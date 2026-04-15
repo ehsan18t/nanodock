@@ -1,0 +1,107 @@
+# nanodock - CI Pipeline
+# Enforces code quality on pull requests. All checks must pass before merging.
+#
+# Gates (ALL must pass):
+#   1. cargo fmt --check            -> consistent formatting
+#   2. cargo clippy (deny)          -> zero lint warnings (all+pedantic+nursery)
+#   3. cargo test --locked          -> all tests pass, Cargo.lock respected
+#   4. cargo build                  -> library compiles
+#   5. cargo doc                    -> documentation + doc-comment format valid
+#   6. cargo deny check             -> no vulnerable/banned dependencies
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Principle of least privilege - CI only reads source, never pushes.
+permissions:
+  contents: read
+
+# Cancel any in-progress run for the same PR branch to avoid wasted minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  quality-gate:
+    name: Quality Gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # 1.94.1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+
+      # Gate 1: Formatting - rejects inconsistent style
+      - name: "Gate 1: cargo fmt --check"
+        run: cargo fmt --all -- --check
+
+      # Gate 2: Clippy (all+pedantic+nursery at deny level) - rejects lint violations.
+      # Lint levels and per-lint overrides are configured in Cargo.toml [lints.clippy].
+      - name: "Gate 2: cargo clippy"
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Gate 3: Tests - rejects broken logic; --locked ensures Cargo.lock is honoured
+      - name: "Gate 3: cargo test"
+        run: cargo test --locked --all-targets
+
+      # Gate 4: Build - rejects code that does not compile
+      - name: "Gate 4: cargo build"
+        run: cargo build --locked
+
+      # Gate 5: Documentation & doc-comment format - rejects broken links, bare URLs,
+      # invalid code blocks, and missing crate-level docs.
+      - name: "Gate 5: cargo doc"
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: >-
+            -D warnings
+            -D rustdoc::bare_urls
+            -D rustdoc::invalid_rust_codeblocks
+            -D rustdoc::private_intra_doc_links
+            -D rustdoc::unescaped_backticks
+
+  # Gate 6: Dependency audit - rejects vulnerable/banned/unlicensed dependencies.
+  # Uses EmbarkStudios/cargo-deny-action (Docker-based, pre-built binary - no
+  # manual install or caching needed). Advisories are split into a separate
+  # matrix entry with continue-on-error so a sudden new advisory announcement
+  # does not block unrelated PRs.
+  audit:
+    name: Dependency Audit (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A new advisory should warn, not block unrelated work.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: "Gate 6: cargo deny check ${{ matrix.checks }}"
+        uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+        with:
+          command: check ${{ matrix.checks }}

@@ -1,0 +1,55 @@
+name: Feature Request
+description: Suggest a new feature or improvement for nanodock
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make nanodock better? Describe it below!
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: >
+        What problem does this feature solve? Example: "I need to query
+        container labels but the current API doesn't expose them."
+      placeholder: When querying container metadata, I need to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe what you want to happen and how it should work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you have considered.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area of impact
+      options:
+        - Docker API / detection
+        - Podman support
+        - Port mapping
+        - Container lifecycle (stop/kill)
+        - Transport (sockets/pipes/TCP)
+        - Platform support
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Examples from other libraries, Docker API references, etc.

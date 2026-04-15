@@ -84,6 +84,7 @@ pub fn lookup_rootless_podman_container(
 }
 
 /// Check whether a process name matches the Podman rootless port-forwarder.
+#[must_use]
 pub const fn is_podman_rootlessport_process(process_name: &str) -> bool {
     process_name.eq_ignore_ascii_case("rootlessport")
 }

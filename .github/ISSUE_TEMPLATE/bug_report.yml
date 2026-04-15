@@ -1,0 +1,92 @@
+name: Bug Report
+description: Report a bug or unexpected behaviour in nanodock
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill in the details below so we can
+        reproduce and fix it quickly.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug or unexpected behaviour.
+      placeholder: When calling `start_detection()`, the function...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact code or commands to trigger the bug.
+      placeholder: |
+        1. Call `nanodock::start_detection(None)`
+        2. Observe the result
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output / logs
+      description: >
+        Paste any error output or log messages. Enable the `log` crate at debug
+        level for extra detail.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: nanodock version
+      description: Version from your Cargo.toml dependency.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Ubuntu / Debian
+        - Fedora / RHEL
+        - Arch Linux
+        - macOS
+        - Other (specify below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Container runtime
+      options:
+        - Docker Desktop
+        - Docker Engine (Linux native)
+        - Podman (rootful)
+        - Podman (rootless)
+        - Colima
+        - Rancher Desktop
+        - Other (specify below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help (Docker version, socket path, etc.).

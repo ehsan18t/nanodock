@@ -1,1 +1,24 @@
+# Build artifacts
 /target
+
+# IDE / editor junk
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Cargo
+**/*.rs.bk
+
+# Debug
+*.pdb
+*.dSYM/
+
+# OS junk
+*.tmp
+*.bak
+*.log

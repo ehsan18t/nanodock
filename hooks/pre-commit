@@ -1,0 +1,82 @@
+#!/bin/sh
+# nanodock - Pre-commit hook
+# Prevents committing code that doesn't pass quality gates.
+#
+# Install: copy this file to .git/hooks/pre-commit (or run the setup script)
+#          chmod +x .git/hooks/pre-commit  (Linux/macOS)
+#
+# What it checks:
+#   1. cargo fmt --check  - formatting
+#   2. cross-target clippy - lint violations across Linux + Windows targets
+#   3. cargo test          - all tests pass
+
+set -e
+
+ensure_cargo() {
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Git can execute hooks with a reduced PATH outside the user's shell init.
+    if [ -f "$HOME/.cargo/env" ]; then
+        . "$HOME/.cargo/env"
+    fi
+
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -x "$HOME/.cargo/bin/cargo" ]; then
+        PATH="$HOME/.cargo/bin:$PATH"
+        export PATH
+        return 0
+    fi
+
+    echo ""
+    echo "✗ RUST TOOLCHAIN NOT FOUND"
+    echo "  cargo is not available in the git hook environment."
+    echo "  Install Rust or source ~/.cargo/env, then try again."
+    exit 1
+}
+
+ensure_cargo
+
+echo "╔══════════════════════════════════════════╗"
+echo "║     nanodock Pre-Commit Quality Gate      ║"
+echo "╚══════════════════════════════════════════╝"
+echo ""
+
+# Gate 1: Formatting
+echo "→ Checking formatting..."
+if ! cargo fmt --all -- --check; then
+    echo ""
+    echo "✗ FORMATTING FAILED"
+    echo "  Run: cargo fmt"
+    echo "  Then try committing again."
+    exit 1
+fi
+echo "  ✓ Formatting OK"
+
+# Gate 2: Clippy across the supported Linux + Windows targets
+echo "→ Running cross-target clippy..."
+if ! sh scripts/check-platform-clippy.sh; then
+    echo ""
+    echo "✗ CLIPPY FAILED"
+    echo "  Fix the lint errors above or install the missing rustup targets,"
+    echo "  then try committing again."
+    exit 1
+fi
+echo "  ✓ Cross-target clippy OK"
+
+# Gate 3: Tests
+echo "→ Running tests..."
+if ! cargo test --all-targets; then
+    echo ""
+    echo "✗ TESTS FAILED"
+    echo "  Fix the failing tests, then try committing again."
+    exit 1
+fi
+echo "  ✓ Tests OK"
+
+echo ""
+echo "✓ All quality gates passed. Committing..."

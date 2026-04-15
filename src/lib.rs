@@ -5,10 +5,10 @@
 //!
 //! ## Module structure
 //!
-//! - [`api`] - JSON response parsing and container name resolution.
-//! - [`http`] - Minimal HTTP/1.0 response parser (headers via `httparse`).
-//! - [`ipc`] - OS-specific transport (Unix socket, Windows named pipe, TCP).
-//! - [`podman`] - Rootless Podman resolver via overlay metadata (Linux only).
+//! - `api` - JSON response parsing and container name resolution.
+//! - `http` - Minimal HTTP/1.0 response parser (headers via `httparse`).
+//! - `ipc` - OS-specific transport (Unix socket, Windows named pipe, TCP).
+//! - `podman` - Rootless Podman resolver via overlay metadata (Linux only).
 //!
 //! ## Quick start
 //!

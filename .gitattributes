@@ -1,0 +1,46 @@
+# nanodock - Git attributes
+#
+# Normalise all text files to LF in the repository.
+# On checkout: LF everywhere except Windows-native script types (.bat, .cmd,
+# .ps1) which need CRLF so they run correctly on Windows without modification.
+#
+# Binary assets are marked explicitly so Git never tries to diff or merge them.
+
+# ── Default: auto-detect text vs binary ──────────────────────────────────────
+* text=auto eol=lf
+
+# ── Source code ──────────────────────────────────────────────────────────────
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.lock      text eol=lf
+
+# ── Documentation & config ───────────────────────────────────────────────────
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.txt       text eol=lf
+.editorconfig text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+LICENSE     text eol=lf
+
+# ── Windows-native scripts (must be CRLF on checkout) ────────────────────────
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# ── Unix shell scripts & git hooks (LF only) ─────────────────────────────────
+*.sh                text eol=lf
+hooks/commit-msg    text eol=lf
+hooks/pre-commit    text eol=lf
+hooks/pre-push      text eol=lf
+
+# ── Binary assets ────────────────────────────────────────────────────────────
+*.ico       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.exe       binary
+*.dll       binary
+*.pdb       binary

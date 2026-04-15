@@ -1,0 +1,36 @@
+[package]
+name = "nanodock"
+version = "0.1.0"
+edition = "2024"
+authors = ["Ehsan Khan"]
+description = "Zero-dependency-light Docker/Podman daemon client for container detection, port mapping, and lifecycle control"
+license = "MIT"
+readme = "README.md"
+keywords = ["docker", "podman", "container", "port", "daemon"]
+categories = ["os", "network-programming"]
+repository = "https://github.com/ehsan18t/nanodock"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+let_underscore_drop = "deny"
+non_ascii_idents = "deny"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+httparse = { version = "1", default-features = false }
+log = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

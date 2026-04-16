@@ -70,10 +70,17 @@ echo "  ✓ Cross-target clippy OK"
 
 # Gate 3: Tests
 echo "→ Running tests..."
-if ! cargo test --all-targets; then
+if ! cargo test --lib --tests; then
     echo ""
     echo "✗ TESTS FAILED"
-    echo "  Fix the failing tests, then try committing again."
+    echo "  Fix the failing unit or integration tests, then try committing again."
+    exit 1
+fi
+
+if ! cargo test --doc; then
+    echo ""
+    echo "✗ TESTS FAILED"
+    echo "  Fix the failing doctests, then try committing again."
     exit 1
 fi
 echo "  ✓ Tests OK"

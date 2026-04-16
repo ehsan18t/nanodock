@@ -213,7 +213,14 @@ src/
 cargo build
 
 # Run tests
-cargo test
+cargo test --lib --tests
+cargo test --doc
+
+# Compile benchmarks
+cargo bench --no-run
+
+# Run benchmarks on Linux with valgrind and gungraun-runner installed
+cargo bench --bench benchmarks
 
 # Check formatting
 cargo fmt --check
@@ -232,14 +239,56 @@ cargo deny check
 
 All of the following must pass before merging:
 
-| Gate | Command               | Purpose                   |
-| ---- | --------------------- | ------------------------- |
-| 1    | `cargo fmt --check`   | Consistent formatting     |
-| 2    | `cargo clippy`        | Zero lint warnings        |
-| 3    | `cargo test`          | All tests pass            |
-| 4    | `cargo build`         | Library compiles          |
-| 5    | `cargo doc --no-deps` | Documentation builds      |
-| 6    | `cargo deny check`    | No vulnerable/banned deps |
+| Gate | Command                                        | Purpose                   |
+| ---- | ---------------------------------------------- | ------------------------- |
+| 1    | `cargo fmt --check`                            | Consistent formatting     |
+| 2    | `cargo clippy`                                 | Zero lint warnings        |
+| 3    | `cargo test --lib --tests && cargo test --doc` | All tests pass            |
+| 4    | `cargo bench --no-run`                         | Benchmarks compile        |
+| 5    | `cargo build`                                  | Library compiles          |
+| 6    | `cargo doc --no-deps`                          | Documentation builds      |
+| 7    | `cargo deny check`                             | No vulnerable/banned deps |
+
+## Instruction Benchmarks
+
+nanodock ships a Gungraun benchmark suite for the two hot paths most likely to
+regress in real use: parsing daemon `/containers/json` payloads and matching
+host sockets back to published container bindings.
+
+Unlike Criterion, Gungraun measures instruction counts and related Callgrind
+metrics instead of wall-clock time. The benchmark output is written under
+`target/gungraun/`.
+
+Important constraints from the upstream Gungraun docs:
+
+- benchmark execution requires Linux plus Valgrind
+- benchmark execution also requires a version-matched `gungraun-runner` binary
+- Windows can compile the benchmark harness with `cargo bench --no-run`, but it
+  cannot execute the benchmarks
+
+To install the benchmark runtime on Linux:
+
+```bash
+sudo apt-get install valgrind
+cargo install --version 0.18.1 gungraun-runner
+```
+
+To create and compare a named baseline locally:
+
+```bash
+cargo bench --bench benchmarks -- --save-baseline=main --callgrind-metrics=ir
+cargo bench --bench benchmarks -- --baseline=main --callgrind-metrics=ir --callgrind-limits='ir=1.0%'
+```
+
+Pull requests run a Linux benchmark job that:
+
+- saves a merge-base baseline from `main`
+- compares the PR head against that baseline using instruction deltas (`Ir`)
+- fails the job if any benchmark regresses by more than 1%
+- uploads raw console output plus the generated `target/gungraun/` reports as artifacts
+
+If you update the `gungraun` crate version, update the installed
+`gungraun-runner` version in CI and local setup to match.
 
 ### Git Hooks
 

@@ -14,7 +14,7 @@ echo.
 call :ensure_cargo
 
 REM Gate 1: Formatting
-echo -^> [1/6] Checking formatting...
+echo -^> [1/7] Checking formatting...
 cargo fmt --all -- --check
 if %ERRORLEVEL% neq 0 (
     echo.
@@ -26,7 +26,7 @@ if %ERRORLEVEL% neq 0 (
 echo   OK Formatting
 
 REM Gate 2: Clippy across Linux + Windows targets
-echo -^> [2/6] Running cross-target clippy...
+echo -^> [2/7] Running cross-target clippy...
 where pwsh >nul 2>nul
 if %ERRORLEVEL% equ 0 (
     pwsh -NoProfile -File scripts\check-platform-clippy.ps1
@@ -43,18 +43,38 @@ if %ERRORLEVEL% neq 0 (
 echo   OK Cross-target clippy
 
 REM Gate 3: Tests
-echo -^> [3/6] Running tests...
-cargo test --all-targets
+echo -^> [3/7] Running tests...
+cargo test --lib --tests
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X TESTS FAILED
-    echo   Fix the failing tests, then try pushing again.
+    echo   Fix the failing unit or integration tests, then try pushing again.
+    exit /b 1
+)
+
+cargo test --doc
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo X TESTS FAILED
+    echo   Fix the failing doctests, then try pushing again.
     exit /b 1
 )
 echo   OK Tests
 
-REM Gate 4: Library build
-echo -^> [4/6] Building library...
+REM Gate 4: Benchmarks compile on all platforms. Actual execution requires
+REM valgrind plus gungraun-runner and is enforced in Linux CI.
+echo -^> [4/7] Compiling benchmarks...
+cargo bench --no-run
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo X BENCHMARK COMPILE FAILED
+    echo   Fix the benchmark build errors, then try pushing again.
+    exit /b 1
+)
+echo   OK Benchmarks
+
+REM Gate 5: Library build
+echo -^> [5/7] Building library...
 cargo build
 if %ERRORLEVEL% neq 0 (
     echo.
@@ -64,8 +84,8 @@ if %ERRORLEVEL% neq 0 (
 )
 echo   OK Build
 
-REM Gate 5: Documentation
-echo -^> [5/6] Building docs...
+REM Gate 6: Documentation
+echo -^> [6/7] Building docs...
 set "RUSTDOCFLAGS=-D warnings -D rustdoc::bare_urls -D rustdoc::invalid_rust_codeblocks -D rustdoc::private_intra_doc_links -D rustdoc::unescaped_backticks"
 cargo doc --no-deps
 if %ERRORLEVEL% neq 0 (
@@ -76,8 +96,8 @@ if %ERRORLEVEL% neq 0 (
 )
 echo   OK Docs
 
-REM Gate 6: Dependency audit (optional)
-echo -^> [6/6] Auditing dependencies...
+REM Gate 7: Dependency audit (optional)
+echo -^> [7/7] Auditing dependencies...
 where cargo-deny >nul 2>nul
 if %ERRORLEVEL% equ 0 (
     cargo deny check 2>nul

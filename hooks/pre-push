@@ -10,9 +10,10 @@
 #   1. cargo fmt --check   - formatting
 #   2. cross-target clippy - lint violations across Linux + Windows targets
 #   3. cargo test          - all tests pass
-#   4. cargo build         - library compiles
-#   5. cargo doc           - documentation builds with CI rustdoc flags
-#   6. cargo deny check    - dependency audit (if cargo-deny is installed)
+#   4. cargo bench --no-run - gungraun benchmarks compile
+#   5. cargo build         - library compiles
+#   6. cargo doc           - documentation builds with CI rustdoc flags
+#   7. cargo deny check    - dependency audit (if cargo-deny is installed)
 
 set -e
 
@@ -51,7 +52,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # Gate 1: Formatting
-echo "→ [1/6] Checking formatting..."
+echo "→ [1/7] Checking formatting..."
 if ! cargo fmt --all -- --check; then
     echo ""
     echo "✗ FORMATTING FAILED"
@@ -62,7 +63,7 @@ fi
 echo "  ✓ Formatting OK"
 
 # Gate 2: Clippy across the supported Linux + Windows targets
-echo "→ [2/6] Running cross-target clippy..."
+echo "→ [2/7] Running cross-target clippy..."
 if ! sh scripts/check-platform-clippy.sh; then
     echo ""
     echo "✗ CLIPPY FAILED"
@@ -73,17 +74,35 @@ fi
 echo "  ✓ Cross-target clippy OK"
 
 # Gate 3: Tests
-echo "→ [3/6] Running tests..."
-if ! cargo test --all-targets; then
+echo "→ [3/7] Running tests..."
+if ! cargo test --lib --tests; then
     echo ""
     echo "✗ TESTS FAILED"
-    echo "  Fix the failing tests, then try pushing again."
+    echo "  Fix the failing unit or integration tests, then try pushing again."
+    exit 1
+fi
+
+if ! cargo test --doc; then
+    echo ""
+    echo "✗ TESTS FAILED"
+    echo "  Fix the failing doctests, then try pushing again."
     exit 1
 fi
 echo "  ✓ Tests OK"
 
-# Gate 4: Library build
-echo "→ [4/6] Building library..."
+# Gate 4: Benchmarks compile on all platforms. Actual execution requires
+# valgrind plus gungraun-runner and is enforced in Linux CI.
+echo "→ [4/7] Compiling benchmarks..."
+if ! cargo bench --no-run; then
+    echo ""
+    echo "✗ BENCHMARK COMPILE FAILED"
+    echo "  Fix the benchmark build errors, then try pushing again."
+    exit 1
+fi
+echo "  ✓ Benchmarks OK"
+
+# Gate 5: Library build
+echo "→ [5/7] Building library..."
 if ! cargo build; then
     echo ""
     echo "✗ BUILD FAILED"
@@ -92,8 +111,8 @@ if ! cargo build; then
 fi
 echo "  ✓ Build OK"
 
-# Gate 5: Documentation
-echo "→ [5/6] Building docs..."
+# Gate 6: Documentation
+echo "→ [6/7] Building docs..."
 if ! RUSTDOCFLAGS="-D warnings -D rustdoc::bare_urls -D rustdoc::invalid_rust_codeblocks -D rustdoc::private_intra_doc_links -D rustdoc::unescaped_backticks" cargo doc --no-deps; then
     echo ""
     echo "✗ DOCUMENTATION BUILD FAILED"
@@ -102,8 +121,8 @@ if ! RUSTDOCFLAGS="-D warnings -D rustdoc::bare_urls -D rustdoc::invalid_rust_co
 fi
 echo "  ✓ Docs OK"
 
-# Gate 6: Dependency audit (optional - only if cargo-deny is installed)
-echo "→ [6/6] Auditing dependencies..."
+# Gate 7: Dependency audit (optional - only if cargo-deny is installed)
+echo "→ [7/7] Auditing dependencies..."
 if command -v cargo-deny >/dev/null 2>&1; then
     if ! cargo deny check 2>/dev/null; then
         # Advisory DB fetch can fail due to stale cache; clear and retry

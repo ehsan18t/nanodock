@@ -43,11 +43,19 @@ echo   OK Cross-target clippy
 
 REM Gate 3: Tests
 echo -^> Running tests...
-cargo test --all-targets
+cargo test --lib --tests
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X TESTS FAILED
-    echo   Fix the failing tests, then try committing again.
+    echo   Fix the failing unit or integration tests, then try committing again.
+    exit /b 1
+)
+
+cargo test --doc
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo X TESTS FAILED
+    echo   Fix the failing doctests, then try committing again.
     exit /b 1
 )
 echo   OK Tests

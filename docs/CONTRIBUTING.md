@@ -61,10 +61,11 @@ All of the following must pass before merging:
 | ---- | ------------------------------------------------------------------------ | --------------------------------------------------- |
 | 1    | `cargo fmt --check`                                                      | Consistent formatting                               |
 | 2    | `scripts/check-platform-clippy.sh` / `scripts/check-platform-clippy.ps1` | Zero lint warnings across Linux + Windows cfg paths |
-| 3    | `cargo test`                                                             | All tests pass                                      |
-| 4    | `cargo build`                                                            | Library compiles                                    |
-| 5    | `cargo doc --no-deps`                                                    | Documentation builds                                |
-| 6    | `cargo deny check`                                                       | No vulnerable/banned deps                           |
+| 3    | `cargo test --lib --tests && cargo test --doc`                           | All tests pass                                      |
+| 4    | `cargo bench --no-run`                                                   | Benchmarks compile                                  |
+| 5    | `cargo build`                                                            | Library compiles                                    |
+| 6    | `cargo doc --no-deps`                                                    | Documentation builds                                |
+| 7    | `cargo deny check`                                                       | No vulnerable/banned deps                           |
 
 CI runs on every push to `main` **and** on every pull request targeting `main`,
 so cross-platform issues (Linux + Windows matrix) are caught before a PR is merged.
@@ -75,6 +76,32 @@ so reviewers can see the intended upstream release at a glance.
 
 For environment-specific diagnostics while developing, enable the `log` crate
 at debug level to see Docker/Podman probing and transport fallback messages.
+
+Pull requests also run a Linux benchmark regression job with Gungraun. CI saves
+a merge-base baseline from `main`, runs the PR head against that baseline, and
+fails the job when the instruction count (`Ir`) regresses beyond the configured
+limit. CI uploads a `benchmark-reports-<sha>` artifact that contains the raw
+console log plus the generated `target/gungraun/` report tree.
+
+Because Gungraun executes through Valgrind, actual benchmark execution is
+Linux-only. Windows contributors can still compile the benchmark harness with
+`cargo bench --no-run`, but they cannot run the benchmark suite locally on
+Windows.
+
+To run the instruction benchmarks locally on Linux:
+
+```bash
+sudo apt-get install valgrind
+cargo install --version 0.18.1 gungraun-runner
+cargo bench --bench benchmarks
+```
+
+To compare against a named baseline and fail on instruction regressions:
+
+```bash
+cargo bench --bench benchmarks -- --save-baseline=main --callgrind-metrics=ir
+cargo bench --bench benchmarks -- --baseline=main --callgrind-metrics=ir --callgrind-limits='ir=1.0%'
+```
 
 ---
 

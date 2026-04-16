@@ -29,7 +29,7 @@
 
 - [ ] `cargo fmt --check` passes
 - [ ] `cargo clippy --all-targets` passes (deny level)
-- [ ] `cargo test --all-targets` passes
+- [ ] `cargo test --lib --tests && cargo test --doc` passes
 - [ ] `cargo doc --no-deps` builds without warnings
 - [ ] Documentation updated (README, docs) if behaviour changed
 - [ ] Commits follow [Conventional Commits](https://www.conventionalcommits.org) format

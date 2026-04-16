@@ -5,9 +5,13 @@
 #   1. cargo fmt --check            -> consistent formatting
 #   2. cargo clippy (deny)          -> zero lint warnings (all+pedantic+nursery)
 #   3. cargo test --locked          -> all tests pass, Cargo.lock respected
-#   4. cargo build                  -> library compiles
-#   5. cargo doc                    -> documentation + doc-comment format valid
-#   6. cargo deny check             -> no vulnerable/banned dependencies
+#   4. cargo bench --no-run         -> benchmarks compile without errors
+#   5. cargo build                  -> library compiles
+#   6. cargo doc                    -> documentation + doc-comment format valid
+#   7. cargo deny check             -> no vulnerable/banned dependencies
+#
+# Linux benchmark execution:
+#   - gungraun instruction-count regressions vs PR merge-base
 
 name: CI
 
@@ -64,15 +68,21 @@ jobs:
 
       # Gate 3: Tests - rejects broken logic; --locked ensures Cargo.lock is honoured
       - name: "Gate 3: cargo test"
-        run: cargo test --locked --all-targets
+        run: |
+          cargo test --locked --lib --tests
+          cargo test --locked --doc
 
-      # Gate 4: Build - rejects code that does not compile
-      - name: "Gate 4: cargo build"
+      # Gate 4: Benchmarks - rejects benchmarks that do not compile
+      - name: "Gate 4: cargo bench --no-run"
+        run: cargo bench --locked --no-run
+
+      # Gate 5: Build - rejects code that does not compile
+      - name: "Gate 5: cargo build"
         run: cargo build --locked
 
-      # Gate 5: Documentation & doc-comment format - rejects broken links, bare URLs,
+      # Gate 6: Documentation & doc-comment format - rejects broken links, bare URLs,
       # invalid code blocks, and missing crate-level docs.
-      - name: "Gate 5: cargo doc"
+      - name: "Gate 6: cargo doc"
         run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: >-
@@ -82,7 +92,94 @@ jobs:
             -D rustdoc::private_intra_doc_links
             -D rustdoc::unescaped_backticks
 
-  # Gate 6: Dependency audit - rejects vulnerable/banned/unlicensed dependencies.
+  # Linux-only instruction-count benchmarks with gungraun.
+  #
+  # Gungraun executes under valgrind, so benchmark execution is unavailable on
+  # Windows runners. Pull requests compare the PR head against a merge-base
+  # baseline from `main` and fail on instruction regressions above the chosen
+  # Ir limit. Pushes to `main` still run the benchmark suite as a smoke check.
+  benchmark-regression:
+    name: Benchmark Regression (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GUNGRAUN_SEPARATE_TARGETS: "true"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # 1.94.1
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          key: bench
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+
+      - name: Install gungraun-runner
+        run: |
+          version=$(cargo metadata --format-version=1 --no-deps | python -c "import json, sys; data = json.load(sys.stdin); print(next(pkg['version'] for pkg in data['packages'] if pkg['name'] == 'gungraun'))")
+          cargo install --locked gungraun-runner --version "$version"
+
+      - name: Resolve merge-base
+        id: base
+        if: github.event_name == 'pull_request'
+        run: |
+          base=$(git merge-base HEAD origin/${{ github.base_ref }})
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "Merge-base: $base"
+
+      - name: Run benchmarks on merge-base (establish baseline)
+        if: github.event_name == 'pull_request'
+        run: |
+          head_sha=$(git rev-parse HEAD)
+          git checkout --detach ${{ steps.base.outputs.sha }}
+          cargo bench --locked --bench benchmarks -- \
+            --save-baseline main \
+            --callgrind-metrics=ir \
+            --save-summary=json
+          git checkout --detach "$head_sha"
+
+      - name: Run PR benchmark comparison
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo bench --locked --bench benchmarks -- \
+            --baseline main \
+            --callgrind-metrics=ir \
+            --callgrind-limits='ir=1.0%' \
+            --save-summary=json \
+            | tee bench_output.txt
+
+      - name: Run benchmark smoke check on main pushes
+        if: github.event_name != 'pull_request'
+        run: |
+          cargo bench --locked --bench benchmarks \
+            -- \
+            --callgrind-metrics=ir \
+            --save-summary=json \
+            | tee bench_output.txt
+
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: benchmark-reports-${{ github.sha }}
+          path: |
+            bench_output.txt
+            target/gungraun
+          retention-days: 7
+          if-no-files-found: warn
+
+  # Gate 7: Dependency audit - rejects vulnerable/banned/unlicensed dependencies.
   # Uses EmbarkStudios/cargo-deny-action (Docker-based, pre-built binary - no
   # manual install or caching needed). Advisories are split into a separate
   # matrix entry with continue-on-error so a sudden new advisory announcement
@@ -101,7 +198,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: "Gate 6: cargo deny check ${{ matrix.checks }}"
+      - name: "Gate 7: cargo deny check ${{ matrix.checks }}"
         uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
         with:
           command: check ${{ matrix.checks }}

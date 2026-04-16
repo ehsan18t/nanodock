@@ -11,6 +11,7 @@ ignore = []
 
 [licenses]
 # Only allow these licenses - anything unlisted is denied by default.
+# Benchmark-only tooling such as Gungraun must satisfy the same allowlist.
 confidence-threshold = 0.93
 allow = [
   "MIT",

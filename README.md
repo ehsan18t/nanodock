@@ -141,8 +141,9 @@ nanodock communicates directly with the Docker/Podman daemon using the
 | Linux    | Unix socket | `/var/run/docker.sock`                          |
 | Linux    | Unix socket | `/run/user/{uid}/docker.sock`                   |
 | Linux    | Unix socket | `$HOME/.docker/desktop/docker.sock`             |
+| Linux    | Unix socket | `$HOME/.docker/run/docker.sock`                 |
 | Linux    | Unix socket | `/run/user/{uid}/podman/podman.sock`            |
-| Linux    | Unix socket | `$HOME/.local/share/containers/.../podman.sock` |
+| Linux    | Unix socket | `/run/podman/podman.sock`                       |
 | Windows  | Named pipe  | `\\.\pipe\docker_engine`                        |
 | Windows  | Named pipe  | `\\.\pipe\podman-machine-default`               |
 | Both     | TCP         | `DOCKER_HOST=tcp://host:port`                   |

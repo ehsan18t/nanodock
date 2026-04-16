@@ -68,7 +68,12 @@ pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<Stri
     ]);
 
     if let Some(home) = home {
-        socket_paths.push(home.join(".docker/run/docker.sock").display().to_string());
+        socket_paths.extend([
+            home.join(".docker/desktop/docker.sock")
+                .display()
+                .to_string(),
+            home.join(".docker/run/docker.sock").display().to_string(),
+        ]);
     }
 
     socket_paths
@@ -550,14 +555,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_socket_paths_include_rootless_docker_locations() {
+    fn unix_socket_paths_include_user_scoped_docker_locations() {
         let home = PathBuf::from("/home/tester");
         let paths = unix_socket_paths(1000, Some(home));
 
         assert!(paths.contains(&"/run/user/1000/docker.sock".to_string()));
         assert!(
+            paths.contains(&"/home/tester/.docker/desktop/docker.sock".to_string()),
+            "docker desktop linux socket should be probed"
+        );
+        assert!(
             paths.contains(&"/home/tester/.docker/run/docker.sock".to_string()),
-            "rootless home socket should be probed"
+            "legacy user-scoped docker socket should still be probed"
         );
     }
 

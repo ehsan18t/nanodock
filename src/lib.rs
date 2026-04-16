@@ -80,6 +80,16 @@ pub struct ContainerInfo {
     pub image: String,
 }
 
+impl std::fmt::Display for ContainerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.image.is_empty() {
+            write!(f, "{}", self.name)
+        } else {
+            write!(f, "{} ({})", self.name, self.image)
+        }
+    }
+}
+
 /// Maps `(host_ip, host_port, protocol)` to container info.
 pub type ContainerPortMap = HashMap<(Option<IpAddr>, u16, Protocol), ContainerInfo>;
 
@@ -242,6 +252,17 @@ pub enum StopOutcome {
     NotFound,
     /// The daemon could not be reached or returned an unexpected status.
     Failed,
+}
+
+impl std::fmt::Display for StopOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => write!(f, "stopped"),
+            Self::AlreadyStopped => write!(f, "already stopped"),
+            Self::NotFound => write!(f, "not found"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
 }
 
 /// Stop or kill a running container via the Docker/Podman daemon API.

@@ -93,6 +93,7 @@ where
         .filter(|ip| !ip.is_empty())
         .map(str::parse)
         .transpose()
+        .map(|host_ip| host_ip.filter(|ip: &IpAddr| !ip.is_unspecified()))
         .map_err(serde::de::Error::custom)
 }
 
@@ -401,6 +402,42 @@ mod tests {
             Protocol::Tcp,
             "api",
             "node:22",
+        );
+    }
+
+    #[test]
+    fn parse_docker_wildcard_host_ip_as_unspecified() {
+        let json = r#"[{
+            "Names": ["/postgres"],
+            "Image": "postgres:16",
+            "Ports": [{"IP": "0.0.0.0", "PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+
+        assert_container_mapping(&map, None, 5432, Protocol::Tcp, "postgres", "postgres:16");
+        assert!(
+            !map.contains_key(&(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 5432, Protocol::Tcp)),
+            "unspecified IPv4 bindings should be normalized to the wildcard key"
+        );
+    }
+
+    #[test]
+    fn parse_ipv6_wildcard_host_ip_as_unspecified() {
+        let json = r#"[{
+            "Names": ["/dns"],
+            "Image": "bind9:latest",
+            "Ports": [{"IP": "::", "PrivatePort": 53, "PublicPort": 5353, "Type": "udp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+
+        assert_container_mapping(&map, None, 5353, Protocol::Udp, "dns", "bind9:latest");
+        assert!(
+            !map.contains_key(&(
+                Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+                5353,
+                Protocol::Udp
+            )),
+            "unspecified IPv6 bindings should be normalized to the wildcard key"
         );
     }
 }

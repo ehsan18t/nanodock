@@ -518,4 +518,27 @@ mod tests {
 
         assert_eq!(result, PublishedContainerMatch::Ambiguous);
     }
+
+    #[test]
+    fn lookup_published_container_uses_normalized_wildcard_bindings() {
+        let map = api::parse_containers_json(
+            r#"[{
+                "Names": ["/postgres"],
+                "Image": "postgres:16",
+                "Ports": [{"IP": "0.0.0.0", "PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp"}]
+            }]"#,
+        );
+
+        let result = lookup_published_container(
+            &map,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432),
+            Protocol::Tcp,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            PublishedContainerMatch::Match(info) if info.name == "postgres"
+        ));
+    }
 }

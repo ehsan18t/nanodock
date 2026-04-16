@@ -83,9 +83,8 @@ pub struct ContainerInfo {
 /// Maps `(host_ip, host_port, protocol)` to container info.
 pub type ContainerPortMap = HashMap<(Option<IpAddr>, u16, Protocol), ContainerInfo>;
 
-/// Build a reusable container fixture for test maps.
-#[must_use]
-pub fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
+#[cfg(test)]
+fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
     ContainerInfo {
         id: id.to_string(),
         name: name.to_string(),
@@ -93,8 +92,8 @@ pub fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
     }
 }
 
-/// Insert a reusable container fixture into a test port map.
-pub fn insert_test_container(
+#[cfg(test)]
+fn insert_test_container(
     map: &mut ContainerPortMap,
     host_ip: Option<IpAddr>,
     port: u16,

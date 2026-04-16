@@ -128,7 +128,7 @@ fn podman_overlay_container_roots(home: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
-pub fn load_podman_rootless_containers_from_overlay_root(
+fn load_podman_rootless_containers_from_overlay_root(
     overlay_root: &Path,
 ) -> HashMap<PathBuf, ContainerInfo> {
     let catalog_path = overlay_root.join("containers.json");
@@ -231,7 +231,7 @@ fn is_podman_network_namespace_path(path: &Path) -> bool {
             .is_some_and(|name| name.to_string_lossy().starts_with("netns-"))
 }
 
-pub fn match_container_by_netns_paths(
+fn match_container_by_netns_paths(
     netns_paths: &[PathBuf],
     containers_by_netns: &HashMap<PathBuf, ContainerInfo>,
 ) -> Option<ContainerInfo> {

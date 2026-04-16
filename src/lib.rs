@@ -48,6 +48,7 @@ pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
 // ── Protocol ─────────────────────────────────────────────────────────
 
 /// Network transport protocol.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Protocol {
     /// Transmission Control Protocol.
@@ -116,6 +117,7 @@ fn insert_test_container(
 }
 
 /// Result of matching a socket against published container port bindings.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishedContainerMatch<'a> {
     /// Exactly one container binding matched the socket.
@@ -242,6 +244,7 @@ pub fn await_detection(handle: DetectionHandle) -> ContainerPortMap {
 // ── Container stop / kill ────────────────────────────────────────────
 
 /// Result of attempting to stop or kill a container via the daemon API.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum StopOutcome {
     /// Container was successfully stopped (HTTP 204).

@@ -136,17 +136,17 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Supported Daemon Paths
 
-| Platform | Transport   | Path                                            |
-| -------- | ----------- | ----------------------------------------------- |
-| Linux    | Unix socket | `/var/run/docker.sock`                          |
-| Linux    | Unix socket | `/run/user/{uid}/docker.sock`                   |
-| Linux    | Unix socket | `$HOME/.docker/desktop/docker.sock`             |
-| Linux    | Unix socket | `$HOME/.docker/run/docker.sock`                 |
-| Linux    | Unix socket | `/run/user/{uid}/podman/podman.sock`            |
-| Linux    | Unix socket | `/run/podman/podman.sock`                       |
-| Windows  | Named pipe  | `\\.\pipe\docker_engine`                        |
-| Windows  | Named pipe  | `\\.\pipe\podman-machine-default`               |
-| Both     | TCP         | `DOCKER_HOST=tcp://host:port`                   |
+| Platform | Transport   | Path                                 |
+| -------- | ----------- | ------------------------------------ |
+| Linux    | Unix socket | `/var/run/docker.sock`               |
+| Linux    | Unix socket | `/run/user/{uid}/docker.sock`        |
+| Linux    | Unix socket | `$HOME/.docker/desktop/docker.sock`  |
+| Linux    | Unix socket | `$HOME/.docker/run/docker.sock`      |
+| Linux    | Unix socket | `/run/user/{uid}/podman/podman.sock` |
+| Linux    | Unix socket | `/run/podman/podman.sock`            |
+| Windows  | Named pipe  | `\\.\pipe\docker_engine`             |
+| Windows  | Named pipe  | `\\.\pipe\podman-machine-default`    |
+| Both     | TCP         | `DOCKER_HOST=tcp://host:port`        |
 
 ## API Reference
 
@@ -175,11 +175,11 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 ### Linux-only Functions
 
-| Function                              | Description                              |
-| ------------------------------------- | ---------------------------------------- |
-| `is_podman_rootlessport_process(pid)` | Check if a PID is `rootlessport`         |
-| `lookup_rootless_podman_container()`  | Resolve container from rootlessport PIDs |
-| `RootlessPodmanResolver`              | Cached resolver for rootless Podman      |
+| Function                               | Description                               |
+| -------------------------------------- | ----------------------------------------- |
+| `is_podman_rootlessport_process(name)` | Check if a process name is `rootlessport` |
+| `lookup_rootless_podman_container()`   | Resolve container from rootlessport PIDs  |
+| `RootlessPodmanResolver`               | Cached resolver for rootless Podman       |
 
 ## Architecture
 

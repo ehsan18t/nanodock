@@ -141,7 +141,7 @@ fn read_chunked_body(reader: &mut impl BufRead) -> Option<Vec<u8>> {
 
         let chunk_size = parse_streaming_chunk_size(&size_line)?;
         if chunk_size == 0 {
-            consume_chunked_trailers(reader)?;
+            consume_chunked_trailers(reader);
             return Some(body);
         }
 
@@ -168,14 +168,14 @@ fn parse_streaming_chunk_size(line: &str) -> Option<usize> {
     }
 }
 
-fn consume_chunked_trailers(reader: &mut impl BufRead) -> Option<()> {
+fn consume_chunked_trailers(reader: &mut impl BufRead) {
     loop {
         let mut trailer_line = String::new();
-        if reader.read_line(&mut trailer_line).ok()? == 0 {
-            return None;
-        }
-        if trailer_line.trim().is_empty() {
-            return Some(());
+        // EOF or IO error after the terminal chunk means the body is
+        // complete and there are no (more) trailers to consume.
+        let bytes_read = reader.read_line(&mut trailer_line).unwrap_or(0);
+        if bytes_read == 0 || trailer_line.trim().is_empty() {
+            return;
         }
     }
 }
@@ -279,7 +279,7 @@ pub fn extract_http_body_from_buffer(
 
             Ok(None)
         }
-        TransferEncoding::Chunked => match decode_chunked_body(body) {
+        TransferEncoding::Chunked => match decode_chunked_body(body, eof) {
             Ok(Some(decoded)) => String::from_utf8(decoded).map(Some).map_err(|_| ()),
             Ok(None) => Ok(None),
             Err(()) => Err(()),
@@ -289,7 +289,7 @@ pub fn extract_http_body_from_buffer(
 }
 
 #[cfg(any(windows, test))]
-fn decode_chunked_body(body: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+fn decode_chunked_body(body: &[u8], eof: bool) -> Result<Option<Vec<u8>>, ()> {
     let mut decoded = Vec::new();
     let mut offset = 0;
 
@@ -306,7 +306,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Option<Vec<u8>>, ()> {
         offset = line_end + 2;
 
         if chunk_size == 0 {
-            return parse_chunked_trailers(body, offset)
+            return parse_chunked_trailers(body, offset, eof)
                 .map(|complete| complete.then_some(decoded));
         }
 
@@ -325,7 +325,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Option<Vec<u8>>, ()> {
 }
 
 #[cfg(any(windows, test))]
-fn parse_chunked_trailers(body: &[u8], offset: usize) -> Result<bool, ()> {
+fn parse_chunked_trailers(body: &[u8], offset: usize, eof: bool) -> Result<bool, ()> {
     let trailers = body.get(offset..).ok_or(())?;
     if trailers.starts_with(b"\r\n") {
         return Ok(true);
@@ -335,7 +335,9 @@ fn parse_chunked_trailers(body: &[u8], offset: usize) -> Result<bool, ()> {
         return Ok(true);
     }
 
-    Ok(false)
+    // At EOF, accept the body even without trailing CRLF since
+    // all chunk data including the terminal chunk has been received.
+    Ok(eof)
 }
 
 #[cfg(any(windows, test))]
@@ -432,7 +434,55 @@ mod tests {
     #[test]
     fn http_body_parser_waits_for_complete_chunked_payload() {
         let partial = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
-        assert!(try_extract_http_body(partial, false).is_none());
+        assert!(
+            try_extract_http_body(partial, false).is_none(),
+            "missing trailing CRLF without EOF should remain incomplete"
+        );
+    }
+
+    #[test]
+    fn chunked_body_accepted_at_eof_without_trailing_crlf() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
+        assert_eq!(
+            try_extract_http_body(response, true).as_deref(),
+            Some("[]"),
+            "at EOF the body should be accepted since all chunks are complete"
+        );
+    }
+
+    #[test]
+    fn streaming_chunked_body_accepted_at_eof_without_trailing_crlf() {
+        struct MockDaemonStream {
+            reader: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl std::io::Read for MockDaemonStream {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reader.read(buf)
+            }
+        }
+
+        impl std::io::Write for MockDaemonStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let response_data =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
+        let mut stream = MockDaemonStream {
+            reader: std::io::Cursor::new(response_data.to_vec()),
+        };
+        let body = send_http_request(&mut stream);
+        assert_eq!(
+            body.as_deref(),
+            Some("[]"),
+            "streaming path should accept chunked body when server closes after terminal chunk"
+        );
     }
 
     #[test]

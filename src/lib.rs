@@ -789,4 +789,149 @@ mod tests {
             PublishedContainerMatch::Match(info) if info.name == "postgres"
         ));
     }
+
+    // ── interpret_stop_status ────────────────────────────────────────
+
+    #[test]
+    fn interpret_stop_status_204_means_stopped() {
+        assert_eq!(
+            interpret_stop_status(204, false),
+            StopOutcome::Stopped,
+            "204 should mean stopped for graceful stop"
+        );
+        assert_eq!(
+            interpret_stop_status(204, true),
+            StopOutcome::Stopped,
+            "204 should mean stopped for force kill"
+        );
+    }
+
+    #[test]
+    fn interpret_stop_status_304_means_already_stopped() {
+        assert_eq!(
+            interpret_stop_status(304, false),
+            StopOutcome::AlreadyStopped,
+            "304 from stop endpoint means already stopped"
+        );
+    }
+
+    #[test]
+    fn interpret_stop_status_409_on_force_means_already_stopped() {
+        assert_eq!(
+            interpret_stop_status(409, true),
+            StopOutcome::AlreadyStopped,
+            "409 from kill endpoint means container not running"
+        );
+    }
+
+    #[test]
+    fn interpret_stop_status_409_on_graceful_means_failed() {
+        assert_eq!(
+            interpret_stop_status(409, false),
+            StopOutcome::Failed,
+            "409 on non-force is unexpected and should map to Failed"
+        );
+    }
+
+    #[test]
+    fn interpret_stop_status_404_means_not_found() {
+        assert_eq!(
+            interpret_stop_status(404, false),
+            StopOutcome::NotFound,
+            "404 means container not found"
+        );
+    }
+
+    #[test]
+    fn interpret_stop_status_500_means_failed() {
+        assert_eq!(
+            interpret_stop_status(500, false),
+            StopOutcome::Failed,
+            "server error should map to Failed"
+        );
+    }
+
+    // ── fold_stop_code ───────────────────────────────────────────────
+
+    #[test]
+    fn fold_stop_code_passes_non_404_through() {
+        let mut fallback = None;
+        assert_eq!(
+            fold_stop_code(204, &mut fallback),
+            Some(204),
+            "non-404 should pass through"
+        );
+        assert_eq!(fallback, None, "fallback should remain None");
+    }
+
+    #[test]
+    fn fold_stop_code_defers_404_to_fallback() {
+        let mut fallback = None;
+        assert_eq!(
+            fold_stop_code(404, &mut fallback),
+            None,
+            "404 should be deferred"
+        );
+        assert_eq!(fallback, Some(404), "fallback should record the 404");
+    }
+
+    // ── merge_daemon_response_bodies ─────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_bodies_empty_iterator_returns_none() {
+        let result = merge_daemon_response_bodies::<&str, Vec<&str>>(vec![]);
+        assert!(result.is_none(), "no responses means None");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_bodies_single_empty_array() {
+        let result = merge_daemon_response_bodies(["[]"]);
+        assert_eq!(
+            result.as_deref(),
+            Some("[]"),
+            "single empty array should produce []"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_bodies_concatenates_non_empty_arrays() {
+        let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, r#"[{"b":2},{"c":3}]"#]);
+        assert_eq!(
+            result.as_deref(),
+            Some(r#"[{"a":1},{"b":2},{"c":3}]"#),
+            "elements from both arrays should be combined"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_bodies_skips_empty_arrays_without_spurious_commas() {
+        let result = merge_daemon_response_bodies(["[]", r#"[{"a":1}]"#]);
+        assert_eq!(
+            result.as_deref(),
+            Some(r#"[{"a":1}]"#),
+            "empty arrays should not introduce leading commas"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_bodies_trailing_empty_array_does_not_add_comma() {
+        let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, "[]"]);
+        assert_eq!(
+            result.as_deref(),
+            Some(r#"[{"a":1}]"#),
+            "trailing empty array should not add trailing comma"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_bodies_all_empty_arrays_produces_empty_array() {
+        let result = merge_daemon_response_bodies(["[]", "[]"]);
+        assert_eq!(result.as_deref(), Some("[]"), "all-empty should produce []");
+    }
 }

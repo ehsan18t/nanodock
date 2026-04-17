@@ -380,6 +380,11 @@ impl std::fmt::Display for StopOutcome {
 /// SIGTERM with a 10-second timeout before SIGKILL). When `force` is
 /// true, sends `POST /containers/{id}/kill` (immediate SIGKILL).
 ///
+/// The `id` parameter can be a container ID (hex) or a container name.
+/// Characters that would corrupt the HTTP request path (`/`, `?`, `#`,
+/// control characters, spaces) are rejected early with
+/// [`StopOutcome::NotFound`].
+///
 /// The `home` parameter provides the user's home directory path, used
 /// on Unix to discover daemon socket locations.
 ///
@@ -387,6 +392,11 @@ impl std::fmt::Display for StopOutcome {
 /// and returns the outcome from the first transport that connects.
 #[must_use]
 pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutcome {
+    if !is_safe_container_id(id) {
+        debug!("rejected container id with unsafe characters");
+        return StopOutcome::NotFound;
+    }
+
     let endpoint = if force {
         format!("/containers/{id}/kill")
     } else {
@@ -404,6 +414,18 @@ pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutco
         },
         |status_code| interpret_stop_status(status_code, force),
     )
+}
+
+/// Reject container IDs that would corrupt the HTTP request line.
+///
+/// Docker accepts both hex IDs and container names (alphanumeric, hyphens,
+/// underscores, dots). This function rejects only characters that could
+/// cause path traversal or HTTP header injection.
+fn is_safe_container_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id
+            .bytes()
+            .any(|b| matches!(b, b'/' | b'?' | b'#' | b'%' | b'\r' | b'\n' | b' '))
 }
 
 /// Map an HTTP status code from the stop/kill endpoint to `StopOutcome`.
@@ -933,5 +955,52 @@ mod tests {
     fn merge_bodies_all_empty_arrays_produces_empty_array() {
         let result = merge_daemon_response_bodies(["[]", "[]"]);
         assert_eq!(result.as_deref(), Some("[]"), "all-empty should produce []");
+    }
+
+    // ── is_safe_container_id ─────────────────────────────────────────
+
+    #[test]
+    fn safe_id_accepts_hex_id() {
+        assert!(
+            is_safe_container_id("abc123def456"),
+            "hex ID should be valid"
+        );
+    }
+
+    #[test]
+    fn safe_id_accepts_container_name() {
+        assert!(
+            is_safe_container_id("my-container_1.0"),
+            "name with hyphens, underscores, dots should be valid"
+        );
+    }
+
+    #[test]
+    fn safe_id_rejects_empty() {
+        assert!(!is_safe_container_id(""), "empty ID should be rejected");
+    }
+
+    #[test]
+    fn safe_id_rejects_path_traversal() {
+        assert!(
+            !is_safe_container_id("../../../etc/passwd"),
+            "path traversal should be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_id_rejects_query_injection() {
+        assert!(
+            !is_safe_container_id("abc?signal=SIGKILL"),
+            "query injection should be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_id_rejects_crlf_injection() {
+        assert!(
+            !is_safe_container_id("abc\r\nX-Injected: true"),
+            "CRLF injection should be rejected"
+        );
     }
 }

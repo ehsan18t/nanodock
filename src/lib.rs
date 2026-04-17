@@ -206,7 +206,10 @@ impl std::fmt::Display for PublishedContainerMatch<'_> {
 /// Handle for an in-progress Docker/Podman container detection.
 ///
 /// Created by [`start_detection`] and consumed by [`await_detection`].
-pub type DetectionHandle = std::sync::mpsc::Receiver<Option<ContainerPortMap>>;
+/// The inner channel is hidden to allow future changes to the detection
+/// mechanism without breaking the public API.
+#[derive(Debug)]
+pub struct DetectionHandle(std::sync::mpsc::Receiver<Option<ContainerPortMap>>);
 
 /// Match a local socket against known published container bindings.
 ///
@@ -312,19 +315,19 @@ pub fn start_detection(home: Option<PathBuf>) -> DetectionHandle {
         // Ignore send error: receiver may have timed out and been dropped.
         drop(tx.send(result));
     });
-    rx
+    DetectionHandle(rx)
 }
 
 /// Wait for Docker/Podman detection to complete.
 ///
 /// Blocks for at most 3 seconds before returning an empty map.
 /// Never returns an error - this is best-effort enrichment.
-// The handle is a `Receiver` which must be consumed (moved) to
+// The handle wraps a `Receiver` which must be consumed (moved) to
 // read from it; passing by reference is not possible.
 #[allow(clippy::needless_pass_by_value)]
 #[must_use]
 pub fn await_detection(handle: DetectionHandle) -> ContainerPortMap {
-    match handle.recv_timeout(ipc::DAEMON_TIMEOUT) {
+    match handle.0.recv_timeout(ipc::DAEMON_TIMEOUT) {
         Ok(Some(container_map)) => container_map,
         Ok(None) => {
             debug!("container runtime detection returned no data");

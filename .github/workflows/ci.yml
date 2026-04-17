@@ -127,7 +127,7 @@ jobs:
 
       - name: Install gungraun-runner
         run: |
-          version=$(cargo metadata --format-version=1 --no-deps | python -c "import json, sys; data = json.load(sys.stdin); print(next(pkg['version'] for pkg in data['packages'] if pkg['name'] == 'gungraun'))")
+          version=$(cargo metadata --format-version=1 | python -c "import json, sys; data = json.load(sys.stdin); print(next(pkg['version'] for pkg in data['packages'] if pkg['name'] == 'gungraun'))")
           cargo install --locked gungraun-runner --version "$version"
 
       - name: Resolve merge-base

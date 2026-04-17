@@ -57,22 +57,18 @@ pub fn docker_host_tcp_addr() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<String> {
-    let mut socket_paths = Vec::new();
-
-    socket_paths.extend([
-        "/var/run/docker.sock".to_string(),
-        format!("/run/user/{uid}/docker.sock"),
-        format!("/run/user/{uid}/podman/podman.sock"),
-        "/run/podman/podman.sock".to_string(),
-    ]);
+pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let mut socket_paths = vec![
+        std::path::PathBuf::from("/var/run/docker.sock"),
+        std::path::PathBuf::from(format!("/run/user/{uid}/docker.sock")),
+        std::path::PathBuf::from(format!("/run/user/{uid}/podman/podman.sock")),
+        std::path::PathBuf::from("/run/podman/podman.sock"),
+    ];
 
     if let Some(home) = home {
         socket_paths.extend([
-            home.join(".docker/desktop/docker.sock")
-                .display()
-                .to_string(),
-            home.join(".docker/run/docker.sock").display().to_string(),
+            home.join(".docker/desktop/docker.sock"),
+            home.join(".docker/run/docker.sock"),
         ]);
     }
 
@@ -559,13 +555,13 @@ mod tests {
         let home = PathBuf::from("/home/tester");
         let paths = unix_socket_paths(1000, Some(home));
 
-        assert!(paths.contains(&"/run/user/1000/docker.sock".to_string()));
+        assert!(paths.contains(&PathBuf::from("/run/user/1000/docker.sock")));
         assert!(
-            paths.contains(&"/home/tester/.docker/desktop/docker.sock".to_string()),
+            paths.contains(&PathBuf::from("/home/tester/.docker/desktop/docker.sock")),
             "docker desktop linux socket should be probed"
         );
         assert!(
-            paths.contains(&"/home/tester/.docker/run/docker.sock".to_string()),
+            paths.contains(&PathBuf::from("/home/tester/.docker/run/docker.sock")),
             "legacy user-scoped docker socket should still be probed"
         );
     }

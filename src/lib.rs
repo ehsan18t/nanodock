@@ -492,7 +492,7 @@ fn send_stop_request_platform(endpoint: &str, home: Option<PathBuf>) -> Option<u
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
     for path in ipc::unix_socket_paths(uid, home) {
-        if let Some(code) = ipc::stop_via_unix_socket(Path::new(&path), endpoint)
+        if let Some(code) = ipc::stop_via_unix_socket(&path, endpoint)
             && let Some(result) = fold_stop_code(code, &mut not_found)
         {
             return Some(result);
@@ -557,7 +557,7 @@ fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
     let responses = ipc::fetch_all_successes(ipc::unix_socket_paths(uid, home), |path| {
-        ipc::fetch_unix_socket_json(Path::new(&path))
+        ipc::fetch_unix_socket_json(&path)
     });
 
     merge_daemon_response_bodies(responses)
@@ -580,7 +580,7 @@ fn query_daemon(home: Option<PathBuf>) -> Option<ContainerPortMap> {
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
     let responses = ipc::fetch_all_successes(ipc::unix_socket_paths(uid, home), |path| {
-        ipc::fetch_unix_socket_json(Path::new(&path))
+        ipc::fetch_unix_socket_json(&path)
     });
 
     merge_daemon_responses(responses)

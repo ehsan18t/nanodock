@@ -70,6 +70,10 @@ pub fn send_http_request(stream: &mut (impl Read + std::io::Write)) -> Option<St
 /// then delegates to `httparse::Response::parse` for robust parsing.
 /// The reader is left positioned at the start of the response body.
 fn read_response_headers(reader: &mut impl BufRead) -> Option<ParsedHeaders> {
+    // Cap total header accumulation at 64 KiB to prevent unbounded memory
+    // growth from a misbehaving or adversarial daemon on the local socket.
+    const MAX_HEADER_SIZE: usize = 64 * 1024;
+
     // Pre-allocate for a typical Docker daemon header payload.
     let mut raw = Vec::with_capacity(1024);
 
@@ -80,6 +84,9 @@ fn read_response_headers(reader: &mut impl BufRead) -> Option<ParsedHeaders> {
     loop {
         let start = raw.len();
         if reader.read_until(b'\n', &mut raw).ok()? == 0 {
+            return None;
+        }
+        if raw.len() > MAX_HEADER_SIZE {
             return None;
         }
         let line = &raw[start..];

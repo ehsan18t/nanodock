@@ -3,14 +3,12 @@ name = "nanodock"
 version = "0.1.0"
 edition = "2024"
 autobenches = false
-authors = ["Ehsan Khan"]
-description = "Zero-dependency-light Docker/Podman daemon client for container detection, port mapping, and lifecycle control"
+description = "Minimal synchronous Docker/Podman client for container detection, port mapping, and lifecycle control"
 license = "MIT"
 readme = "README.md"
 keywords = ["docker", "podman", "container", "port", "daemon"]
-categories = ["os", "network-programming"]
+categories = ["virtualization", "network-programming"]
 repository = "https://github.com/ehsan18t/nanodock"
-homepage = "https://github.com/ehsan18t/nanodock"
 documentation = "https://docs.rs/nanodock"
 
 [lints.clippy]

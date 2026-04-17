@@ -28,6 +28,22 @@
   at runtime. No async runtime, no `tokio`, no `hyper`.
 - **Cross-platform** - Works on Linux (x86-64) and Windows (x86-64).
 
+## Why nanodock?
+
+Most Rust Docker libraries (`bollard`, `docker-api`) are full API clients that
+require an async runtime and pull in 30-50+ transitive dependencies. nanodock
+takes the opposite approach: synchronous, minimal, and focused.
+
+| Crate        | Async | Runtime Deps | Scope                         |
+| ------------ | ----- | ------------ | ----------------------------- |
+| `bollard`    | Yes   | ~50+         | Full Docker API               |
+| `docker-api` | Yes   | ~30+         | Full Docker API               |
+| **nanodock** | No    | **4**        | Detection + Ports + Lifecycle |
+
+Use nanodock when you need container awareness (detection, port mapping,
+lifecycle control) without pulling in an async runtime or a full Docker SDK.
+Ideal for CLI tools, system utilities, and monitoring agents.
+
 ## Quick Start
 
 Add nanodock to your `Cargo.toml`:
@@ -280,44 +296,9 @@ All of the following must pass before merging:
 
 ## Instruction Benchmarks
 
-nanodock ships a Gungraun benchmark suite for the two hot paths most likely to
-regress in real use: parsing daemon `/containers/json` payloads and matching
-host sockets back to published container bindings.
-
-Unlike Criterion, Gungraun measures instruction counts and related Callgrind
-metrics instead of wall-clock time. The benchmark output is written under
-`target/gungraun/`.
-
-Important constraints from the upstream Gungraun docs:
-
-- benchmark execution requires Linux plus Valgrind
-- benchmark execution also requires a version-matched `gungraun-runner` binary
-- Windows can compile the benchmark harness with `cargo bench --no-run`, but it
-  cannot execute the benchmarks
-
-To install the benchmark runtime on Linux:
-
-```bash
-sudo apt-get install valgrind
-cargo install --version 0.18.1 gungraun-runner
-```
-
-To create and compare a named baseline locally:
-
-```bash
-cargo bench --bench benchmarks -- --save-baseline=main --callgrind-metrics=ir
-cargo bench --bench benchmarks -- --baseline=main --callgrind-metrics=ir --callgrind-limits='ir=1.0%'
-```
-
-Pull requests run a Linux benchmark job that:
-
-- saves a merge-base baseline from `main`
-- compares the PR head against that baseline using instruction deltas (`Ir`)
-- fails the job if any benchmark regresses by more than 1%
-- uploads raw console output plus the generated `target/gungraun/` reports as artifacts
-
-If you update the `gungraun` crate version, update the installed
-`gungraun-runner` version in CI and local setup to match.
+nanodock ships deterministic instruction-count benchmarks via
+[Gungraun](https://crates.io/crates/gungraun) (requires Linux + Valgrind).
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for setup and usage details.
 
 ### Git Hooks
 

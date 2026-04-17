@@ -387,6 +387,9 @@ fn read_named_pipe_bytes(
 fn wait_named_pipe(path: &str, deadline: std::time::Instant) -> Option<()> {
     let timeout_ms = remaining_timeout_ms(deadline)?;
     let wide_path = wide_string(path);
+    // SAFETY: `wide_path` is a valid null-terminated UTF-16 string produced by
+    // `wide_string`, and `timeout_ms` is a plain u32. No aliasing or lifetime
+    // invariants apply; the kernel copies the string internally.
     let success = unsafe { WaitNamedPipeW(wide_path.as_ptr(), timeout_ms) };
     (success != 0).then_some(())
 }
@@ -394,6 +397,11 @@ fn wait_named_pipe(path: &str, deadline: std::time::Instant) -> Option<()> {
 #[cfg(windows)]
 fn peek_available_bytes(stream: &std::fs::File) -> Option<u32> {
     let mut available = 0;
+    // SAFETY: `stream` is an open named-pipe file whose raw handle is valid
+    // for the lifetime of this call. We pass null for all output pointers
+    // except `total_bytes_avail`, which points to a stack-local u32. The
+    // zero-length buffer and null `bytes_read` pointer tell the kernel we
+    // only want the available-byte count, not actual data.
     let success = unsafe {
         PeekNamedPipe(
             stream.as_raw_handle(),

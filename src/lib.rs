@@ -404,50 +404,82 @@ fn interpret_stop_status(status_code: u16, force: bool) -> StopOutcome {
 }
 
 /// Try each known transport until one successfully sends the POST request.
+///
+/// A 404 ("not found") response does not short-circuit: the container may
+/// exist on a different daemon (e.g., Podman when Docker returns 404).
 fn send_stop_request(endpoint: &str, home: Option<PathBuf>) -> Option<u16> {
     // TCP via DOCKER_HOST takes precedence (both platforms).
     if let Some(addr) = ipc::docker_host_tcp_addr()
         && let Some(code) = ipc::stop_via_tcp(&addr, endpoint)
     {
-        return Some(code);
+        if code != 404 {
+            return Some(code);
+        }
+        // Container not found on TCP daemon; try platform sockets before
+        // giving up, but remember the 404 as a fallback.
+        return Some(send_stop_request_platform(endpoint, home).unwrap_or(code));
     }
 
     send_stop_request_platform(endpoint, home)
+}
+
+/// Return `code` if it is NOT a 404, otherwise fold it into `fallback` so the
+/// caller can return the 404 only after all daemons have been tried.
+const fn fold_stop_code(code: u16, fallback: &mut Option<u16>) -> Option<u16> {
+    if code == 404 {
+        *fallback = Some(404);
+        None
+    } else {
+        Some(code)
+    }
 }
 
 #[cfg(unix)]
 fn send_stop_request_platform(endpoint: &str, home: Option<PathBuf>) -> Option<u16> {
     use std::path::Path;
 
+    let mut not_found = None;
+
     // Honour DOCKER_HOST unix:// if set.
     if let Some(path) = ipc::docker_host_unix_path()
         && let Some(code) = ipc::stop_via_unix_socket(Path::new(&path), endpoint)
+        && let Some(result) = fold_stop_code(code, &mut not_found)
     {
-        return Some(code);
+        return Some(result);
     }
 
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
     for path in ipc::unix_socket_paths(uid, home) {
-        if let Some(code) = ipc::stop_via_unix_socket(Path::new(&path), endpoint) {
-            return Some(code);
+        if let Some(code) = ipc::stop_via_unix_socket(Path::new(&path), endpoint)
+            && let Some(result) = fold_stop_code(code, &mut not_found)
+        {
+            return Some(result);
         }
     }
-    None
+    not_found
 }
 
 #[cfg(windows)]
 fn send_stop_request_platform(endpoint: &str, _home: Option<PathBuf>) -> Option<u16> {
+    let mut not_found = None;
+
     // Honour DOCKER_HOST npipe:// if set.
     if let Some(path) = ipc::docker_host_npipe_path()
         && let Some(code) = ipc::stop_via_named_pipe(&path, endpoint)
+        && let Some(result) = fold_stop_code(code, &mut not_found)
     {
-        return Some(code);
+        return Some(result);
     }
 
-    DEFAULT_PIPE_PATHS
-        .iter()
-        .find_map(|path| ipc::stop_via_named_pipe(path, endpoint))
+    for path in DEFAULT_PIPE_PATHS {
+        if let Some(code) = ipc::stop_via_named_pipe(path, endpoint)
+            && let Some(result) = fold_stop_code(code, &mut not_found)
+        {
+            return Some(result);
+        }
+    }
+    not_found
 }
 
 // ── Platform-specific daemon queries ─────────────────────────────────
@@ -566,9 +598,11 @@ where
     I: IntoIterator<Item = T>,
 {
     let mut saw_response = false;
+    let mut has_content = false;
     let mut combined = String::from("[");
 
     for response in responses {
+        saw_response = true;
         let body = response.as_ref().trim();
         // Each daemon returns a JSON array; unwrap the outer brackets and
         // concatenate elements so the caller sees a single flat array.
@@ -578,13 +612,12 @@ where
             .unwrap_or(body)
             .trim();
         if inner.is_empty() {
-            saw_response = true;
             continue;
         }
-        if saw_response {
+        if has_content {
             combined.push(',');
         }
-        saw_response = true;
+        has_content = true;
         combined.push_str(inner);
     }
 

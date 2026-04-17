@@ -1,14 +1,14 @@
-# nanodock
-
-A lightweight Rust library for detecting Docker and Podman containers, mapping
-their published ports to host sockets, and controlling container lifecycle. Built
-for embedding into CLI tools and system utilities that need container awareness
-without pulling in a full Docker SDK.
+<div align="center">
+    <h1>nanodock</h1>
+    <p>A lightweight zero-bloat Rust library for detecting Docker and Podman containers, mapping their published ports to host sockets, and controlling container lifecycle. Built for embedding into CLI tools and system utilities that need container awareness without pulling in a full Docker SDK.</p>
 
 [![CI](https://github.com/ehsan18t/nanodock/actions/workflows/ci.yml/badge.svg)](https://github.com/ehsan18t/nanodock/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/nanodock.svg)](https://crates.io/crates/nanodock)
 [![docs.rs](https://docs.rs/nanodock/badge.svg)](https://docs.rs/nanodock)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+</div>
+
 
 ## Features
 

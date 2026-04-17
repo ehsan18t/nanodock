@@ -16,7 +16,7 @@ use crate::ContainerInfo;
 use crate::api::short_container_id;
 
 /// Cache for rootless Podman container lookups keyed by process and network namespace.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct RootlessPodmanResolver {
     containers_by_netns: Option<HashMap<PathBuf, ContainerInfo>>,
     containers_by_pid: HashMap<u32, Option<ContainerInfo>>,

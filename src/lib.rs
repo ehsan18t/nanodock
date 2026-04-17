@@ -51,7 +51,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use log::debug;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ── Public API re-exports ────────────────────────────────────────────
 
@@ -104,11 +104,17 @@ impl std::error::Error for Error {
     }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Self::InvalidJson(err)
+    }
+}
+
 // ── Protocol ─────────────────────────────────────────────────────────
 
 /// Network transport protocol.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Protocol {
     /// Transmission Control Protocol.
     #[serde(rename = "TCP")]
@@ -130,7 +136,7 @@ impl std::fmt::Display for Protocol {
 // ── Container types ──────────────────────────────────────────────────
 
 /// Metadata about a running container that has published ports.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContainerInfo {
     /// Full container ID (hex string) for API calls, empty when unavailable.
     pub id: String,
@@ -177,7 +183,7 @@ fn insert_test_container(
 
 /// Result of matching a socket against published container port bindings.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PublishedContainerMatch<'a> {
     /// Exactly one container binding matched the socket.
     Match(&'a ContainerInfo),
@@ -185,6 +191,16 @@ pub enum PublishedContainerMatch<'a> {
     NotFound,
     /// Multiple distinct published bindings matched and no safe choice exists.
     Ambiguous,
+}
+
+impl std::fmt::Display for PublishedContainerMatch<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Match(info) => write!(f, "{info}"),
+            Self::NotFound => write!(f, "no matching container"),
+            Self::Ambiguous => write!(f, "ambiguous match"),
+        }
+    }
 }
 
 /// Handle for an in-progress Docker/Podman container detection.

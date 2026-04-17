@@ -12,6 +12,8 @@
 //!
 //! ## Quick start
 //!
+//! ### Best-effort path (background thread, never errors)
+//!
 //! ```rust,no_run
 //! use nanodock::{start_detection, await_detection};
 //!
@@ -20,6 +22,21 @@
 //! let port_map = await_detection(handle);
 //! for ((ip, port, proto), info) in &port_map {
 //!     println!("{proto} port {port} -> {} ({})", info.name, info.image);
+//! }
+//! ```
+//!
+//! ### Strict path (synchronous, returns errors)
+//!
+//! ```rust,no_run
+//! use nanodock::detect_containers;
+//!
+//! match detect_containers(None) {
+//!     Ok(port_map) => {
+//!         for ((ip, port, proto), info) in &port_map {
+//!             println!("{proto} port {port} -> {} ({})", info.name, info.image);
+//!         }
+//!     }
+//!     Err(e) => eprintln!("detection failed: {e}"),
 //! }
 //! ```
 
@@ -39,11 +56,53 @@ use serde::Serialize;
 // ── Public API re-exports ────────────────────────────────────────────
 
 pub use api::parse_containers_json;
+pub use api::parse_containers_json_strict;
 pub use api::short_container_id;
 #[cfg(target_os = "linux")]
 pub use podman::is_podman_rootlessport_process;
 #[cfg(target_os = "linux")]
 pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
+
+// ── Error type ───────────────────────────────────────────────────────
+
+/// Error returned by [`detect_containers`] when the daemon cannot be
+/// reached or returns an unusable response.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum Error {
+    /// No container runtime daemon was reachable on any known transport
+    /// (Unix sockets, Windows named pipes, or TCP via `DOCKER_HOST`).
+    DaemonNotFound,
+
+    /// A daemon transport connected but the response body was not valid
+    /// JSON for the container-list endpoint.
+    InvalidJson(serde_json::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DaemonNotFound => {
+                write!(
+                    f,
+                    "no container runtime daemon found on any known transport"
+                )
+            }
+            Self::InvalidJson(source) => {
+                write!(f, "container daemon returned invalid JSON: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DaemonNotFound => None,
+            Self::InvalidJson(source) => Some(source),
+        }
+    }
+}
 
 // ── Protocol ─────────────────────────────────────────────────────────
 
@@ -186,6 +245,34 @@ fn unique_published_container(
 }
 
 // ── Detection orchestration ──────────────────────────────────────────
+
+/// Synchronously detect Docker/Podman containers and their published ports.
+///
+/// Tries all known daemon transports (TCP via `DOCKER_HOST`, Unix
+/// sockets on Linux, Windows named pipes) and returns the first
+/// successful result. Returns an error if no daemon could be reached
+/// or if the response could not be parsed.
+///
+/// Unlike [`start_detection`] / [`await_detection`], this function
+/// blocks the calling thread and surfaces errors so the caller can
+/// distinguish "no containers running" (empty map) from "daemon
+/// unreachable" ([`Error::DaemonNotFound`]).
+///
+/// # Errors
+///
+/// Returns [`Error::DaemonNotFound`] when no transport connected.
+/// Returns [`Error::InvalidJson`] when the daemon responded but the
+/// body was not valid container-list JSON.
+pub fn detect_containers(home: Option<PathBuf>) -> Result<ContainerPortMap, Error> {
+    debug!("starting synchronous container runtime detection");
+    let body = query_daemon_body(home).ok_or(Error::DaemonNotFound)?;
+    let map = api::parse_containers_json_strict(&body).map_err(Error::InvalidJson)?;
+    debug!(
+        "finished synchronous container runtime detection: port_mappings={}",
+        map.len()
+    );
+    Ok(map)
+}
 
 /// Start asynchronous detection of Docker/Podman containers.
 ///
@@ -365,12 +452,42 @@ fn send_stop_request_platform(endpoint: &str, _home: Option<PathBuf>) -> Option<
 
 // ── Platform-specific daemon queries ─────────────────────────────────
 
+/// If `DOCKER_HOST` is set to a `tcp://` URL, query it and return the
+/// raw JSON body.
+///
+/// Shared across Unix and Windows since the TCP transport is
+/// platform-agnostic.
+fn query_docker_host_tcp_body() -> Option<String> {
+    let addr = ipc::docker_host_tcp_addr()?;
+    ipc::fetch_tcp_json(&addr)
+}
+
 /// If `DOCKER_HOST` is set to a `tcp://` URL, query it and return the map.
 ///
 /// Shared across Unix and Windows since the TCP transport is platform-agnostic.
 fn query_docker_host_tcp() -> Option<ContainerPortMap> {
-    let addr = ipc::docker_host_tcp_addr()?;
-    ipc::fetch_tcp_json(&addr).map(|body| api::parse_containers_json(&body))
+    query_docker_host_tcp_body().map(|body| api::parse_containers_json(&body))
+}
+
+#[cfg(unix)]
+fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
+    use std::path::Path;
+
+    if let Some(body) = query_docker_host_tcp_body() {
+        return Some(body);
+    }
+
+    if let Some(path) = ipc::docker_host_unix_path() {
+        return ipc::fetch_unix_socket_json(Path::new(&path));
+    }
+
+    // Safety: getuid() is a simple syscall with no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let responses = ipc::fetch_all_successes(ipc::unix_socket_paths(uid, home), |path| {
+        ipc::fetch_unix_socket_json(Path::new(&path))
+    });
+
+    merge_daemon_response_bodies(responses)
 }
 
 #[cfg(unix)]
@@ -403,6 +520,25 @@ const DEFAULT_PIPE_PATHS: &[&str] = &[
 ];
 
 #[cfg(windows)]
+fn query_daemon_body(_home: Option<PathBuf>) -> Option<String> {
+    if let Some(body) = query_docker_host_tcp_body() {
+        return Some(body);
+    }
+
+    let deadline = std::time::Instant::now() + ipc::DAEMON_TIMEOUT;
+
+    if let Some(path) = ipc::docker_host_npipe_path()
+        && let Some(body) = ipc::fetch_named_pipe_json(&path, deadline)
+    {
+        return Some(body);
+    }
+
+    DEFAULT_PIPE_PATHS
+        .iter()
+        .find_map(|path| ipc::fetch_named_pipe_json(path, deadline))
+}
+
+#[cfg(windows)]
 fn query_daemon(_home: Option<PathBuf>) -> Option<ContainerPortMap> {
     if let Some(map) = query_docker_host_tcp() {
         return Some(map);
@@ -421,6 +557,43 @@ fn query_daemon(_home: Option<PathBuf>) -> Option<ContainerPortMap> {
         .iter()
         .find_map(|path| ipc::fetch_named_pipe_json(path, deadline))
         .map(|body| api::parse_containers_json(&body))
+}
+
+#[cfg(unix)]
+fn merge_daemon_response_bodies<T, I>(responses: I) -> Option<String>
+where
+    T: AsRef<str>,
+    I: IntoIterator<Item = T>,
+{
+    let mut saw_response = false;
+    let mut combined = String::from("[");
+
+    for response in responses {
+        let body = response.as_ref().trim();
+        // Each daemon returns a JSON array; unwrap the outer brackets and
+        // concatenate elements so the caller sees a single flat array.
+        let inner = body
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(body)
+            .trim();
+        if inner.is_empty() {
+            saw_response = true;
+            continue;
+        }
+        if saw_response {
+            combined.push(',');
+        }
+        saw_response = true;
+        combined.push_str(inner);
+    }
+
+    if !saw_response {
+        return None;
+    }
+
+    combined.push(']');
+    Some(combined)
 }
 
 #[cfg(unix)]

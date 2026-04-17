@@ -39,6 +39,10 @@ nanodock = "0.1"
 
 ### Detect containers and map ports
 
+Two detection paths are available:
+
+**Best-effort path** (background thread, never errors):
+
 ```rust,no_run
 use nanodock::{start_detection, await_detection};
 
@@ -56,6 +60,26 @@ fn main() {
             "{proto} port {port} -> container '{}' (image: {})",
             info.name, info.image
         );
+    }
+}
+```
+
+**Strict path** (synchronous, returns errors):
+
+```rust,no_run
+use nanodock::detect_containers;
+
+fn main() {
+    match detect_containers(None) {
+        Ok(port_map) => {
+            for ((ip, port, proto), info) in &port_map {
+                println!(
+                    "{proto} port {port} -> container '{}' (image: {})",
+                    info.name, info.image
+                );
+            }
+        }
+        Err(e) => eprintln!("detection failed: {e}"),
     }
 }
 ```
@@ -83,6 +107,7 @@ fn main() {
         PublishedContainerMatch::Ambiguous => {
             println!("Multiple containers match port 5432");
         }
+        _ => {}
     }
 }
 ```
@@ -99,6 +124,7 @@ fn main() {
         StopOutcome::AlreadyStopped => println!("Container was already stopped"),
         StopOutcome::NotFound => println!("Container not found"),
         StopOutcome::Failed => println!("Could not reach daemon"),
+        _ => println!("Unexpected outcome"),
     }
 }
 ```
@@ -162,16 +188,19 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `PublishedContainerMatch` | Result of looking up a socket in the port map             |
 | `StopOutcome`             | Result of a stop/kill request                             |
 | `DetectionHandle`         | Handle for in-progress background detection               |
+| `Error`                   | Error type for strict-path detection failures             |
 
 ### Core Functions
 
-| Function                          | Description                                   |
-| --------------------------------- | --------------------------------------------- |
-| `start_detection(home)`           | Spawn background daemon query, returns handle |
-| `await_detection(handle)`         | Block for results (3s timeout), returns map   |
-| `lookup_published_container()`    | Match a socket against the port map           |
-| `stop_container(id, force, home)` | Stop or kill a container by ID                |
-| `parse_containers_json(body)`     | Parse raw `/containers/json` response         |
+| Function                          | Description                                         |
+| --------------------------------- | --------------------------------------------------- |
+| `detect_containers(home)`         | Synchronous detection, returns `Result<Map, Error>` |
+| `start_detection(home)`           | Spawn background daemon query, returns handle       |
+| `await_detection(handle)`         | Block for results (3s timeout), returns map         |
+| `lookup_published_container()`    | Match a socket against the port map                 |
+| `stop_container(id, force, home)` | Stop or kill a container by ID                      |
+| `parse_containers_json(body)`     | Parse raw `/containers/json` response               |
+| `parse_containers_json_strict()`  | Strict parse that returns `Result` on invalid JSON  |
 
 ### Linux-only Functions
 

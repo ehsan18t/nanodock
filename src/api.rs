@@ -50,13 +50,29 @@ pub fn parse_containers_json(json_body: &str) -> ContainerPortMap {
         return map;
     };
 
+    populate_port_map(&mut map, &containers);
+    map
+}
+
+/// Strict variant of [`parse_containers_json`] that propagates JSON
+/// deserialization errors instead of silently returning an empty map.
+pub fn parse_containers_json_strict(
+    json_body: &str,
+) -> Result<ContainerPortMap, serde_json::Error> {
+    let containers = serde_json::from_str::<Vec<DockerContainer<'_>>>(json_body)?;
+    let mut map = ContainerPortMap::new();
+    populate_port_map(&mut map, &containers);
+    Ok(map)
+}
+
+fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'_>]) {
     for container in containers {
         let id = container.id.unwrap_or("").to_string();
-        let name = container_display_name(&container);
+        let name = container_display_name(container);
         let image = container.image.unwrap_or("").to_string();
         let info = ContainerInfo { id, name, image };
 
-        let Some(ports) = container.ports else {
+        let Some(ports) = &container.ports else {
             continue;
         };
 
@@ -78,8 +94,6 @@ pub fn parse_containers_json(json_body: &str) -> ContainerPortMap {
             }
         }
     }
-
-    map
 }
 
 fn deserialize_host_ip<'de, D>(deserializer: D) -> Result<Option<IpAddr>, D::Error>
@@ -438,6 +452,40 @@ mod tests {
                 Protocol::Udp
             )),
             "unspecified IPv6 bindings should be normalized to the wildcard key"
+        );
+    }
+
+    #[test]
+    fn parse_strict_returns_error_on_invalid_json() {
+        let result = parse_containers_json_strict("not json");
+        assert!(
+            result.is_err(),
+            "strict parser must propagate deserialization errors"
+        );
+    }
+
+    #[test]
+    fn parse_strict_succeeds_on_valid_json() {
+        let map = parse_containers_json_strict(SAMPLE_RESPONSE)
+            .expect("strict parser should succeed on valid JSON");
+        assert_eq!(map.len(), 2);
+        assert_container_mapping(
+            &map,
+            None,
+            5432,
+            Protocol::Tcp,
+            "backend-postgres-1",
+            "postgres:16",
+        );
+    }
+
+    #[test]
+    fn parse_strict_returns_empty_map_for_empty_array() {
+        let map = parse_containers_json_strict("[]")
+            .expect("strict parser should succeed on empty array");
+        assert!(
+            map.is_empty(),
+            "empty JSON array should produce an empty map, not an error"
         );
     }
 }

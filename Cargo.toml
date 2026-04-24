@@ -1,6 +1,6 @@
 [package]
 name = "nanodock"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 autobenches = false
 description = "Minimal synchronous Docker/Podman client for container detection, port mapping, and lifecycle control"

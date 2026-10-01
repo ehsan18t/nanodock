@@ -123,7 +123,7 @@ and tuned for nanodock's library-crate positioning.
   decide whether to `Arc`/`Rc` the result.
 - **Configuration lives on `Client`**: home directory, detection timeout, and
   `DOCKER_HOST` override, each a chainable setter. The free functions
-  (`detect_containers`, `start_detection`, `stop_container`) are thin
+  (`detect_containers`, `start_detection`, `stop_container`, `kill_container`) are thin
   shorthands over `Client::new()` and take no settings. New settings go on
   `Client`; do NOT add parameters to the free functions.
 - **Timeouts**: The default 3-second detection timeout suits interactive CLI

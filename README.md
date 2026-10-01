@@ -167,14 +167,16 @@ fn main() {
 }
 ```
 
-### Stop a container
+### Stop or kill a container
+
+`stop_container` asks the daemon to stop the container gracefully (SIGTERM, then SIGKILL after 10 seconds), and `kill_container` kills it at once. Both return a `StopOutcome`.
 
 ```rust,no_run
 use nanodock::{stop_container, StopOutcome};
 
 fn main() {
     let container_id = "abc123def456";
-    match stop_container(container_id, false) {
+    match stop_container(container_id) {
         StopOutcome::Stopped => println!("Container stopped"),
         StopOutcome::AlreadyStopped => println!("Container was already stopped"),
         StopOutcome::NotFound => println!("Container not found"),
@@ -207,7 +209,7 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Transport Discovery Order
 
-1. **`DOCKER_HOST` environment variable** (or `Client::docker_host`) - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
+1. **`DOCKER_HOST` environment variable** (or `Client::docker_host`) - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. Stop and kill requests try the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop or kill to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
 2. **Platform-native sockets** - On Linux and macOS, the well-known Unix socket paths below are checked (rootful and rootless Docker, Podman, Docker Desktop, Colima, OrbStack, Rancher Desktop, Lima, and Podman machine). Paths that do not exist are skipped before any connection is attempted, and paths that resolve to the same file (for example `/var/run/docker.sock` symlinked to another runtime's socket) are queried once, at the first position. On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged; when two daemons report the same port, the one earlier in this list wins.
 3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless
    Podman, nanodock reads the overlay storage metadata to resolve container
@@ -251,7 +253,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 | Type                      | Description                                                                         |
 | ------------------------- | ----------------------------------------------------------------------------------- |
-| `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, `stop` |
+| `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, `stop`, `kill` |
 | `ContainerInfo`           | Container metadata: id, name, image, Compose project and service                    |
 | `ContainerPortMap`        | Map from `(host_ip, port, protocol)` to a shared `ContainerInfo`                    |
 | `PortMapIter`             | Iterator over the bindings of a `ContainerPortMap`                                  |
@@ -271,14 +273,16 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `.home(home)`, `.timeout(t)`, `.docker_host(h)`   | Chainable settings                                         |
 | `Client::detect()`                                | Synchronous detection, returns `Result<ContainerPortMap, Error>` |
 | `Client::start_detection()`                       | Spawn a background detection, returns a `DetectionHandle`  |
-| `Client::stop(id, force)`                         | Stop or kill a container by ID or name                     |
+| `Client::stop(id)`                                | Stop a container by ID or name (SIGTERM, 10 second grace)  |
+| `Client::kill(id)`                                | Kill a container by ID or name (immediate SIGKILL)         |
 | `DetectionHandle::wait()`                         | Wait for the result (empty map on failure or timeout)      |
 | `DetectionHandle::wait_result()`                  | Wait for the result, keeping the `Error`                   |
 | `ContainerPortMap::lookup(ip, port, proto, fallback)` | Match a socket address against the published ports     |
 | `ContainerPortMap::get(host_ip, port, proto)`     | Exact binding lookup                                       |
 | `detect_containers()`                             | Shorthand for `Client::new().detect()`                     |
 | `start_detection()`                               | Shorthand for `Client::new().start_detection()`            |
-| `stop_container(id, force)`                       | Shorthand for `Client::new().stop(id, force)`              |
+| `stop_container(id)`                              | Shorthand for `Client::new().stop(id)`                     |
+| `kill_container(id)`                              | Shorthand for `Client::new().kill(id)`                     |
 | `parse_containers_json(body)`                     | Lenient parse of a raw `/containers/json` response         |
 | `parse_containers_json_strict(body)`              | Strict parse that fails with `ParseError` on invalid JSON  |
 | `short_container_id(id)`                          | The 12-character short form of a container ID              |

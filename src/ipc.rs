@@ -1870,26 +1870,30 @@ mod tests {
 
     #[test]
     fn stop_after_close_after_request_never_tries_next_endpoint() {
-        let first = TestDaemon::start(answer_ping_only);
-        let second = TestDaemon::start(answer_ping_then_204);
+        for kind in [crate::StopKind::Graceful, crate::StopKind::Kill] {
+            let first = TestDaemon::start(answer_ping_only);
+            let second = TestDaemon::start(answer_ping_then_204);
+            let endpoint = crate::stop_endpoint("web", kind);
 
-        let targets = [(false, first.addr.clone()), (false, second.addr.clone())];
-        let attempt = crate::first_stop_owner(targets, |addr| {
-            stop_via_tcp(&addr, "/containers/web/stop?t=10")
-        });
-        let first_requests = first.finish();
-        let second_requests = second.finish();
+            let targets = [(false, first.addr.clone()), (false, second.addr.clone())];
+            let attempt = crate::first_stop_owner(targets, |addr| stop_via_tcp(&addr, &endpoint));
+            let first_requests = first.finish();
+            let second_requests = second.finish();
 
-        assert_eq!(
-            crate::stop_outcome(attempt, false),
-            crate::StopOutcome::NoResponse,
-            "an unanswered stop has an unknown result"
-        );
-        assert!(any_post(&first_requests), "the first daemon got the stop");
-        assert!(
-            second_requests.is_empty(),
-            "a same-named container on the second daemon must not be touched"
-        );
+            assert_eq!(
+                crate::stop_outcome(attempt, kind),
+                crate::StopOutcome::NoResponse,
+                "an unanswered {kind:?} request has an unknown result"
+            );
+            assert!(
+                any_post(&first_requests),
+                "the first daemon got the {kind:?} request"
+            );
+            assert!(
+                second_requests.is_empty(),
+                "a same-named container on the second daemon must not be touched by {kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -1905,7 +1909,7 @@ mod tests {
         drop(daemon.finish());
 
         assert_eq!(
-            crate::stop_outcome(attempt, false),
+            crate::stop_outcome(attempt, crate::StopKind::Graceful),
             crate::StopOutcome::Stopped,
             "the live daemon behind the dead forwarder is used"
         );

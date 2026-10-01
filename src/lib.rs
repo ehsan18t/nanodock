@@ -7,14 +7,15 @@
 //! ## Overview
 //!
 //! - [`Client`] holds the daemon settings (home directory, detection
-//!   timeout, `DOCKER_HOST` override) and runs detection and stop requests.
-//!   [`detect_containers`], [`start_detection`], and [`stop_container`] are
-//!   shorthands for a default client.
+//!   timeout, `DOCKER_HOST` override) and runs detection, stop, and kill
+//!   requests. [`detect_containers`], [`start_detection`],
+//!   [`stop_container`], and [`kill_container`] are shorthands for a default
+//!   client.
 //! - Detection returns a [`ContainerPortMap`] from published
 //!   `(host_ip, port, protocol)` bindings to [`ContainerInfo`].
 //!   [`ContainerPortMap::lookup`] finds the container behind a local socket.
 //! - Failures are reported as an [`Error`] that says what happened, and stop
-//!   requests as a [`StopOutcome`].
+//!   and kill requests as a [`StopOutcome`].
 //!
 //! ## Cargo features
 //!
@@ -821,11 +822,12 @@ impl Client {
         }
     }
 
-    /// Stop or kill a running container through the daemon API.
+    /// Stop a running container gracefully through the daemon API.
     ///
-    /// When `force` is false, sends `POST /containers/{id}/stop?t=10`
-    /// (SIGTERM, then SIGKILL after 10 seconds). When `force` is true,
-    /// sends `POST /containers/{id}/kill` (immediate SIGKILL).
+    /// Sends `POST /containers/{id}/stop?t=10`: the daemon sends the
+    /// container's stop signal (SIGTERM by default) and kills it if it is
+    /// still running 10 seconds later. Use [`Client::kill`] to kill it at
+    /// once.
     ///
     /// The `id` can be a container ID (hex) or a container name. Characters
     /// that would corrupt the HTTP request path (`/`, `?`, `#`, `%`, control
@@ -853,15 +855,35 @@ impl Client {
     /// The detection timeout does not apply: a stop allows for the grace
     /// period plus a margin (20 seconds overall).
     #[must_use]
-    pub fn stop(&self, id: &str, force: bool) -> StopOutcome {
+    pub fn stop(&self, id: &str) -> StopOutcome {
+        self.send_stop(id, StopKind::Graceful)
+    }
+
+    /// Kill a running container at once through the daemon API.
+    ///
+    /// Sends `POST /containers/{id}/kill` (SIGKILL, no grace period). A
+    /// container that is not running is [`StopOutcome::AlreadyStopped`].
+    ///
+    /// The `id`, the daemons tried, their order, the `GET /_ping` check
+    /// before the request, and every outcome rule are the same as for
+    /// [`Client::stop`]: in particular, once a daemon may have received the
+    /// kill request no other daemon is tried, and any reply from the
+    /// `DOCKER_HOST` daemon is the result.
+    #[must_use]
+    pub fn kill(&self, id: &str) -> StopOutcome {
+        self.send_stop(id, StopKind::Kill)
+    }
+
+    /// Validate `id` and send a stop or kill request for it.
+    fn send_stop(&self, id: &str, kind: StopKind) -> StopOutcome {
         if !is_safe_container_id(id) {
             debug!("rejected container id with unsafe characters");
             return StopOutcome::NotFound;
         }
 
-        let endpoint = stop_endpoint(id, force);
+        let endpoint = stop_endpoint(id, kind);
         let attempt = first_stop_owner(self.stop_targets(), |target| target.send_stop(&endpoint));
-        stop_outcome(attempt, force)
+        stop_outcome(attempt, kind)
     }
 }
 
@@ -950,13 +972,22 @@ pub fn start_detection() -> DetectionHandle {
     Client::new().start_detection()
 }
 
-/// Stop or kill a container with a default [`Client`].
+/// Stop a container gracefully with a default [`Client`].
 ///
-/// Shorthand for `Client::new().stop(id, force)`; see [`Client::stop`] and,
-/// for the default settings, [`Client::new`].
+/// Shorthand for `Client::new().stop(id)`; see [`Client::stop`] and, for
+/// the default settings, [`Client::new`].
 #[must_use]
-pub fn stop_container(id: &str, force: bool) -> StopOutcome {
-    Client::new().stop(id, force)
+pub fn stop_container(id: &str) -> StopOutcome {
+    Client::new().stop(id)
+}
+
+/// Kill a container at once with a default [`Client`].
+///
+/// Shorthand for `Client::new().kill(id)`; see [`Client::kill`] and, for
+/// the default settings, [`Client::new`].
+#[must_use]
+pub fn kill_container(id: &str) -> StopOutcome {
+    Client::new().kill(id)
 }
 
 // ── Container stop / kill ────────────────────────────────────────────
@@ -1011,17 +1042,25 @@ impl std::fmt::Display for StopOutcome {
     }
 }
 
+/// Which request ends the container: a graceful stop or an immediate kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopKind {
+    /// `POST /containers/{id}/stop` with an explicit grace period.
+    Graceful,
+    /// `POST /containers/{id}/kill`.
+    Kill,
+}
+
 /// Build the stop or kill endpoint for an already validated container id.
-fn stop_endpoint(id: &str, force: bool) -> String {
-    let endpoint = if force {
-        format!("/containers/{id}/kill")
-    } else {
+fn stop_endpoint(id: &str, kind: StopKind) -> String {
+    let endpoint = match kind {
+        StopKind::Kill => format!("/containers/{id}/kill"),
         // An explicit grace period keeps the daemon's stop time in line
         // with the transport timeout (`ipc::STOP_TIMEOUT`).
-        format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS)
+        StopKind::Graceful => format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS),
     };
     debug!(
-        "attempting container stop: id={} force={force} endpoint={endpoint}",
+        "attempting container stop: id={} kind={kind:?} endpoint={endpoint}",
         short_container_id(id)
     );
     endpoint
@@ -1045,9 +1084,9 @@ fn is_safe_container_id(id: &str) -> bool {
 /// "A daemon received the request but gave no usable reply" is
 /// [`StopOutcome::NoResponse`], never "not found": the container may or may
 /// not have been stopped.
-fn stop_outcome(attempt: ipc::StopAttempt, force: bool) -> StopOutcome {
+fn stop_outcome(attempt: ipc::StopAttempt, kind: StopKind) -> StopOutcome {
     match attempt {
-        ipc::StopAttempt::Status(status_code) => interpret_stop_status(status_code, force),
+        ipc::StopAttempt::Status(status_code) => interpret_stop_status(status_code, kind),
         ipc::StopAttempt::NoResponse => {
             debug!("container runtime daemon did not reply to stop request");
             StopOutcome::NoResponse
@@ -1060,13 +1099,13 @@ fn stop_outcome(attempt: ipc::StopAttempt, force: bool) -> StopOutcome {
 }
 
 /// Map an HTTP status code from the stop/kill endpoint to `StopOutcome`.
-fn interpret_stop_status(status_code: u16, force: bool) -> StopOutcome {
+fn interpret_stop_status(status_code: u16, kind: StopKind) -> StopOutcome {
     match status_code {
         204 => StopOutcome::Stopped,
         // POST /containers/{id}/stop returns 304 when already stopped.
         304 => StopOutcome::AlreadyStopped,
         // POST /containers/{id}/kill returns 409 when container is not running.
-        409 if force => StopOutcome::AlreadyStopped,
+        409 if kind == StopKind::Kill => StopOutcome::AlreadyStopped,
         404 => StopOutcome::NotFound,
         status => {
             debug!("unexpected status code from container stop endpoint: {status}");
@@ -1693,30 +1732,30 @@ mod tests {
     #[test]
     fn interpret_stop_status_204_means_stopped() {
         assert_eq!(
-            interpret_stop_status(204, false),
+            interpret_stop_status(204, StopKind::Graceful),
             StopOutcome::Stopped,
             "204 should mean stopped for graceful stop"
         );
         assert_eq!(
-            interpret_stop_status(204, true),
+            interpret_stop_status(204, StopKind::Kill),
             StopOutcome::Stopped,
-            "204 should mean stopped for force kill"
+            "204 should mean stopped for kill"
         );
     }
 
     #[test]
     fn interpret_stop_status_304_means_already_stopped() {
         assert_eq!(
-            interpret_stop_status(304, false),
+            interpret_stop_status(304, StopKind::Graceful),
             StopOutcome::AlreadyStopped,
             "304 from stop endpoint means already stopped"
         );
     }
 
     #[test]
-    fn interpret_stop_status_409_on_force_means_already_stopped() {
+    fn interpret_stop_status_409_on_kill_means_already_stopped() {
         assert_eq!(
-            interpret_stop_status(409, true),
+            interpret_stop_status(409, StopKind::Kill),
             StopOutcome::AlreadyStopped,
             "409 from kill endpoint means container not running"
         );
@@ -1725,16 +1764,16 @@ mod tests {
     #[test]
     fn interpret_stop_status_409_on_graceful_is_rejected() {
         assert_eq!(
-            interpret_stop_status(409, false),
+            interpret_stop_status(409, StopKind::Graceful),
             StopOutcome::Rejected { status: 409 },
-            "409 on non-force is unexpected and should be reported with its status"
+            "409 on a graceful stop is unexpected and should be reported with its status"
         );
     }
 
     #[test]
     fn interpret_stop_status_404_means_not_found() {
         assert_eq!(
-            interpret_stop_status(404, false),
+            interpret_stop_status(404, StopKind::Graceful),
             StopOutcome::NotFound,
             "404 means container not found"
         );
@@ -1743,7 +1782,7 @@ mod tests {
     #[test]
     fn interpret_stop_status_500_is_rejected() {
         assert_eq!(
-            interpret_stop_status(500, false),
+            interpret_stop_status(500, StopKind::Graceful),
             StopOutcome::Rejected { status: 500 },
             "a server error is reported with its status"
         );
@@ -1906,12 +1945,12 @@ mod tests {
     #[test]
     fn stop_endpoint_sends_explicit_grace_period() {
         assert_eq!(
-            stop_endpoint("abc123", false),
+            stop_endpoint("abc123", StopKind::Graceful),
             format!("/containers/abc123/stop?t={}", ipc::STOP_GRACE_SECS),
             "graceful stop must pin the grace period the transport timeout is sized for"
         );
         assert_eq!(
-            stop_endpoint("abc123", true),
+            stop_endpoint("abc123", StopKind::Kill),
             "/containers/abc123/kill",
             "kill takes no grace period"
         );
@@ -1928,7 +1967,7 @@ mod tests {
         let id = "aaaaaaaaaaa\u{e9}bc";
         assert!(is_safe_container_id(id), "non-ASCII ids pass validation");
         assert_eq!(
-            stop_endpoint(id, false),
+            stop_endpoint(id, StopKind::Graceful),
             format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS),
             "a multi-byte id must not panic when logged"
         );
@@ -1985,7 +2024,7 @@ mod tests {
             "no endpoint was reached"
         );
         assert_eq!(
-            stop_outcome(result, false),
+            stop_outcome(result, StopKind::Kill),
             StopOutcome::Unreachable,
             "no daemon received the request"
         );
@@ -2017,13 +2056,13 @@ mod tests {
     fn stop_after_404_then_silent_daemon_is_no_response_not_not_found() {
         // One default daemon answers 404, then the next one receives the
         // request and never replies: the container may have been stopped.
-        for force in [false, true] {
+        for kind in [StopKind::Graceful, StopKind::Kill] {
             let attempt = first_stop_owner(
                 from_defaults([ipc::StopAttempt::Status(404), ipc::StopAttempt::NoResponse]),
                 |attempt| attempt,
             );
             assert_eq!(
-                stop_outcome(attempt, force),
+                stop_outcome(attempt, kind),
                 StopOutcome::NoResponse,
                 "a daemon that received the stop and went silent must not read as not found"
             );
@@ -2044,7 +2083,7 @@ mod tests {
             },
         );
         assert_eq!(
-            stop_outcome(attempt, false),
+            stop_outcome(attempt, StopKind::Graceful),
             StopOutcome::NotFound,
             "the DOCKER_HOST daemon's answer is final"
         );
@@ -2064,10 +2103,19 @@ mod tests {
             |attempt| attempt,
         );
         assert_eq!(
-            stop_outcome(attempt, false),
+            stop_outcome(attempt, StopKind::Kill),
             StopOutcome::Stopped,
             "only an override that never received the stop falls through"
         );
+    }
+
+    #[test]
+    fn stop_and_kill_reject_unsafe_ids_before_any_request() {
+        let client = Client::new()
+            .home(None)
+            .docker_host(Some("tcp://127.0.0.1:1".to_string()));
+        assert_eq!(client.stop("../etc"), StopOutcome::NotFound);
+        assert_eq!(client.kill("abc?signal=HUP"), StopOutcome::NotFound);
     }
 
     // ── Client ───────────────────────────────────────────────────────

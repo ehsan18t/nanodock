@@ -10,7 +10,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 
 ### Added
 
-- `Client` holds the daemon settings and runs detection and stop requests. `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, and `Client::stop` do what the free functions do; `detect_containers`, `start_detection`, and `stop_container` remain as shorthands for `Client::new()`. The detection timeout (3 seconds by default) is configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
+- `Client` holds the daemon settings and runs detection and stop requests. `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, `Client::stop`, and `Client::kill` do what the free functions do; `detect_containers`, `start_detection`, `stop_container`, and the new `kill_container` are shorthands for `Client::new()`. The detection timeout (3 seconds by default) is configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
 - `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout`, `HttpStatus(u16)`, `InvalidResponse(ParseError)`, and `Io(std::io::Error)`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
@@ -35,6 +35,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** `StopOutcome::Failed` is split into `StopOutcome::Unreachable` (no daemon could be contacted, so the container was not touched), `StopOutcome::NoResponse` (a daemon received the request but gave no usable reply, so the container may or may not be stopping), and `StopOutcome::Rejected { status }` (the daemon answered with an unexpected HTTP status). The stop semantics are unchanged: the ping preflight, the rule that no second daemon is tried once one may have received the request, and the rule that any reply from the `DOCKER_HOST` daemon ends the search all still apply.
 - **Breaking:** the `Serialize` and `Deserialize` derives on `ContainerInfo`, `Protocol`, and `StopOutcome` are behind the `serde` feature, which is off by default. Enable it to keep serializing these types. `StopOutcome` now also derives `Deserialize` under that feature.
 - **Breaking:** `detect_containers`, `start_detection`, and `stop_container` no longer take a `home: Option<PathBuf>` argument; they use `Client::new()`, which reads the home directory from the environment. Passing `None` used to skip every per-user socket (Docker Desktop on macOS, Colima, OrbStack, Lima, Rancher Desktop, Podman machine) without any sign. Use `Client::new().home(home)` to search a specific home directory.
+- **Breaking:** stopping and killing are separate calls instead of one call with a `force: bool` argument. `stop_container(id)` and `Client::stop(id)` stop the container gracefully (`POST /containers/{id}/stop?t=10`), and `kill_container(id)` and `Client::kill(id)` kill it at once (`POST /containers/{id}/kill`). Both keep the same daemon selection and fail-closed rules.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
 - The background detection wait window is measured from the moment detection started rather than from the call that waits, so it never ends later than the detection timeout after `start_detection`.
 
@@ -89,6 +90,22 @@ let hit = map.get(host_ip, port, proto);
 let known = map.get(host_ip, port, proto).is_some();
 // Iteration keeps its shape; the host IP is now yielded by value.
 for ((host_ip, port, proto), info) in &map { /* ... */ }
+```
+
+Stopping or killing a container:
+
+```rust,ignore
+// 0.1
+let outcome = nanodock::stop_container(id, force, home);
+// 0.2
+let outcome = if force {
+    nanodock::kill_container(id)
+} else {
+    nanodock::stop_container(id)
+};
+// 0.2, a specific home directory
+let client = nanodock::Client::new().home(home);
+let outcome = if force { client.kill(id) } else { client.stop(id) };
 ```
 
 Handling a stop that did not succeed:

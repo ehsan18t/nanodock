@@ -19,6 +19,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - `PublishedContainerMatch::container` returns the matched container, if any.
 - `StopOutcome::is_stopped` tells whether the container is known to be stopped.
 - An optional `serde` feature derives `Serialize` and `Deserialize` for `ContainerInfo`, `Protocol`, `StopOutcome`, and `ProxyFallback`. docs.rs builds the documentation with every feature enabled.
+- `RootlessPodmanResolver`, `lookup_rootless_podman_container`, and `is_podman_rootlessport_process` are now available on every platform with the same signatures, so callers no longer need `cfg(target_os = "linux")` gates around them. Outside Linux the lookup always returns `None` without touching the filesystem; Linux behavior is unchanged.
 
 ### Changed
 

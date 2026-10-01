@@ -275,9 +275,11 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | ------- | ------- | ---------------------------------------------------------------------------------------------- |
 | `serde` | Off     | Derives `Serialize` and `Deserialize` for `ContainerInfo`, `Protocol`, `StopOutcome`, `ProxyFallback` |
 
-### Linux-only Functions
+### Rootless Podman Helpers
 
-| Function                               | Description                               |
+These exist on every platform with the same signature, so callers need no `cfg` gates. Only Linux runs `rootlessport` on the host, so on other platforms `lookup_rootless_podman_container` always returns `None` and the resolver stays empty.
+
+| Item                                   | Description                               |
 | -------------------------------------- | ----------------------------------------- |
 | `is_podman_rootlessport_process(name)` | Check if a process name is `rootlessport` |
 | `lookup_rootless_podman_container()`   | Resolve container from rootlessport PIDs  |
@@ -291,7 +293,7 @@ src/
 ├── api.rs      - JSON response parsing, container name resolution
 ├── http.rs     - Minimal HTTP/1.0 response parser (via httparse)
 ├── ipc.rs      - OS-specific transport (Unix socket, named pipe, TCP)
-└── podman.rs   - Rootless Podman resolver via overlay metadata (Linux)
+└── podman.rs   - Rootless Podman resolver via overlay metadata
 ```
 
 ### Module Boundaries
@@ -304,9 +306,7 @@ src/
   responses using `httparse`. No Docker-specific logic lives here.
 - **`ipc.rs`** owns OS-specific transport code. Unix sockets, Windows named
   pipes, TCP connections, and `DOCKER_HOST` parsing all live here.
-- **`podman.rs`** owns rootless Podman resolution. It reads overlay storage
-  metadata and OCI runtime configs to match network namespace paths to
-  container names.
+- **`podman.rs`** owns rootless Podman resolution. It reads overlay storage metadata and OCI runtime configs to match network namespace paths to container names. Its public items compile on every platform; the lookup only runs on Linux.
 
 ## Building
 

@@ -1,8 +1,10 @@
 //! Rootless Podman container resolution via overlay metadata and network
 //! namespace paths.
 //!
-//! This entire module is gated behind `#[cfg(target_os = "linux")]` at the
-//! `mod` declaration in `lib.rs`.
+//! The public items exist on every platform so callers need no `cfg` gates of
+//! their own. Only Linux runs `rootlessport` on the host, so the lookup
+//! returns `None` elsewhere. The code is still compiled and type-checked on
+//! every platform; the platform check is a `cfg!` branch, not an item gate.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -16,6 +18,9 @@ use crate::ContainerInfo;
 use crate::api::short_container_id;
 
 /// Cache for rootless Podman container lookups keyed by process and network namespace.
+///
+/// Available on every platform. Outside Linux it stays empty, because
+/// [`lookup_rootless_podman_container`] returns `None` there without using it.
 #[derive(Debug, Default)]
 pub struct RootlessPodmanResolver {
     containers_by_netns: Option<HashMap<PathBuf, ContainerInfo>>,
@@ -59,13 +64,18 @@ struct PodmanNamespace {
 ///
 /// When the Podman API socket is unavailable to the current process, this falls
 /// back to local overlay metadata and Linux network namespace paths.
+///
+/// Available on every platform with the same signature. On platforms other
+/// than Linux it always returns `None` without touching the filesystem or the
+/// resolver: rootless Podman's `rootlessport` helper only runs on a Linux host
+/// (a Podman machine on macOS or Windows runs it inside the VM).
 pub fn lookup_rootless_podman_container(
     pid: u32,
     process_name: &str,
     resolver: &mut RootlessPodmanResolver,
     home: Option<&Path>,
 ) -> Option<ContainerInfo> {
-    if !is_podman_rootlessport_process(process_name) {
+    if !cfg!(target_os = "linux") || !is_podman_rootlessport_process(process_name) {
         return None;
     }
 
@@ -285,6 +295,39 @@ mod tests {
 
         assert_eq!(container.name, "ensurily-postgres-dev");
         assert_eq!(container.image, "docker.io/library/postgres:14-alpine");
+    }
+
+    #[test]
+    fn lookup_ignores_processes_other_than_rootlessport() {
+        let mut resolver = RootlessPodmanResolver::default();
+
+        let container = lookup_rootless_podman_container(1, "nginx", &mut resolver, None);
+
+        assert_eq!(container, None, "only rootlessport is resolved");
+        assert!(
+            resolver.containers_by_netns.is_none() && resolver.containers_by_pid.is_empty(),
+            "a non-rootlessport process must not load or cache overlay metadata"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn lookup_returns_none_outside_linux() {
+        let home = TempDir::new().unwrap();
+        let mut resolver = RootlessPodmanResolver::default();
+
+        let container = lookup_rootless_podman_container(
+            std::process::id(),
+            "rootlessport",
+            &mut resolver,
+            Some(home.path()),
+        );
+
+        assert_eq!(container, None, "rootlessport only runs on a Linux host");
+        assert!(
+            resolver.containers_by_netns.is_none() && resolver.containers_by_pid.is_empty(),
+            "the resolver stays untouched outside Linux"
+        );
     }
 
     #[test]

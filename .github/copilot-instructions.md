@@ -154,7 +154,7 @@ src/
   api.rs      -- JSON response parsing, container name resolution
   http.rs     -- Minimal HTTP/1.0 response parser (via httparse)
   ipc.rs      -- OS-specific transport (Unix socket, named pipe, TCP)
-  podman.rs   -- Rootless Podman resolver via overlay metadata (Linux)
+  podman.rs   -- Rootless Podman resolver via overlay metadata (lookup runs on Linux only)
 ```
 
 - **Do not create new modules** without explicit human approval.
@@ -166,7 +166,7 @@ src/
 - **`ipc.rs`** owns OS-specific transport code. All socket/pipe/TCP connection
   management lives here.
 - **`podman.rs`** owns rootless Podman resolution via overlay filesystem
-  inspection (Linux only).
+  inspection. Its public items compile everywhere; the lookup runs on Linux only.
 
 ### 4.1 - Module Boundary Enforcement
 

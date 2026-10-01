@@ -84,7 +84,6 @@
 mod api;
 mod http;
 mod ipc;
-#[cfg(target_os = "linux")]
 mod podman;
 
 // Compiles the README examples as doctests so they cannot drift from the API.
@@ -107,9 +106,7 @@ use serde::{Deserialize, Serialize};
 pub use api::parse_containers_json;
 pub use api::parse_containers_json_strict;
 pub use api::short_container_id;
-#[cfg(target_os = "linux")]
 pub use podman::is_podman_rootlessport_process;
-#[cfg(target_os = "linux")]
 pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
 
 // ── Error type ───────────────────────────────────────────────────────

@@ -164,7 +164,6 @@ pub fn docker_host_tcp_addr() -> Option<String> {
 /// detached rather than joined: a stuck endpoint must not delay or discard
 /// the answers of the others. Detached workers are bounded by their own
 /// transport deadline, and their late results are dropped with the channel.
-#[cfg(unix)]
 pub fn fetch_all_successes<P, T, I, F>(candidates: I, fetch: F, deadline: Instant) -> Vec<T>
 where
     P: Send + 'static,
@@ -787,7 +786,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn fetch_all_successes_collects_multiple_responses() {
         let mut responses = fetch_all_successes(
@@ -804,7 +802,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn fetch_all_successes_returns_early_when_all_workers_finish() {
         let started = Instant::now();
@@ -824,7 +821,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn fetch_all_successes_does_not_wait_for_stuck_workers() {
         let started = Instant::now();

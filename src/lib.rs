@@ -268,10 +268,12 @@ fn unique_published_container(
 
 /// Synchronously detect Docker/Podman containers and their published ports.
 ///
-/// Tries all known daemon transports (TCP via `DOCKER_HOST`, Unix
-/// sockets on Linux, Windows named pipes) and returns the first
-/// successful result. Returns an error if no daemon could be reached
-/// or if the response could not be parsed.
+/// Tries all known daemon transports concurrently under one shared time
+/// budget. A `DOCKER_HOST` `tcp://` daemon is queried alongside the local
+/// Unix sockets or Windows named pipes and is used on its own when it
+/// answers; otherwise the containers of all answering local daemons are
+/// merged. Returns an error if no daemon could be
+/// reached or if the response could not be parsed.
 ///
 /// Unlike [`start_detection`] / [`await_detection`], this function
 /// blocks the calling thread and surfaces errors so the caller can
@@ -524,73 +526,47 @@ fn send_stop_request_platform(endpoint: &str, _home: Option<PathBuf>) -> Option<
     not_found
 }
 
-// ── Platform-specific daemon queries ─────────────────────────────────
+// ── Daemon endpoints ─────────────────────────────────────────────────
 
-/// If `DOCKER_HOST` is set to a `tcp://` URL, query it and return the
-/// raw JSON body.
-///
-/// Shared across Unix and Windows since the TCP transport is
-/// platform-agnostic.
-fn query_docker_host_tcp_body(deadline: Instant) -> Option<String> {
-    let addr = ipc::docker_host_tcp_addr()?;
-    ipc::fetch_tcp_json(&addr, deadline)
+/// One daemon endpoint that detection can query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonEndpoint {
+    /// `DOCKER_HOST` `tcp://` address (`host:port`).
+    Tcp(String),
+    /// Unix domain socket path.
+    #[cfg(unix)]
+    Unix(PathBuf),
+    /// Windows named pipe path.
+    #[cfg(windows)]
+    Pipe(String),
 }
 
-/// If `DOCKER_HOST` is set to a `tcp://` URL, query it and return the map.
-///
-/// Shared across Unix and Windows since the TCP transport is platform-agnostic.
-fn query_docker_host_tcp(deadline: Instant) -> Option<ContainerPortMap> {
-    query_docker_host_tcp_body(deadline).map(|body| api::parse_containers_json(&body))
+impl DaemonEndpoint {
+    /// Fetch the container list JSON body before `deadline`.
+    fn fetch_json(&self, deadline: Instant) -> Option<String> {
+        match self {
+            Self::Tcp(addr) => ipc::fetch_tcp_json(addr, deadline),
+            #[cfg(unix)]
+            Self::Unix(path) => ipc::fetch_unix_socket_json(path, deadline),
+            #[cfg(windows)]
+            Self::Pipe(path) => ipc::fetch_named_pipe_json(path, deadline),
+        }
+    }
 }
 
+/// The `DOCKER_HOST` `tcp://` endpoint, if configured.
+fn docker_host_tcp_endpoint() -> Option<DaemonEndpoint> {
+    ipc::docker_host_tcp_addr().map(DaemonEndpoint::Tcp)
+}
+
+/// The well-known local daemon sockets for the current user.
 #[cfg(unix)]
-fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
-    use std::path::Path;
-
-    let deadline = ipc::query_deadline();
-    if let Some(body) = query_docker_host_tcp_body(deadline) {
-        return Some(body);
-    }
-
-    if let Some(path) = ipc::docker_host_unix_path() {
-        return ipc::fetch_unix_socket_json(Path::new(&path), deadline);
-    }
-
+fn default_local_endpoints(home: Option<PathBuf>) -> impl Iterator<Item = DaemonEndpoint> {
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
-    let responses = ipc::fetch_all_successes(
-        ipc::unix_socket_paths(uid, home),
-        move |path| ipc::fetch_unix_socket_json(&path, deadline),
-        deadline,
-    );
-
-    merge_daemon_response_bodies(responses)
-}
-
-#[cfg(unix)]
-fn query_daemon(home: Option<PathBuf>) -> Option<ContainerPortMap> {
-    use std::path::Path;
-
-    let deadline = ipc::query_deadline();
-    if let Some(map) = query_docker_host_tcp(deadline) {
-        return Some(map);
-    }
-
-    // Honour DOCKER_HOST when it points at a Unix socket (unix://).
-    if let Some(path) = ipc::docker_host_unix_path() {
-        return ipc::fetch_unix_socket_json(Path::new(&path), deadline)
-            .map(|body| api::parse_containers_json(&body));
-    }
-
-    // Safety: getuid() is a simple syscall with no preconditions.
-    let uid = unsafe { libc::getuid() };
-    let responses = ipc::fetch_all_successes(
-        ipc::unix_socket_paths(uid, home),
-        move |path| ipc::fetch_unix_socket_json(&path, deadline),
-        deadline,
-    );
-
-    merge_daemon_responses(responses)
+    ipc::unix_socket_paths(uid, home)
+        .into_iter()
+        .map(DaemonEndpoint::Unix)
 }
 
 #[cfg(windows)]
@@ -599,45 +575,148 @@ const DEFAULT_PIPE_PATHS: &[&str] = &[
     r"\\.\pipe\podman-machine-default",
 ];
 
+/// The well-known local daemon named pipes.
 #[cfg(windows)]
-fn query_daemon_body(_home: Option<PathBuf>) -> Option<String> {
-    let deadline = ipc::query_deadline();
-    if let Some(body) = query_docker_host_tcp_body(deadline) {
-        return Some(body);
-    }
-
-    if let Some(path) = ipc::docker_host_npipe_path()
-        && let Some(body) = ipc::fetch_named_pipe_json(&path, deadline)
-    {
-        return Some(body);
-    }
-
+fn default_local_endpoints(_home: Option<PathBuf>) -> impl Iterator<Item = DaemonEndpoint> {
     DEFAULT_PIPE_PATHS
         .iter()
-        .find_map(|path| ipc::fetch_named_pipe_json(path, deadline))
+        .map(|path| DaemonEndpoint::Pipe((*path).to_string()))
 }
 
-#[cfg(windows)]
-fn query_daemon(_home: Option<PathBuf>) -> Option<ContainerPortMap> {
-    let deadline = ipc::query_deadline();
-    if let Some(map) = query_docker_host_tcp(deadline) {
-        return Some(map);
-    }
-
-    // Honour DOCKER_HOST when it points at a named pipe (npipe://).
-    if let Some(path) = ipc::docker_host_npipe_path()
-        && let Some(body) = ipc::fetch_named_pipe_json(&path, deadline)
-    {
-        return Some(api::parse_containers_json(&body));
-    }
-
-    DEFAULT_PIPE_PATHS
-        .iter()
-        .find_map(|path| ipc::fetch_named_pipe_json(path, deadline))
-        .map(|body| api::parse_containers_json(&body))
-}
-
+/// The local `DOCKER_HOST` override (`unix://` or `npipe://`), if configured.
 #[cfg(unix)]
+fn docker_host_local_endpoint() -> Option<DaemonEndpoint> {
+    ipc::docker_host_unix_path().map(|path| DaemonEndpoint::Unix(PathBuf::from(path)))
+}
+
+#[cfg(windows)]
+fn docker_host_local_endpoint() -> Option<DaemonEndpoint> {
+    ipc::docker_host_npipe_path().map(DaemonEndpoint::Pipe)
+}
+
+/// Whether a local `DOCKER_HOST` override replaces the default endpoints.
+///
+/// On Unix a `unix://` path replaces the default sockets. On Windows an
+/// `npipe://` pipe is tried alongside the default pipes, like `tcp://`.
+const LOCAL_OVERRIDE_REPLACES_DEFAULTS: bool = cfg!(unix);
+
+/// Endpoints one detection pass queries, in priority order, each tagged with
+/// whether it was configured through `DOCKER_HOST`.
+///
+/// A `tcp://` daemon is queried alongside the local defaults, so a stale
+/// address cannot use up the budget the local endpoints need.
+fn detection_targets(home: Option<PathBuf>) -> Vec<(bool, DaemonEndpoint)> {
+    prioritized_targets(
+        docker_host_tcp_endpoint(),
+        docker_host_local_endpoint(),
+        LOCAL_OVERRIDE_REPLACES_DEFAULTS,
+        || default_local_endpoints(home).collect(),
+    )
+}
+
+/// Order daemon endpoints by priority: the `DOCKER_HOST` endpoint first
+/// (tagged `true`), then the defaults in list order (tagged `false`).
+///
+/// `DOCKER_HOST` holds one scheme, so at most one of `tcp` and
+/// `local_override` is set. The defaults are dropped when a local override
+/// is set and `override_replaces_defaults` is true; a `tcp://` endpoint
+/// never replaces them.
+fn prioritized_targets<P>(
+    tcp: Option<P>,
+    local_override: Option<P>,
+    override_replaces_defaults: bool,
+    defaults: impl FnOnce() -> Vec<P>,
+) -> Vec<(bool, P)> {
+    let defaults = if override_replaces_defaults && local_override.is_some() {
+        Vec::new()
+    } else {
+        defaults()
+    };
+    tcp.or(local_override)
+        .map(|endpoint| (true, endpoint))
+        .into_iter()
+        .chain(defaults.into_iter().map(|endpoint| (false, endpoint)))
+        .collect()
+}
+
+// ── Daemon queries ───────────────────────────────────────────────────
+
+/// Query every detection target concurrently and keep the bodies to use,
+/// highest priority first.
+fn query_daemon_bodies(home: Option<PathBuf>) -> Vec<String> {
+    collect_daemon_bodies(
+        detection_targets(home),
+        DaemonEndpoint::fetch_json,
+        ipc::query_deadline(),
+    )
+}
+
+/// Run `fetch` for every tagged target on its own thread under one shared
+/// `deadline`, then pick the bodies to use with [`select_daemon_bodies`].
+///
+/// `targets` must be in priority order. Each response is tagged with its
+/// target index, so the result does not depend on arrival order.
+fn collect_daemon_bodies<P, F>(targets: Vec<(bool, P)>, fetch: F, deadline: Instant) -> Vec<String>
+where
+    P: Send + 'static,
+    F: Fn(&P, Instant) -> Option<String> + Send + Sync + 'static,
+{
+    let responses = ipc::fetch_all_successes(
+        targets.into_iter().enumerate(),
+        move |(priority, (from_docker_host, target))| {
+            fetch(&target, deadline).map(|body| (priority, from_docker_host, body))
+        },
+        deadline,
+    );
+    select_daemon_bodies(responses)
+}
+
+/// Pick the bodies to use from daemon responses tagged with their target
+/// index (lower is higher priority) and whether they came from
+/// `DOCKER_HOST`, and return them highest priority first.
+///
+/// A response from the `DOCKER_HOST` endpoint is used on its own. Otherwise
+/// every default endpoint that answered is kept so their containers can be
+/// merged.
+fn select_daemon_bodies(mut responses: Vec<(usize, bool, String)>) -> Vec<String> {
+    responses.sort_by_key(|(priority, _, _)| *priority);
+    let (overrides, defaults): (Vec<_>, Vec<_>) = responses
+        .into_iter()
+        .partition(|(_, from_docker_host, _)| *from_docker_host);
+    let chosen = if overrides.is_empty() {
+        defaults
+    } else {
+        overrides
+    };
+    chosen.into_iter().map(|(_, _, body)| body).collect()
+}
+
+/// Merge bodies (highest priority first) into one JSON array for strict
+/// parsing.
+///
+/// The bodies are concatenated lowest priority first: when two daemons
+/// publish the same key, the later entry wins the map insert, so the
+/// higher-priority daemon is kept.
+fn merge_prioritized_bodies(bodies: &[String]) -> Option<String> {
+    merge_daemon_response_bodies(bodies.iter().rev())
+}
+
+/// Merge bodies (highest priority first) into one port map.
+///
+/// Bodies are merged lowest priority first so that, when two daemons
+/// publish the same key, the higher-priority daemon overwrites the other.
+fn merge_prioritized_responses(bodies: &[String]) -> Option<ContainerPortMap> {
+    merge_daemon_responses(bodies.iter().rev())
+}
+
+fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
+    merge_prioritized_bodies(&query_daemon_bodies(home))
+}
+
+fn query_daemon(home: Option<PathBuf>) -> Option<ContainerPortMap> {
+    merge_prioritized_responses(&query_daemon_bodies(home))
+}
+
 fn merge_daemon_response_bodies<T, I>(responses: I) -> Option<String>
 where
     T: AsRef<str>,
@@ -675,7 +754,6 @@ where
     Some(combined)
 }
 
-#[cfg(unix)]
 fn merge_daemon_responses<T, I>(responses: I) -> Option<ContainerPortMap>
 where
     T: AsRef<str>,
@@ -697,7 +775,6 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    #[cfg(unix)]
     #[test]
     fn merge_daemon_responses_combines_multiple_runtime_payloads() {
         let merged = merge_daemon_responses([
@@ -904,14 +981,12 @@ mod tests {
 
     // ── merge_daemon_response_bodies ─────────────────────────────────
 
-    #[cfg(unix)]
     #[test]
     fn merge_bodies_empty_iterator_returns_none() {
         let result = merge_daemon_response_bodies::<&str, Vec<&str>>(vec![]);
         assert!(result.is_none(), "no responses means None");
     }
 
-    #[cfg(unix)]
     #[test]
     fn merge_bodies_single_empty_array() {
         let result = merge_daemon_response_bodies(["[]"]);
@@ -922,7 +997,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn merge_bodies_concatenates_non_empty_arrays() {
         let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, r#"[{"b":2},{"c":3}]"#]);
@@ -933,7 +1007,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn merge_bodies_skips_empty_arrays_without_spurious_commas() {
         let result = merge_daemon_response_bodies(["[]", r#"[{"a":1}]"#]);
@@ -944,7 +1017,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn merge_bodies_trailing_empty_array_does_not_add_comma() {
         let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, "[]"]);
@@ -955,7 +1027,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn merge_bodies_all_empty_arrays_produces_empty_array() {
         let result = merge_daemon_response_bodies(["[]", "[]"]);
@@ -1006,6 +1077,227 @@ mod tests {
         assert!(
             !is_safe_container_id("abc\r\nX-Injected: true"),
             "CRLF injection should be rejected"
+        );
+    }
+
+    // ── Target selection ─────────────────────────────────────────────
+
+    fn defaults() -> Vec<&'static str> {
+        vec!["default-a", "default-b"]
+    }
+
+    #[test]
+    fn prioritized_targets_replacing_override_drops_defaults() {
+        // DOCKER_HOST=unix://: the user excluded the default sockets.
+        assert_eq!(
+            prioritized_targets(None, Some("override"), true, defaults),
+            vec![(true, "override")],
+            "a unix:// override must not chain the default sockets"
+        );
+    }
+
+    #[test]
+    fn prioritized_targets_non_replacing_override_keeps_defaults_after_it() {
+        // DOCKER_HOST=npipe://: detection queries the default pipes too.
+        assert_eq!(
+            prioritized_targets(None, Some("override"), false, defaults),
+            vec![
+                (true, "override"),
+                (false, "default-a"),
+                (false, "default-b")
+            ]
+        );
+    }
+
+    #[test]
+    fn prioritized_targets_tcp_never_replaces_defaults() {
+        assert_eq!(
+            prioritized_targets(Some("tcp"), None, true, defaults),
+            vec![(true, "tcp"), (false, "default-a"), (false, "default-b")]
+        );
+    }
+
+    #[test]
+    fn prioritized_targets_without_docker_host_uses_defaults() {
+        assert_eq!(
+            prioritized_targets(None, None, true, defaults),
+            vec![(false, "default-a"), (false, "default-b")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_local_override_replaces_defaults() {
+        const {
+            assert!(LOCAL_OVERRIDE_REPLACES_DEFAULTS);
+        }
+    }
+
+    // ── Merge priority ───────────────────────────────────────────────
+
+    fn shared_port_body(name: &str) -> String {
+        format!(
+            r#"[{{"Names": ["/{name}"], "Image": "img", "Ports": [{{"PublicPort": 8080, "Type": "tcp"}}]}}]"#
+        )
+    }
+
+    #[test]
+    fn merge_keeps_higher_priority_daemon_regardless_of_arrival_order() {
+        let first = (0, false, shared_port_body("from-first-default"));
+        let second = (1, false, shared_port_body("from-second-default"));
+        let key = (None, 8080, Protocol::Tcp);
+
+        for responses in [vec![first.clone(), second.clone()], vec![second, first]] {
+            let bodies = select_daemon_bodies(responses);
+
+            let lenient = merge_prioritized_responses(&bodies).expect("responses were given");
+            assert_eq!(
+                lenient.get(&key).map(|info| info.name.as_str()),
+                Some("from-first-default"),
+                "the earlier default endpoint wins a shared key"
+            );
+
+            let merged = merge_prioritized_bodies(&bodies).expect("responses were given");
+            let strict = api::parse_containers_json_strict(&merged).expect("valid JSON");
+            assert_eq!(
+                strict.get(&key).map(|info| info.name.as_str()),
+                Some("from-first-default"),
+                "the strict path resolves a shared key the same way"
+            );
+        }
+    }
+
+    // ── Detection target selection ───────────────────────────────────
+
+    #[test]
+    fn select_daemon_bodies_merges_all_default_endpoints() {
+        let bodies = select_daemon_bodies(vec![
+            (0, false, "[1]".to_string()),
+            (1, false, "[2]".to_string()),
+        ]);
+        assert_eq!(
+            bodies,
+            vec!["[1]".to_string(), "[2]".to_string()],
+            "every answering default endpoint should contribute"
+        );
+    }
+
+    #[test]
+    fn select_daemon_bodies_prefers_docker_host() {
+        let bodies = select_daemon_bodies(vec![
+            (1, false, "[1]".to_string()),
+            (0, true, "[9]".to_string()),
+        ]);
+        assert_eq!(
+            bodies,
+            vec!["[9]".to_string()],
+            "an answering DOCKER_HOST endpoint is used on its own"
+        );
+    }
+
+    /// Stand-in detection target: a real TCP address or a canned local reply.
+    enum FakeTarget {
+        Tcp(String),
+        Local(&'static str),
+        Hung,
+    }
+
+    fn fetch_fake(target: &FakeTarget, deadline: Instant) -> Option<String> {
+        match target {
+            FakeTarget::Tcp(addr) => ipc::fetch_tcp_json(addr, deadline),
+            FakeTarget::Local(body) => Some((*body).to_string()),
+            FakeTarget::Hung => {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn collect_daemon_bodies_falls_back_to_local_when_tcp_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("address").to_string();
+        drop(listener);
+
+        let started = Instant::now();
+        let mut bodies = collect_daemon_bodies(
+            vec![
+                (true, FakeTarget::Tcp(addr)),
+                (false, FakeTarget::Local("[1]")),
+                (false, FakeTarget::Local("[2]")),
+            ],
+            fetch_fake,
+            started + std::time::Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+        bodies.sort();
+
+        assert_eq!(
+            bodies,
+            vec!["[1]".to_string(), "[2]".to_string()],
+            "a refused DOCKER_HOST must not hide the local daemons"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the shared budget bounds the pass, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn collect_daemon_bodies_keeps_local_results_when_tcp_hangs() {
+        let started = Instant::now();
+        let bodies = collect_daemon_bodies(
+            vec![(true, FakeTarget::Hung), (false, FakeTarget::Local("[1]"))],
+            fetch_fake,
+            started + std::time::Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            bodies,
+            vec!["[1]".to_string()],
+            "a blackholed DOCKER_HOST must not starve the local endpoints"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a hung endpoint must not outlive the budget, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn collect_daemon_bodies_prefers_answering_tcp_daemon() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("address").to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match std::io::Read::read(&mut stream, &mut byte) {
+                    Ok(1) => request.push(byte[0]),
+                    _ => break,
+                }
+            }
+            drop(std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\n[9]",
+            ));
+        });
+
+        let bodies = collect_daemon_bodies(
+            vec![
+                (true, FakeTarget::Tcp(addr)),
+                (false, FakeTarget::Local("[1]")),
+            ],
+            fetch_fake,
+            Instant::now() + std::time::Duration::from_secs(5),
+        );
+        drop(server.join());
+
+        assert_eq!(
+            bodies,
+            vec!["[9]".to_string()],
+            "an answering DOCKER_HOST daemon is used on its own"
         );
     }
 }

@@ -362,7 +362,9 @@ pub enum StopOutcome {
     AlreadyStopped,
     /// Container was not found (HTTP 404).
     NotFound,
-    /// The daemon could not be reached or returned an unexpected status.
+    /// No daemon could be reached, the daemon returned an unexpected status,
+    /// or it received the request but gave no usable reply (the
+    /// container may or may not have been stopped).
     Failed,
 }
 
@@ -379,8 +381,8 @@ impl std::fmt::Display for StopOutcome {
 
 /// Stop or kill a running container via the Docker/Podman daemon API.
 ///
-/// When `force` is false, sends `POST /containers/{id}/stop` (graceful
-/// SIGTERM with a 10-second timeout before SIGKILL). When `force` is
+/// When `force` is false, sends `POST /containers/{id}/stop?t=10`
+/// (graceful SIGTERM, then SIGKILL after 10 seconds). When `force` is
 /// true, sends `POST /containers/{id}/kill` (immediate SIGKILL).
 ///
 /// The `id` parameter can be a container ID (hex) or a container name.
@@ -391,8 +393,20 @@ impl std::fmt::Display for StopOutcome {
 /// The `home` parameter provides the user's home directory path, used
 /// on Unix to discover daemon socket locations.
 ///
-/// Tries all known transports (TCP, Unix sockets, Windows named pipes)
-/// and returns the outcome from the first transport that connects.
+/// Tries the same daemons as detection, in priority order (`DOCKER_HOST`
+/// first, then the platform defaults; a `unix://` `DOCKER_HOST` replaces the
+/// default sockets). Before the stop request is sent to a daemon, it must
+/// answer `GET /_ping` on a separate connection; a daemon that cannot be
+/// reached or does not answer the ping (for example a forwarder whose
+/// backend is down) is skipped without receiving the stop.
+///
+/// Any reply from the `DOCKER_HOST` daemon, including "not found", is the
+/// result. A "not found" from a default daemon moves on to the next one,
+/// and the first other reply is the result. Once a daemon has received the
+/// stop request, a closed or reset connection, a timeout, or a partial or
+/// malformed reply ends the search with [`StopOutcome::Failed`], even when
+/// an earlier daemon answered "not found": that daemon may still be
+/// stopping the container, so no other daemon is tried.
 #[must_use]
 pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutcome {
     if !is_safe_container_id(id) {
@@ -400,23 +414,25 @@ pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutco
         return StopOutcome::NotFound;
     }
 
+    let endpoint = stop_endpoint(id, force);
+    let attempt = first_stop_owner(stop_targets(home), |target| target.send_stop(&endpoint));
+    stop_outcome(attempt, force)
+}
+
+/// Build the stop or kill endpoint for an already validated container id.
+fn stop_endpoint(id: &str, force: bool) -> String {
     let endpoint = if force {
         format!("/containers/{id}/kill")
     } else {
-        format!("/containers/{id}/stop")
+        // An explicit grace period keeps the daemon's stop time in line
+        // with the transport timeout (`ipc::STOP_TIMEOUT`).
+        format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS)
     };
     debug!(
         "attempting container stop: id={} force={force} endpoint={endpoint}",
         &id[..id.len().min(12)]
     );
-
-    send_stop_request(&endpoint, home).map_or_else(
-        || {
-            debug!("no transport could reach container runtime daemon for stop");
-            StopOutcome::Failed
-        },
-        |status_code| interpret_stop_status(status_code, force),
-    )
+    endpoint
 }
 
 /// Reject container IDs that would corrupt the HTTP request line.
@@ -429,6 +445,25 @@ fn is_safe_container_id(id: &str) -> bool {
         && !id
             .bytes()
             .any(|b| matches!(b, b'/' | b'?' | b'#' | b'%' | b'\r' | b'\n' | b' '))
+}
+
+/// Map the combined result of a stop request to `StopOutcome`.
+///
+/// Both "no daemon reachable" and "a daemon received the request but gave
+/// no usable reply" are failures: in the second case the container may or
+/// may not have been stopped, so it must not be reported as not found.
+fn stop_outcome(attempt: ipc::StopAttempt, force: bool) -> StopOutcome {
+    match attempt {
+        ipc::StopAttempt::Status(status_code) => interpret_stop_status(status_code, force),
+        ipc::StopAttempt::NoResponse => {
+            debug!("container runtime daemon did not reply to stop request");
+            StopOutcome::Failed
+        }
+        ipc::StopAttempt::Unreachable => {
+            debug!("no transport could reach container runtime daemon for stop");
+            StopOutcome::Failed
+        }
+    }
 }
 
 /// Map an HTTP status code from the stop/kill endpoint to `StopOutcome`.
@@ -447,88 +482,41 @@ fn interpret_stop_status(status_code: u16, force: bool) -> StopOutcome {
     }
 }
 
-/// Try each known transport until one successfully sends the POST request.
+/// Send the stop request to each endpoint in order and pick the outcome.
 ///
-/// A 404 ("not found") response does not short-circuit: the container may
-/// exist on a different daemon (e.g., Podman when Docker returns 404).
-fn send_stop_request(endpoint: &str, home: Option<PathBuf>) -> Option<u16> {
-    // TCP via DOCKER_HOST takes precedence (both platforms).
-    if let Some(addr) = ipc::docker_host_tcp_addr()
-        && let Some(code) = ipc::stop_via_tcp(&addr, endpoint)
-    {
-        if code != 404 {
-            return Some(code);
-        }
-        // Container not found on TCP daemon; try platform sockets before
-        // giving up, but remember the 404 as a fallback.
-        return Some(send_stop_request_platform(endpoint, home).unwrap_or(code));
-    }
-
-    send_stop_request_platform(endpoint, home)
-}
-
-/// Return `code` if it is NOT a 404, otherwise fold it into `fallback` so the
-/// caller can return the 404 only after all daemons have been tried.
-const fn fold_stop_code(code: u16, fallback: &mut Option<u16>) -> Option<u16> {
-    if code == 404 {
-        *fallback = Some(404);
-        None
-    } else {
-        Some(code)
-    }
-}
-
-#[cfg(unix)]
-fn send_stop_request_platform(endpoint: &str, home: Option<PathBuf>) -> Option<u16> {
-    use std::path::Path;
-
-    let mut not_found = None;
-
-    // Honour DOCKER_HOST unix:// if set.
-    if let Some(path) = ipc::docker_host_unix_path()
-        && let Some(code) = ipc::stop_via_unix_socket(Path::new(&path), endpoint)
-        && let Some(result) = fold_stop_code(code, &mut not_found)
-    {
-        return Some(result);
-    }
-
-    // Safety: getuid() is a simple syscall with no preconditions.
-    let uid = unsafe { libc::getuid() };
-    for path in ipc::unix_socket_paths(uid, home) {
-        if let Some(code) = ipc::stop_via_unix_socket(&path, endpoint)
-            && let Some(result) = fold_stop_code(code, &mut not_found)
-        {
-            return Some(result);
+/// Each endpoint is tagged with whether it is the `DOCKER_HOST` override.
+/// Unreachable endpoints (the stop request was never sent) move on to the
+/// next endpoint. A 404 from a default endpoint also moves on: the
+/// container may exist on a different daemon (e.g., Podman when Docker
+/// returns 404). That 404 is returned only if no other daemon answered, and
+/// [`ipc::StopAttempt::Unreachable`] only if no daemon was reached at all.
+/// Any reply from the override, including 404, and any other status code
+/// from a default endpoint is returned immediately. An endpoint that
+/// received the request but gave no usable reply ends the search with
+/// [`ipc::StopAttempt::NoResponse`], even after an earlier 404: that daemon
+/// may still be stopping the container, and another daemon must not act on
+/// a same-named container in the meantime.
+fn first_stop_owner<P, I, F>(endpoints: I, mut attempt: F) -> ipc::StopAttempt
+where
+    I: IntoIterator<Item = (bool, P)>,
+    F: FnMut(P) -> ipc::StopAttempt,
+{
+    let mut result = ipc::StopAttempt::Unreachable;
+    for (is_override, endpoint) in endpoints {
+        match attempt(endpoint) {
+            ipc::StopAttempt::Unreachable => {}
+            ipc::StopAttempt::Status(404) if !is_override => {
+                result = ipc::StopAttempt::Status(404);
+            }
+            owned @ (ipc::StopAttempt::NoResponse | ipc::StopAttempt::Status(_)) => return owned,
         }
     }
-    not_found
-}
-
-#[cfg(windows)]
-fn send_stop_request_platform(endpoint: &str, _home: Option<PathBuf>) -> Option<u16> {
-    let mut not_found = None;
-
-    // Honour DOCKER_HOST npipe:// if set.
-    if let Some(path) = ipc::docker_host_npipe_path()
-        && let Some(code) = ipc::stop_via_named_pipe(&path, endpoint)
-        && let Some(result) = fold_stop_code(code, &mut not_found)
-    {
-        return Some(result);
-    }
-
-    for path in DEFAULT_PIPE_PATHS {
-        if let Some(code) = ipc::stop_via_named_pipe(path, endpoint)
-            && let Some(result) = fold_stop_code(code, &mut not_found)
-        {
-            return Some(result);
-        }
-    }
-    not_found
+    result
 }
 
 // ── Daemon endpoints ─────────────────────────────────────────────────
 
-/// One daemon endpoint that detection can query.
+/// One daemon endpoint that detection and stop requests can be sent to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonEndpoint {
     /// `DOCKER_HOST` `tcp://` address (`host:port`).
@@ -550,6 +538,17 @@ impl DaemonEndpoint {
             Self::Unix(path) => ipc::fetch_unix_socket_json(path, deadline),
             #[cfg(windows)]
             Self::Pipe(path) => ipc::fetch_named_pipe_json(path, deadline),
+        }
+    }
+
+    /// Send a stop or kill request for `endpoint`.
+    fn send_stop(&self, endpoint: &str) -> ipc::StopAttempt {
+        match self {
+            Self::Tcp(addr) => ipc::stop_via_tcp(addr, endpoint),
+            #[cfg(unix)]
+            Self::Unix(path) => ipc::stop_via_unix_socket(path, endpoint),
+            #[cfg(windows)]
+            Self::Pipe(path) => ipc::stop_via_named_pipe(path, endpoint),
         }
     }
 }
@@ -599,6 +598,18 @@ fn docker_host_local_endpoint() -> Option<DaemonEndpoint> {
 /// On Unix a `unix://` path replaces the default sockets. On Windows an
 /// `npipe://` pipe is tried alongside the default pipes, like `tcp://`.
 const LOCAL_OVERRIDE_REPLACES_DEFAULTS: bool = cfg!(unix);
+
+/// Endpoints a stop request is tried against, in order, each tagged with
+/// whether it was configured through `DOCKER_HOST`.
+///
+/// The same endpoints, in the same order, as one detection pass (see
+/// [`detection_targets`]), so a stop never reaches a daemon that detection
+/// excluded. Any reply from the `DOCKER_HOST` endpoint, including "not
+/// found", ends the search (see [`first_stop_owner`]); the defaults are
+/// tried only when that endpoint is unreachable.
+fn stop_targets(home: Option<PathBuf>) -> Vec<(bool, DaemonEndpoint)> {
+    detection_targets(home)
+}
 
 /// Endpoints one detection pass queries, in priority order, each tagged with
 /// whether it was configured through `DOCKER_HOST`.
@@ -955,30 +966,6 @@ mod tests {
         );
     }
 
-    // ── fold_stop_code ───────────────────────────────────────────────
-
-    #[test]
-    fn fold_stop_code_passes_non_404_through() {
-        let mut fallback = None;
-        assert_eq!(
-            fold_stop_code(204, &mut fallback),
-            Some(204),
-            "non-404 should pass through"
-        );
-        assert_eq!(fallback, None, "fallback should remain None");
-    }
-
-    #[test]
-    fn fold_stop_code_defers_404_to_fallback() {
-        let mut fallback = None;
-        assert_eq!(
-            fold_stop_code(404, &mut fallback),
-            None,
-            "404 should be deferred"
-        );
-        assert_eq!(fallback, Some(404), "fallback should record the 404");
-    }
-
     // ── merge_daemon_response_bodies ─────────────────────────────────
 
     #[test]
@@ -1077,6 +1064,158 @@ mod tests {
         assert!(
             !is_safe_container_id("abc\r\nX-Injected: true"),
             "CRLF injection should be rejected"
+        );
+    }
+
+    // ── stop_endpoint ────────────────────────────────────────────────
+
+    #[test]
+    fn stop_endpoint_sends_explicit_grace_period() {
+        assert_eq!(
+            stop_endpoint("abc123", false),
+            format!("/containers/abc123/stop?t={}", ipc::STOP_GRACE_SECS),
+            "graceful stop must pin the grace period the transport timeout is sized for"
+        );
+        assert_eq!(
+            stop_endpoint("abc123", true),
+            "/containers/abc123/kill",
+            "kill takes no grace period"
+        );
+    }
+
+    // ── first_stop_owner ─────────────────────────────────────────────
+
+    /// Tag every attempt as coming from a default (non-override) endpoint.
+    fn from_defaults<const N: usize>(
+        attempts: [ipc::StopAttempt; N],
+    ) -> impl Iterator<Item = (bool, ipc::StopAttempt)> {
+        attempts.into_iter().map(|attempt| (false, attempt))
+    }
+
+    #[test]
+    fn first_stop_owner_skips_unreachable_and_404() {
+        let result = first_stop_owner(
+            from_defaults([
+                ipc::StopAttempt::Unreachable,
+                ipc::StopAttempt::Status(404),
+                ipc::StopAttempt::Status(204),
+            ]),
+            |attempt| attempt,
+        );
+        assert_eq!(
+            result,
+            ipc::StopAttempt::Status(204),
+            "the daemon that owns the container wins"
+        );
+    }
+
+    #[test]
+    fn first_stop_owner_falls_back_to_404() {
+        let result = first_stop_owner(
+            from_defaults([ipc::StopAttempt::Status(404), ipc::StopAttempt::Unreachable]),
+            |attempt| attempt,
+        );
+        assert_eq!(
+            result,
+            ipc::StopAttempt::Status(404),
+            "404 is reported only after all endpoints"
+        );
+    }
+
+    #[test]
+    fn first_stop_owner_reports_unreachable_when_nothing_answered() {
+        let result = first_stop_owner(
+            from_defaults([ipc::StopAttempt::Unreachable, ipc::StopAttempt::Unreachable]),
+            |attempt| attempt,
+        );
+        assert_eq!(
+            result,
+            ipc::StopAttempt::Unreachable,
+            "no endpoint was reached"
+        );
+        assert_eq!(
+            stop_outcome(result, false),
+            StopOutcome::Failed,
+            "an unreachable daemon is a failure"
+        );
+    }
+
+    #[test]
+    fn first_stop_owner_stops_after_no_response() {
+        let mut tried = 0;
+        let result = first_stop_owner(
+            from_defaults([
+                ipc::StopAttempt::Status(404),
+                ipc::StopAttempt::NoResponse,
+                ipc::StopAttempt::Status(204),
+            ]),
+            |attempt| {
+                tried += 1;
+                attempt
+            },
+        );
+        assert_eq!(
+            result,
+            ipc::StopAttempt::NoResponse,
+            "a timed-out daemon owns the outcome"
+        );
+        assert_eq!(tried, 2, "no endpoint after the timed-out one is tried");
+    }
+
+    #[test]
+    fn stop_after_404_then_silent_daemon_is_failed_not_not_found() {
+        // One default daemon answers 404, then the next one receives the
+        // request and never replies: the container may have been stopped.
+        for force in [false, true] {
+            let attempt = first_stop_owner(
+                from_defaults([ipc::StopAttempt::Status(404), ipc::StopAttempt::NoResponse]),
+                |attempt| attempt,
+            );
+            assert_eq!(
+                stop_outcome(attempt, force),
+                StopOutcome::Failed,
+                "a daemon that received the stop and went silent must not read as not found"
+            );
+        }
+    }
+
+    #[test]
+    fn override_404_is_not_found_without_trying_defaults() {
+        let mut tried = 0;
+        let attempt = first_stop_owner(
+            [
+                (true, ipc::StopAttempt::Status(404)),
+                (false, ipc::StopAttempt::Status(204)),
+            ],
+            |attempt| {
+                tried += 1;
+                attempt
+            },
+        );
+        assert_eq!(
+            stop_outcome(attempt, false),
+            StopOutcome::NotFound,
+            "the DOCKER_HOST daemon's answer is final"
+        );
+        assert_eq!(
+            tried, 1,
+            "no default endpoint is tried after the override answered"
+        );
+    }
+
+    #[test]
+    fn unreachable_override_falls_through_to_defaults() {
+        let attempt = first_stop_owner(
+            [
+                (true, ipc::StopAttempt::Unreachable),
+                (false, ipc::StopAttempt::Status(204)),
+            ],
+            |attempt| attempt,
+        );
+        assert_eq!(
+            stop_outcome(attempt, false),
+            StopOutcome::Stopped,
+            "only an override that never received the stop falls through"
         );
     }
 

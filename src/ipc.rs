@@ -663,39 +663,173 @@ fn connect_tcp_stream(addr: &str, deadline: Instant) -> Option<std::net::TcpStre
 // Container stop / kill transport
 // ---------------------------------------------------------------------------
 
-/// Timeout for container stop operations.
+/// Grace period, in seconds, sent as `?t=` on graceful stop requests.
 ///
-/// Longer than the query timeout since Docker's graceful stop waits up
-/// to 10 seconds by default before sending SIGKILL.
-pub const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// The daemon sends SIGTERM, waits this long, then sends SIGKILL.
+pub const STOP_GRACE_SECS: u64 = 10;
+
+/// Overall deadline for one stop or kill request.
+///
+/// The grace period plus a margin for the ping preflight, the SIGKILL and
+/// the HTTP reply, so a stop that runs the full grace period is still
+/// reported correctly.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(STOP_GRACE_SECS + 10);
+
+/// Upper bound for the `GET /_ping` preflight sent before a stop request.
+///
+/// A live daemon answers the ping at once; a forwarder whose backend is
+/// down closes the connection or never answers. The ping also never runs
+/// past the stop deadline.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Compile-time guard: the preflight plus one stop connect attempt must fit in
+// the margin past the grace period, so a stop that uses the full grace period
+// is not cut short.
+const _: () = assert!(
+    PING_TIMEOUT.as_secs() + CONNECT_ATTEMPT_TIMEOUT.as_secs()
+        < STOP_TIMEOUT.as_secs() - STOP_GRACE_SECS
+);
+
+/// Result of sending a stop or kill request to one daemon endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAttempt {
+    /// The stop request was never sent: the endpoint could not be reached,
+    /// it did not answer the `GET /_ping` preflight (for example a
+    /// forwarder whose backend is down), or writing the stop request
+    /// failed. Other endpoints may safely be tried.
+    Unreachable,
+    /// The stop request was fully written but no usable reply arrived: the
+    /// connection was closed or reset, the deadline passed, or the reply
+    /// was partial or malformed. That daemon may still be acting on the
+    /// request, so no other endpoint should be tried.
+    NoResponse,
+    /// The daemon replied with this HTTP status code.
+    Status(u16),
+}
+
+/// Deadline for the ping preflight of a stop request due by `stop_deadline`.
+fn ping_deadline(stop_deadline: Instant) -> Instant {
+    stop_deadline.min(Instant::now() + PING_TIMEOUT)
+}
+
+/// Whether the ping preflight got any HTTP reply.
+///
+/// Every failure, including a reply that is partial or malformed, counts as
+/// "not answered": the stop request has not been sent yet, so skipping this
+/// endpoint can never cause a second daemon to act on the same container.
+fn ping_answered(result: Result<u16, http::StatusFailure>, transport: &str) -> bool {
+    match result {
+        Ok(status_code) => {
+            debug!("container runtime answered ping: {transport} status={status_code}");
+            true
+        }
+        Err(failure) => {
+            debug!(
+                "container runtime did not answer ping, skipping stop: {transport} failure={failure:?}"
+            );
+            false
+        }
+    }
+}
+
+/// Send a POST and classify the reply of an already connected endpoint.
+fn post_status_attempt(stream: &mut (impl Read + Write), endpoint: &str) -> StopAttempt {
+    stop_attempt_from(http::send_http_post_status(stream, endpoint))
+}
+
+/// Map the result of a stop POST to a [`StopAttempt`].
+///
+/// Only a request that was never written is [`StopAttempt::Unreachable`].
+/// Once it is written, a daemon may have read it, so every failure fails
+/// closed as [`StopAttempt::NoResponse`].
+fn stop_attempt_from(result: Result<u16, http::StatusFailure>) -> StopAttempt {
+    match result {
+        Ok(status_code) => StopAttempt::Status(status_code),
+        Err(http::StatusFailure::NotSent) => {
+            debug!("failed to write stop request to container runtime");
+            StopAttempt::Unreachable
+        }
+        Err(http::StatusFailure::NoReply) => {
+            debug!("container runtime received stop request but gave no usable reply");
+            StopAttempt::NoResponse
+        }
+    }
+}
 
 /// Send a POST request to stop or kill a container via a Unix socket.
+///
+/// The socket must first answer a `GET /_ping` preflight on its own
+/// connection; otherwise the stop is not sent.
 #[cfg(unix)]
-pub fn stop_via_unix_socket(path: &std::path::Path, endpoint: &str) -> Option<u16> {
-    let stream = connect_unix_stream(path, " for stop")?;
-    let mut stream = DeadlineStream::new(stream, Instant::now() + STOP_TIMEOUT);
-    http::send_http_post_status(&mut stream, endpoint)
+pub fn stop_via_unix_socket(path: &std::path::Path, endpoint: &str) -> StopAttempt {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    if !ping_unix_socket(path, ping_deadline(deadline)) {
+        return StopAttempt::Unreachable;
+    }
+    let Some(stream) = connect_unix_stream(path, " for stop") else {
+        return StopAttempt::Unreachable;
+    };
+    let mut stream = DeadlineStream::new(stream, deadline);
+    post_status_attempt(&mut stream, endpoint)
+}
+
+/// Whether the daemon behind a Unix socket answers `GET /_ping`.
+#[cfg(unix)]
+fn ping_unix_socket(path: &std::path::Path, deadline: Instant) -> bool {
+    let Some(stream) = connect_unix_stream(path, " for ping") else {
+        return false;
+    };
+    let mut stream = DeadlineStream::new(stream, deadline);
+    let result = http::send_http_status_request(&mut stream, http::PING_HTTP_REQUEST);
+    ping_answered(result, &format!("socket={}", path.display()))
 }
 
 /// Send a POST request to stop or kill a container via a Windows named pipe.
+///
+/// The pipe must first answer a `GET /_ping` preflight on its own
+/// connection; otherwise the stop is not sent.
 #[cfg(windows)]
-pub fn stop_via_named_pipe(path: &str, endpoint: &str) -> Option<u16> {
+pub fn stop_via_named_pipe(path: &str, endpoint: &str) -> StopAttempt {
     let deadline = Instant::now() + STOP_TIMEOUT;
-    let mut stream = open_named_pipe(path, deadline, " for stop")?;
-    send_http_post_status_windows(&mut stream, endpoint, deadline)
+    if !ping_named_pipe(path, ping_deadline(deadline)) {
+        return StopAttempt::Unreachable;
+    }
+    let Some(mut stream) = open_named_pipe(path, deadline, " for stop") else {
+        return StopAttempt::Unreachable;
+    };
+    stop_attempt_from(send_http_status_request_windows(
+        &mut stream,
+        &http::format_post_request(endpoint),
+        deadline,
+    ))
 }
 
-/// Windows named-pipe polled-IO loop for POST requests that return only a
-/// status code (no body needed).
+/// Whether the daemon behind a named pipe answers `GET /_ping`.
 #[cfg(windows)]
-fn send_http_post_status_windows(
+fn ping_named_pipe(path: &str, deadline: Instant) -> bool {
+    let Some(mut stream) = open_named_pipe(path, deadline, " for ping") else {
+        return false;
+    };
+    let result = send_http_status_request_windows(&mut stream, http::PING_HTTP_REQUEST, deadline);
+    ping_answered(result, &format!("pipe={path}"))
+}
+
+/// Windows named-pipe polled-IO loop for requests that need only the status
+/// code of the reply (no body).
+///
+/// Classifies failures like [`http::send_http_status_request`]: only a
+/// failed write is [`http::StatusFailure::NotSent`]; once the request is
+/// written, a closed pipe, a timeout, or a partial or malformed reply is
+/// [`http::StatusFailure::NoReply`].
+#[cfg(windows)]
+fn send_http_status_request_windows(
     stream: &mut std::fs::File,
-    endpoint: &str,
+    request: &[u8],
     deadline: Instant,
-) -> Option<u16> {
+) -> Result<u16, http::StatusFailure> {
     stream
-        .write_all(&http::format_post_request(endpoint))
-        .ok()?;
+        .write_all(request)
+        .map_err(|_| http::StatusFailure::NotSent)?;
 
     let mut response = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
@@ -707,7 +841,7 @@ fn send_http_post_status_windows(
         &mut response,
         parse_pipe_status,
     )
-    .ok()
+    .map_err(|_| http::StatusFailure::NoReply)
 }
 
 /// Pipe parse step that only needs the status code of the reply.
@@ -721,16 +855,40 @@ fn parse_pipe_status(response: &[u8], _eof: bool) -> PipeParseState<u16> {
 }
 
 /// Send a POST request to stop or kill a container via TCP.
-pub fn stop_via_tcp(addr: &str, endpoint: &str) -> Option<u16> {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let stream = connect_tcp_stream(addr, deadline)?;
+pub fn stop_via_tcp(addr: &str, endpoint: &str) -> StopAttempt {
+    stop_via_tcp_until(addr, endpoint, Instant::now() + STOP_TIMEOUT)
+}
+
+/// Send a stop request over TCP after a `GET /_ping` preflight on its own
+/// connection. Connecting is capped per attempt by [`connect_tcp_stream`],
+/// while the ping and the stop request share `deadline`.
+fn stop_via_tcp_until(addr: &str, endpoint: &str, deadline: Instant) -> StopAttempt {
+    if !ping_tcp(addr, ping_deadline(deadline)) {
+        return StopAttempt::Unreachable;
+    }
+    let Some(stream) = connect_tcp_stream(addr, deadline) else {
+        return StopAttempt::Unreachable;
+    };
     let mut stream = DeadlineStream::new(stream, deadline);
-    http::send_http_post_status(&mut stream, endpoint)
+    post_status_attempt(&mut stream, endpoint)
+}
+
+/// Whether the daemon behind a TCP address answers `GET /_ping`.
+fn ping_tcp(addr: &str, deadline: Instant) -> bool {
+    let Some(stream) = connect_tcp_stream(addr, deadline) else {
+        return false;
+    };
+    let mut stream = DeadlineStream::new(stream, deadline);
+    let result = http::send_http_status_request(&mut stream, http::PING_HTTP_REQUEST);
+    ping_answered(result, &format!("tcp={addr}"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     #[cfg(unix)]
@@ -757,6 +915,95 @@ mod tests {
             }
         }
         request
+    }
+
+    /// How a [`TestDaemon`] answers one connection, given the request head
+    /// it read. Returning without writing closes the connection unanswered.
+    type Respond = fn(&mut TcpStream, &[u8]);
+
+    /// Loopback daemon that accepts every connection until
+    /// [`TestDaemon::finish`], records each request head, and answers it with
+    /// a [`Respond`] function.
+    struct TestDaemon {
+        addr: String,
+        done: Arc<AtomicBool>,
+        handle: JoinHandle<Vec<Vec<u8>>>,
+    }
+
+    impl TestDaemon {
+        fn start(respond: Respond) -> Self {
+            let (listener, addr) = loopback_listener();
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let done = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&done);
+            let handle = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                loop {
+                    // Read the flag before accepting so a connection queued
+                    // before `finish` is still served and recorded.
+                    let finishing = stop.load(Ordering::SeqCst);
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).expect("blocking stream");
+                            let request = drain_request(&mut stream);
+                            respond(&mut stream, &request);
+                            requests.push(request);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock && !finishing => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return requests,
+                    }
+                }
+            });
+            Self { addr, done, handle }
+        }
+
+        /// Stop accepting and return the request lines received, in order.
+        fn finish(self) -> Vec<String> {
+            self.done.store(true, Ordering::SeqCst);
+            self.handle
+                .join()
+                .expect("test daemon thread")
+                .iter()
+                .map(|request| {
+                    String::from_utf8_lossy(request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        }
+    }
+
+    const PING_REQUEST_LINE: &str = "GET /_ping HTTP/1.0";
+
+    fn is_ping(request: &[u8]) -> bool {
+        request.starts_with(PING_REQUEST_LINE.as_bytes())
+    }
+
+    /// Answer a ping like dockerd does; leave any other request unanswered.
+    fn answer_ping_only(stream: &mut TcpStream, request: &[u8]) {
+        if is_ping(request) {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"));
+        }
+    }
+
+    /// Answer the ping, then reply to the stop request with 204.
+    fn answer_ping_then_204(stream: &mut TcpStream, request: &[u8]) {
+        if is_ping(request) {
+            answer_ping_only(stream, request);
+        } else {
+            drop(stream.write_all(b"HTTP/1.0 204 No Content\r\n\r\n"));
+        }
+    }
+
+    /// Whether any recorded request line is a POST (a stop or kill).
+    fn any_post(requests: &[String]) -> bool {
+        requests.iter().any(|line| line.starts_with("POST "))
     }
 
     #[cfg(unix)]
@@ -914,6 +1161,307 @@ mod tests {
             error.kind(),
             io::ErrorKind::TimedOut,
             "an expired deadline should surface as TimedOut"
+        );
+    }
+
+    // ── stop transport ───────────────────────────────────────────────
+
+    #[test]
+    fn stop_timeout_exceeds_grace_period() {
+        assert!(
+            STOP_TIMEOUT > Duration::from_secs(STOP_GRACE_SECS),
+            "a stop that uses the full grace period must not be reported as failed"
+        );
+    }
+
+    #[test]
+    fn stop_via_tcp_reports_status_code_after_ping() {
+        let daemon = TestDaemon::start(answer_ping_then_204);
+
+        let attempt = stop_via_tcp(&daemon.addr, "/containers/abc/stop?t=10");
+        let requests = daemon.finish();
+
+        assert_eq!(
+            attempt,
+            StopAttempt::Status(204),
+            "status should pass through"
+        );
+        assert_eq!(
+            requests,
+            vec![
+                PING_REQUEST_LINE.to_string(),
+                "POST /containers/abc/stop?t=10 HTTP/1.0".to_string()
+            ],
+            "the ping goes out on its own connection before the stop"
+        );
+    }
+
+    #[test]
+    fn stop_via_tcp_classifies_refused_connection_as_unreachable() {
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+
+        assert_eq!(
+            stop_via_tcp_until(
+                &addr,
+                "/containers/abc/stop",
+                // Short on purpose: Windows retries refused loopback
+                // connects, so this may end at the deadline, not a refusal.
+                Instant::now() + Duration::from_millis(300)
+            ),
+            StopAttempt::Unreachable,
+            "a closed port never received the request"
+        );
+    }
+
+    #[test]
+    fn stop_via_tcp_classifies_silent_daemon_as_no_response() {
+        let daemon = TestDaemon::start(|stream, request| {
+            if is_ping(request) {
+                answer_ping_only(stream, request);
+            } else {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        let attempt = stop_via_tcp_until(
+            &daemon.addr,
+            "/containers/abc/stop",
+            Instant::now() + Duration::from_millis(300),
+        );
+        let requests = daemon.finish();
+
+        assert_eq!(
+            attempt,
+            StopAttempt::NoResponse,
+            "a daemon that received the request and timed out owns the outcome"
+        );
+        assert!(any_post(&requests), "the stop request was sent");
+    }
+
+    #[test]
+    fn stop_via_tcp_classifies_accept_then_drop_as_unreachable() {
+        // A forwarder (socat, SSH tunnel) whose backend is down accepts the
+        // connection and closes it without sending a byte.
+        let (listener, addr) = loopback_listener();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            drop(stream);
+        });
+
+        let attempt = stop_via_tcp_until(
+            &addr,
+            "/containers/abc/stop",
+            Instant::now() + Duration::from_secs(5),
+        );
+        drop(server.join());
+
+        assert_eq!(
+            attempt,
+            StopAttempt::Unreachable,
+            "a ping closed without a reply means no daemon is behind the endpoint"
+        );
+    }
+
+    #[test]
+    fn stop_via_tcp_never_sends_stop_when_ping_is_dropped() {
+        // Reads every request, then closes the connection without a reply.
+        let daemon = TestDaemon::start(|_, _| {});
+
+        let attempt = stop_via_tcp_until(
+            &daemon.addr,
+            "/containers/abc/stop",
+            Instant::now() + Duration::from_secs(5),
+        );
+        let requests = daemon.finish();
+
+        assert_eq!(
+            attempt,
+            StopAttempt::Unreachable,
+            "an unanswered ping means no daemon is behind the endpoint"
+        );
+        assert_eq!(
+            requests,
+            vec![PING_REQUEST_LINE.to_string()],
+            "only the ping may be sent"
+        );
+        assert!(!any_post(&requests), "the stop must never be sent");
+    }
+
+    #[test]
+    fn stop_via_tcp_never_sends_stop_when_ping_times_out() {
+        let daemon = TestDaemon::start(|_, _| std::thread::sleep(Duration::from_millis(600)));
+
+        let attempt = stop_via_tcp_until(
+            &daemon.addr,
+            "/containers/abc/stop",
+            Instant::now() + Duration::from_millis(300),
+        );
+        let requests = daemon.finish();
+
+        assert_eq!(
+            attempt,
+            StopAttempt::Unreachable,
+            "a ping that times out leaves the stop unsent"
+        );
+        assert!(!any_post(&requests), "the stop must never be sent");
+    }
+
+    #[test]
+    fn stop_via_tcp_classifies_close_after_request_as_no_response() {
+        // dockerd starts the grace period, then crashes, or Go net/http
+        // recovers a handler panic by closing the connection unanswered.
+        let daemon = TestDaemon::start(answer_ping_only);
+
+        let attempt = stop_via_tcp_until(
+            &daemon.addr,
+            "/containers/abc/stop",
+            Instant::now() + Duration::from_secs(5),
+        );
+        let requests = daemon.finish();
+
+        assert_eq!(
+            attempt,
+            StopAttempt::NoResponse,
+            "a daemon that read the stop request may be acting on it"
+        );
+        assert!(any_post(&requests), "the stop request was received");
+    }
+
+    #[test]
+    fn stop_via_tcp_classifies_partial_reply_as_no_response() {
+        let daemon = TestDaemon::start(|stream, request| {
+            if is_ping(request) {
+                answer_ping_only(stream, request);
+            } else {
+                drop(stream.write_all(b"HTTP/1.0 20"));
+            }
+        });
+
+        let attempt = stop_via_tcp_until(
+            &daemon.addr,
+            "/containers/abc/stop",
+            Instant::now() + Duration::from_secs(5),
+        );
+        drop(daemon.finish());
+
+        assert_eq!(
+            attempt,
+            StopAttempt::NoResponse,
+            "a daemon that started replying may have acted on the request"
+        );
+    }
+
+    #[test]
+    fn stop_after_close_after_request_never_tries_next_endpoint() {
+        let first = TestDaemon::start(answer_ping_only);
+        let second = TestDaemon::start(answer_ping_then_204);
+
+        let targets = [(false, first.addr.clone()), (false, second.addr.clone())];
+        let attempt = crate::first_stop_owner(targets, |addr| {
+            stop_via_tcp(&addr, "/containers/web/stop?t=10")
+        });
+        let first_requests = first.finish();
+        let second_requests = second.finish();
+
+        assert_eq!(
+            crate::stop_outcome(attempt, false),
+            crate::StopOutcome::Failed,
+            "an unanswered stop is a failure"
+        );
+        assert!(any_post(&first_requests), "the first daemon got the stop");
+        assert!(
+            second_requests.is_empty(),
+            "a same-named container on the second daemon must not be touched"
+        );
+    }
+
+    #[test]
+    fn stop_falls_through_dead_forwarder_to_next_endpoint() {
+        let forwarder = TestDaemon::start(|_, _| {});
+        let daemon = TestDaemon::start(answer_ping_then_204);
+
+        let targets = [(true, forwarder.addr.clone()), (false, daemon.addr.clone())];
+        let attempt = crate::first_stop_owner(targets, |addr| {
+            stop_via_tcp(&addr, "/containers/web/stop?t=10")
+        });
+        let forwarder_requests = forwarder.finish();
+        drop(daemon.finish());
+
+        assert_eq!(
+            crate::stop_outcome(attempt, false),
+            crate::StopOutcome::Stopped,
+            "the live daemon behind the dead forwarder is used"
+        );
+        assert!(
+            !any_post(&forwarder_requests),
+            "the dead forwarder never receives the stop"
+        );
+    }
+
+    #[cfg(unix)]
+    fn unix_test_socket_path(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nanodock-{tag}-{}-{:?}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        drop(std::fs::remove_file(&path));
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_via_unix_socket_classifies_accept_then_drop_as_unreachable() {
+        let path = unix_test_socket_path("stop-drop");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind unix socket");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            drop(stream);
+        });
+
+        let attempt = stop_via_unix_socket(&path, "/containers/abc/stop");
+        drop(server.join());
+        drop(std::fs::remove_file(&path));
+
+        assert_eq!(
+            attempt,
+            StopAttempt::Unreachable,
+            "a socket that drops the ping has no daemon behind it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_via_unix_socket_classifies_close_after_request_as_no_response() {
+        let path = unix_test_socket_path("stop-close");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind unix socket");
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            // Exactly two connections: the ping, then the stop.
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let request = drain_request(&mut stream);
+                if is_ping(&request) {
+                    drop(stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"));
+                }
+                lines.push(String::from_utf8_lossy(&request).into_owned());
+            }
+            lines
+        });
+
+        let attempt = stop_via_unix_socket(&path, "/containers/abc/stop");
+        let lines = server.join().expect("server thread");
+        drop(std::fs::remove_file(&path));
+
+        assert_eq!(
+            attempt,
+            StopAttempt::NoResponse,
+            "a daemon that read the stop request may be acting on it"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("POST ")),
+            "the stop request was received"
         );
     }
 

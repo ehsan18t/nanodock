@@ -260,23 +260,59 @@ fn consume_chunked_trailers(reader: &mut impl BufRead) {
 }
 
 // ---------------------------------------------------------------------------
-// POST request helpers (container stop / kill)
+// Status-only requests (daemon ping, container stop / kill)
 // ---------------------------------------------------------------------------
+
+/// Raw HTTP/1.0 request for the daemon's `/_ping` endpoint, used to check
+/// that a daemon (and not only a forwarder in front of it) is answering.
+pub const PING_HTTP_REQUEST: &[u8] = b"GET /_ping HTTP/1.0\r\nHost: localhost\r\n\r\n";
 
 /// Build an HTTP/1.0 POST request for the given daemon endpoint path.
 pub fn format_post_request(path: &str) -> Vec<u8> {
     format!("POST {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").into_bytes()
 }
 
+/// Why a status-only request produced no HTTP status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFailure {
+    /// The request was never fully written, so no daemon can have acted on
+    /// it.
+    NotSent,
+    /// The request was fully written but no usable reply arrived: the peer
+    /// closed or reset the connection, the deadline passed, or the reply was
+    /// partial or malformed. A daemon may have received the request and may
+    /// still be acting on it.
+    NoReply,
+}
+
+/// Send `request` and return the status code of the reply.
+///
+/// Fails with [`StatusFailure::NotSent`] only when writing the request
+/// fails. Once the request is written, every failure (EOF, reset, timeout,
+/// partial or malformed reply) is [`StatusFailure::NoReply`].
+pub fn send_http_status_request(
+    stream: &mut (impl Read + std::io::Write),
+    request: &[u8],
+) -> Result<u16, StatusFailure> {
+    stream
+        .write_all(request)
+        .map_err(|_| StatusFailure::NotSent)?;
+    let mut reader = BufReader::new(stream);
+    read_response_headers(&mut reader)
+        .map(|headers| headers.status_code)
+        .ok_or(StatusFailure::NoReply)
+}
+
 /// Send an HTTP POST request and return the response status code.
 ///
 /// Used for Docker API calls that return no body (e.g. container stop/kill
 /// which respond with 204 No Content). Only the status code is needed.
-pub fn send_http_post_status(stream: &mut (impl Read + std::io::Write), path: &str) -> Option<u16> {
-    stream.write_all(&format_post_request(path)).ok()?;
-    let mut reader = BufReader::new(stream);
-    let headers = read_response_headers(&mut reader)?;
-    Some(headers.status_code)
+/// Failures are classified as in [`send_http_status_request`].
+pub fn send_http_post_status(
+    stream: &mut (impl Read + std::io::Write),
+    path: &str,
+) -> Result<u16, StatusFailure> {
+    send_http_status_request(stream, &format_post_request(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +905,108 @@ mod tests {
                 HeaderState::Invalid
             ),
             "a malformed status line can never complete"
+        );
+    }
+
+    // ── POST status classification ───────────────────────────────────
+
+    /// Stream whose writes fail and whose reads return `read_error`, if any.
+    struct FailingStream {
+        write_error: Option<std::io::ErrorKind>,
+        read_error: std::io::ErrorKind,
+    }
+
+    impl Read for FailingStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(self.read_error.into())
+        }
+    }
+
+    impl std::io::Write for FailingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_error
+                .map_or(Ok(buf.len()), |kind| Err(kind.into()))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn post_status(reader: impl Read) -> Result<u16, StatusFailure> {
+        send_http_post_status(&mut MockStream { reader }, "/containers/abc/stop")
+    }
+
+    #[test]
+    fn post_status_reads_status_code() {
+        assert_eq!(
+            post_status(&b"HTTP/1.0 204 No Content\r\n\r\n"[..]),
+            Ok(204)
+        );
+    }
+
+    #[test]
+    fn post_status_classifies_eof_after_request_as_no_reply() {
+        assert_eq!(
+            post_status(&b""[..]),
+            Err(StatusFailure::NoReply),
+            "a daemon may have read the request before closing without a reply"
+        );
+    }
+
+    #[test]
+    fn post_status_classifies_partial_reply_as_no_reply() {
+        assert_eq!(
+            post_status(&b"HTTP/1.0 20"[..]),
+            Err(StatusFailure::NoReply),
+            "a daemon that started replying may have acted on the request"
+        );
+    }
+
+    #[test]
+    fn post_status_classifies_read_errors_after_request_as_no_reply() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let mut stream = FailingStream {
+                write_error: None,
+                read_error: kind,
+            };
+            assert_eq!(
+                send_http_post_status(&mut stream, "/containers/abc/kill"),
+                Err(StatusFailure::NoReply),
+                "{kind:?} after the request was written means a daemon may be acting on it"
+            );
+        }
+    }
+
+    #[test]
+    fn post_status_classifies_failed_write_as_not_sent() {
+        let mut stream = FailingStream {
+            write_error: Some(std::io::ErrorKind::BrokenPipe),
+            read_error: std::io::ErrorKind::TimedOut,
+        };
+        assert_eq!(
+            send_http_post_status(&mut stream, "/containers/abc/kill"),
+            Err(StatusFailure::NotSent),
+            "a request that was never written cannot have been acted on"
+        );
+    }
+
+    #[test]
+    fn status_request_sends_ping_and_reads_status() {
+        let mut stream = MockStream {
+            reader: &b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"[..],
+        };
+        assert_eq!(
+            send_http_status_request(&mut stream, PING_HTTP_REQUEST),
+            Ok(200),
+            "any HTTP status from the ping endpoint is reported"
         );
     }
 }

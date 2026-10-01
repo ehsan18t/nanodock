@@ -290,7 +290,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `short_container_id(id)`                          | The 12-character short form of a container ID              |
 | `is_container_proxy_process(name)`                | Whether a process is a container runtime port proxy        |
 
-`is_container_proxy_process` recognizes the host-side helpers that listen on a published port on behalf of a container, so a port scanner can attribute the port to the container instead of the helper: `docker-proxy`, `rootlesskit`, `rootlessport`, `rootlessport-child`, `slirp4netns`, `pasta`, `pasta.avx2`, `com.docker.backend`, `com.docker.vpnkit`, `vpnkit`, `wslrelay`, `gvproxy`, and `limactl`. Matching is ASCII case-insensitive, ignores a trailing `.exe`, and accepts the 15-byte names Linux truncates longer process names to (for example `rootlessport-ch`). Generic forwarders such as `ssh` and `socat` are not recognized.
+`is_container_proxy_process` recognizes the host-side helpers that listen on a published port on behalf of a container, so a port scanner can attribute the port to the container instead of the helper: `docker-proxy`, `rootlesskit`, `rootlessport`, `rootlessport-child`, `slirp4netns`, `pasta`, `pasta.avx2`, `com.docker.backend`, `com.docker.vpnkit`, `vpnkit`, `wslrelay`, `gvproxy`, and `limactl`. Matching is ASCII case-insensitive, ignores a trailing `.exe`, and accepts the 15-byte names Linux and the 16-byte names macOS truncate longer process names to (for example `rootlessport-ch` and `com.docker.backe`). Generic forwarders such as `ssh` and `socat` are not recognized.
 
 ### Cargo Features
 

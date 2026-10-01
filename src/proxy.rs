@@ -33,9 +33,11 @@ const CONTAINER_PROXY_PROCESSES: &[&str] = &[
     "limactl",
 ];
 
-/// Length a Linux process name (`comm`) is truncated to: 16 bytes including
-/// the trailing NUL.
-const LINUX_COMM_MAX_LEN: usize = 15;
+/// Lengths the kernel truncates a long process name to: Linux keeps 15 bytes
+/// of `comm` (16 including the trailing NUL), and macOS keeps 16 bytes
+/// (`MAXCOMLEN`), so `com.docker.backend` is seen as `com.docker.back` on
+/// Linux and `com.docker.backe` on macOS.
+const TRUNCATED_NAME_LENS: [usize; 2] = [15, 16];
 
 /// Check whether a process name belongs to a container runtime port proxy.
 ///
@@ -54,9 +56,10 @@ const LINUX_COMM_MAX_LEN: usize = 15;
 ///
 /// The comparison is ASCII case-insensitive and ignores a trailing `.exe`
 /// (in any case), so Windows image names such as `com.docker.backend.exe`
-/// match. A 15-byte name that is the start of a longer known name also
-/// matches, because Linux truncates process names to 15 bytes (for example
-/// `rootlessport-ch`).
+/// match. A name of exactly 15 or 16 bytes that is the start of a longer
+/// known name also matches, because Linux truncates process names to 15
+/// bytes (`rootlessport-ch`) and macOS to 16 (`com.docker.backe`). Shorter
+/// prefixes never match.
 ///
 /// Generic tools that can also forward ports, such as `ssh` or `socat`, are
 /// deliberately not recognized: they are used for far more than container
@@ -71,6 +74,7 @@ const LINUX_COMM_MAX_LEN: usize = 15;
 /// assert!(is_container_proxy_process("docker-proxy"));
 /// assert!(is_container_proxy_process("COM.DOCKER.BACKEND.EXE"));
 /// assert!(is_container_proxy_process("rootlessport-ch"));
+/// assert!(is_container_proxy_process("com.docker.backe"));
 /// assert!(!is_container_proxy_process("nginx"));
 /// ```
 #[must_use]
@@ -78,16 +82,18 @@ pub fn is_container_proxy_process(name: &str) -> bool {
     let name = strip_exe_suffix(name);
     CONTAINER_PROXY_PROCESSES
         .iter()
-        .any(|known| name.eq_ignore_ascii_case(known) || is_truncated_comm_of(name, known))
+        .any(|known| name.eq_ignore_ascii_case(known) || is_truncated_name_of(name, known))
 }
 
-/// Whether `name` is `known` truncated to the Linux process name length.
-fn is_truncated_comm_of(name: &str, known: &str) -> bool {
-    name.len() == LINUX_COMM_MAX_LEN
-        && known.len() > LINUX_COMM_MAX_LEN
+/// Whether `name` is `known` truncated by the kernel: `name` is exactly one
+/// of the [`TRUNCATED_NAME_LENS`] long, `known` is longer, and `known`
+/// starts with `name`.
+fn is_truncated_name_of(name: &str, known: &str) -> bool {
+    TRUNCATED_NAME_LENS.contains(&name.len())
+        && known.len() > name.len()
         && known
             .as_bytes()
-            .get(..LINUX_COMM_MAX_LEN)
+            .get(..name.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name.as_bytes()))
 }
 
@@ -172,6 +178,33 @@ mod tests {
             !is_container_proxy_process("docker-pro"),
             "a prefix of a short name is not a truncation"
         );
+    }
+
+    #[test]
+    fn accepts_macos_truncated_names() {
+        for name in ["com.docker.backe", "com.docker.vpnki", "rootlessport-chi"] {
+            assert_eq!(name.len(), 16, "{name} is a 16-byte macOS name");
+            assert!(
+                is_container_proxy_process(name),
+                "{name} is a known proxy as truncated by macOS"
+            );
+        }
+        assert!(
+            is_container_proxy_process("COM.DOCKER.BACKE"),
+            "truncated names compare case-insensitively"
+        );
+        for name in [
+            "com.docker.backx",
+            "com.docker.bac",
+            "com.docker.backendx",
+            "rootlessport-chx",
+            "slirp4netns-xyzw",
+        ] {
+            assert!(
+                !is_container_proxy_process(name),
+                "{name:?} is not a truncation of a known proxy name"
+            );
+        }
     }
 
     #[test]

@@ -16,11 +16,11 @@
 //! ### Best-effort path (background thread, never errors)
 //!
 //! ```rust,no_run
-//! use nanodock::{start_detection, await_detection};
+//! use nanodock::start_detection;
 //!
 //! let handle = start_detection(None);
 //! // ... do other work while detection runs in the background ...
-//! let port_map = await_detection(handle);
+//! let port_map = handle.wait();
 //! for ((ip, port, proto), info) in &port_map {
 //!     println!("{proto} port {port} -> {} ({})", info.name, info.image);
 //! }
@@ -828,8 +828,33 @@ pub struct DetectionHandle {
 }
 
 impl DetectionHandle {
-    /// Receive the detection result, waiting at most until the deadline.
-    fn receive(self) -> Result<ContainerPortMap, Error> {
+    /// Wait for the detection to finish and return the published ports.
+    ///
+    /// Blocks until the result arrives or the client's timeout (3 seconds
+    /// by default) has passed since the detection started. Never fails:
+    /// when no daemon answered, or the timeout passed, the map is empty.
+    /// This suits enrichment, where a missing daemon is not an error; use
+    /// [`DetectionHandle::wait_result`] to learn why the map is empty.
+    ///
+    /// ```no_run
+    /// let handle = nanodock::start_detection(None);
+    /// // ... do other work while detection runs ...
+    /// let port_map = handle.wait();
+    /// println!("{} published ports", port_map.len());
+    /// ```
+    #[must_use]
+    pub fn wait(self) -> ContainerPortMap {
+        self.wait_result().unwrap_or_default()
+    }
+
+    /// Wait like [`DetectionHandle::wait`], but report why detection failed.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the most informative endpoint failure when no daemon
+    /// produced a container list (see [`Error`]), or with
+    /// [`Error::Timeout`] when the client's timeout passed first.
+    pub fn wait_result(self) -> Result<ContainerPortMap, Error> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         match self.receiver.recv_timeout(remaining) {
             Ok(result) => result,
@@ -871,19 +896,6 @@ pub fn detect_containers(home: Option<PathBuf>) -> Result<ContainerPortMap, Erro
 #[must_use]
 pub fn start_detection(home: Option<PathBuf>) -> DetectionHandle {
     Client::new().home(home).start_detection()
-}
-
-/// Wait for a background detection to complete.
-///
-/// Blocks until the client's timeout (3 seconds by default) has passed
-/// since the detection started, then returns an empty map. Never returns
-/// an error: this is best-effort enrichment.
-// The handle wraps a `Receiver` which must be consumed (moved) to
-// read from it; passing by reference is not possible.
-#[allow(clippy::needless_pass_by_value)]
-#[must_use]
-pub fn await_detection(handle: DetectionHandle) -> ContainerPortMap {
-    handle.receive().unwrap_or_default()
 }
 
 /// Stop or kill a container with a default [`Client`] whose home directory
@@ -2114,6 +2126,43 @@ mod tests {
     }
 
     #[test]
+    fn detection_handle_delivers_the_result_or_an_empty_map() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut map = ContainerPortMap::new();
+        map.insert(
+            None,
+            80,
+            Protocol::Tcp,
+            test_container_info("a", "web", "nginx"),
+        );
+        tx.send(Ok(map)).expect("receiver alive");
+        let handle = DetectionHandle {
+            receiver: rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert_eq!(handle.wait().len(), 1, "the detected ports are returned");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(Error::DaemonNotFound)).expect("receiver alive");
+        let failed = DetectionHandle {
+            receiver: rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert!(failed.wait().is_empty(), "a failure reads as no containers");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(permission_denied())).expect("receiver alive");
+        let explained = DetectionHandle {
+            receiver: rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert!(matches!(
+            explained.wait_result(),
+            Err(Error::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
     fn detection_handle_times_out_at_its_deadline() {
         let (_tx, rx) = std::sync::mpsc::channel();
         let handle = DetectionHandle {
@@ -2121,7 +2170,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_millis(50),
         };
         let started = Instant::now();
-        assert!(matches!(handle.receive(), Err(Error::Timeout)));
+        assert!(matches!(handle.wait_result(), Err(Error::Timeout)));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the handle stops waiting at the deadline"

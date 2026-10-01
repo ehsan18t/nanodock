@@ -59,7 +59,7 @@ Two detection paths are available:
 **Best-effort path** (background thread, never errors):
 
 ```rust,no_run
-use nanodock::{start_detection, await_detection};
+use nanodock::start_detection;
 
 fn main() {
     // Spawn background detection (queries Docker/Podman daemon).
@@ -67,8 +67,8 @@ fn main() {
 
     // ... do other work while detection runs ...
 
-    // Collect results (blocks up to 3 seconds).
-    let port_map = await_detection(handle);
+    // Collect results (blocks up to 3 seconds after the start).
+    let port_map = handle.wait();
 
     for ((ip, port, proto), info) in &port_map {
         println!(
@@ -103,12 +103,10 @@ fn main() {
 
 ```rust,no_run
 use std::net::{IpAddr, Ipv4Addr};
-use nanodock::{
-    start_detection, await_detection, Protocol, ProxyFallback, PublishedContainerMatch,
-};
+use nanodock::{start_detection, Protocol, ProxyFallback, PublishedContainerMatch};
 
 fn main() {
-    let port_map = await_detection(start_detection(None));
+    let port_map = start_detection(None).wait();
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     match port_map.lookup(ip, 5432, Protocol::Tcp, ProxyFallback::Deny) {
@@ -213,7 +211,8 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | --------------------------------- | --------------------------------------------------- |
 | `detect_containers(home)`         | Synchronous detection, returns `Result<Map, Error>` |
 | `start_detection(home)`           | Spawn background daemon query, returns handle       |
-| `await_detection(handle)`         | Block for results (3s timeout), returns map         |
+| `DetectionHandle::wait()`         | Block for results (3s timeout), returns map         |
+| `DetectionHandle::wait_result()`  | Same, but returns `Result` with the failure reason  |
 | `ContainerPortMap::lookup()`      | Match a socket address against the port map         |
 | `stop_container(id, force, home)` | Stop or kill a container by ID                      |
 | `parse_containers_json(body)`     | Parse raw `/containers/json` response               |

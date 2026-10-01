@@ -55,7 +55,7 @@ library crate, or is it a leftover from the embedded-in-portlens era?"
    Every lint violation is a compile error. Never `#[allow(...)]` a lint without a
    neighbouring comment explaining _why_.
 2. **Layered Error Handling:**
-   - **Best-effort path** (`start_detection` / `await_detection`): Returns
+   - **Best-effort path** (`start_detection` / `DetectionHandle::wait`): Returns
      `Option`. Designed for enrichment use cases where the daemon being down
      is not an error.
    - **Strict path** (`detect_containers`): Returns `Result<_, Error>`.

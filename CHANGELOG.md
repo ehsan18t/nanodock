@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
 - `PublishedContainerMatch::container` returns the matched container, if any.
 - `StopOutcome::is_stopped` tells whether the container is known to be stopped.
+- `Client` holds the daemon settings and runs detection and stop requests: `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, and `Client::stop` do what the free functions do; `detect_containers`, `start_detection`, and `stop_container` remain as shorthands for a default client with the given home directory. The detection timeout (3 seconds by default) is now configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
 - `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout`, `HttpStatus(u16)`, `InvalidResponse(ParseError)`, and `Io(std::io::Error)`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
 
 ### Changed
@@ -23,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `Error::DaemonNotFound` now means that no daemon listens on any known endpoint. Failures that were reported as `DaemonNotFound` before (permission denied, timeout, an error status, a malformed reply) now have their own variants.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
 - **Breaking:** `StopOutcome::Failed` is split into `StopOutcome::Unreachable` (no daemon could be contacted, so the container was not touched), `StopOutcome::NoResponse` (a daemon received the request but gave no usable reply, so the container may or may not be stopping), and `StopOutcome::Rejected { status }` (the daemon answered with an unexpected HTTP status). The stop semantics are unchanged: the ping preflight, the rule that no second daemon is tried once one may have received the request, and the rule that any reply from the `DOCKER_HOST` daemon ends the search all still apply.
+- The `await_detection` window is now measured from the moment detection started rather than from the call, so it never waits longer than the detection timeout after `start_detection`.
 
 ### Removed
 

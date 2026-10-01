@@ -196,6 +196,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 | Type                      | Description                                               |
 | ------------------------- | --------------------------------------------------------- |
+| `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, and `stop` |
 | `Protocol`                | Network protocol enum (`Tcp`, `Udp`)                      |
 | `ContainerInfo`           | Container metadata (id, name, image, Compose project and service) |
 | `ContainerPortMap`        | Map from `(ip, port, protocol)` to a shared `ContainerInfo`, with `get`, `iter`, and `lookup` |

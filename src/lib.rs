@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -599,103 +599,301 @@ impl std::fmt::Display for PublishedContainerMatch<'_> {
     }
 }
 
-/// Handle for an in-progress Docker/Podman container detection.
+// ── Client ───────────────────────────────────────────────────────────
+
+/// Detection timeout of [`Client::new`] and the free functions.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Longest accepted detection timeout. [`Client::timeout`] caps longer
+/// values so deadline arithmetic cannot overflow.
+const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Largest part of the timeout kept back from the daemon queries for JSON
+/// parsing and the hand-off to the waiting thread.
+const MAX_HANDOFF_MARGIN: Duration = Duration::from_millis(500);
+
+/// Budget for querying the daemons within a detection `timeout`.
 ///
-/// Created by [`start_detection`] and consumed by [`await_detection`].
-/// The inner channel is hidden to allow future changes to the detection
-/// mechanism without breaking the public API.
+/// Strictly shorter than any nonzero `timeout`, so the detection thread
+/// always delivers what it collected before the [`DetectionHandle`] stops
+/// waiting. The margin is a sixth of the timeout, at most 500 ms: the
+/// default 3 second timeout queries the daemons for 2.5 seconds.
+fn query_budget(timeout: Duration) -> Duration {
+    let margin = (timeout / 6).clamp(Duration::from_nanos(1), MAX_HANDOFF_MARGIN);
+    timeout.saturating_sub(margin)
+}
+
+/// Settings for talking to the Docker/Podman daemons, and the entry point
+/// for detection and stop requests.
+///
+/// [`Client::new`] reads the environment: the `DOCKER_HOST` variable and
+/// the user's home directory. The setters replace those values and the
+/// detection timeout; each takes and returns the client, so they chain.
+/// A client is cheap to clone and can be shared between threads.
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use nanodock::Client;
+///
+/// let client = Client::new().timeout(Duration::from_secs(1));
+/// match client.detect() {
+///     Ok(port_map) => println!("{} published ports", port_map.len()),
+///     Err(error) => eprintln!("detection failed: {error}"),
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    home: Option<PathBuf>,
+    timeout: Duration,
+    docker_host: Option<String>,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Client {
+    /// Create a client from the environment.
+    ///
+    /// The daemon override comes from the `DOCKER_HOST` variable (ignored
+    /// when unset, empty, or not valid UTF-8), the home directory from
+    /// [`std::env::home_dir`], and the detection timeout is 3 seconds.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            home: std::env::home_dir(),
+            timeout: DEFAULT_TIMEOUT,
+            docker_host: std::env::var("DOCKER_HOST")
+                .ok()
+                .filter(|value| !value.is_empty()),
+        }
+    }
+
+    /// Set the home directory used on Unix to find per-user sockets, such
+    /// as Docker Desktop's `~/.docker/desktop/docker.sock`.
+    ///
+    /// With `None` only the system-wide and `/run/user/{uid}` sockets are
+    /// tried. Windows ignores the home directory.
+    #[must_use]
+    pub fn home(mut self, home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self
+    }
+
+    /// Set the detection timeout (3 seconds by default).
+    ///
+    /// [`Client::detect`] returns within about this long, and
+    /// [`DetectionHandle`] waits until this long after
+    /// [`Client::start_detection`] was called. The daemons are queried
+    /// under a slightly shorter budget so their answers are always handed
+    /// over in time. Values above 24 hours are capped. Stop requests are not
+    /// affected: they allow for the daemon's 10 second grace period.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.min(MAX_TIMEOUT);
+        self
+    }
+
+    /// Set the daemon override in `DOCKER_HOST` syntax, replacing the
+    /// environment variable.
+    ///
+    /// `tcp://host:port` is queried alongside the default local endpoints
+    /// and wins when it answers. `unix:///path` (Unix) replaces the default
+    /// sockets. `npipe:////./pipe/name` (Windows) is queried alongside the
+    /// default pipes and wins when it answers. `None`, or a value with
+    /// another scheme, uses only the default endpoints.
+    #[must_use]
+    pub fn docker_host(mut self, docker_host: Option<String>) -> Self {
+        self.docker_host = docker_host;
+        self
+    }
+
+    /// Synchronously detect Docker/Podman containers and their published
+    /// ports.
+    ///
+    /// Queries all known daemon endpoints concurrently under one shared
+    /// time budget. A `DOCKER_HOST` `tcp://` daemon is queried alongside
+    /// the local Unix sockets or Windows named pipes and is used on its own
+    /// when it answers; otherwise the containers of all answering local
+    /// daemons are merged.
+    ///
+    /// This blocks the calling thread and surfaces errors, so the caller
+    /// can tell "no containers running" (an empty map) from "no daemon"
+    /// ([`Error::DaemonNotFound`]) or "not allowed"
+    /// ([`Error::PermissionDenied`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails only when no endpoint produced a container list, with the
+    /// most informative endpoint failure (see [`Error`]), or with
+    /// [`Error::InvalidResponse`] when the merged list is not valid JSON.
+    pub fn detect(&self) -> Result<ContainerPortMap, Error> {
+        debug!("starting synchronous container runtime detection");
+        let bodies = self.query_daemon_bodies(Instant::now())?;
+        let body = merge_prioritized_bodies(&bodies).ok_or(Error::DaemonNotFound)?;
+        let map = api::parse_containers_json_strict(&body)?;
+        debug!(
+            "finished synchronous container runtime detection: port_mappings={}",
+            map.len()
+        );
+        Ok(map)
+    }
+
+    /// Start detection on a background thread and return at once.
+    ///
+    /// Other work (socket enumeration, process lookups) can run while the
+    /// daemons are queried; collect the result from the returned
+    /// [`DetectionHandle`]. Detection parses each daemon's list leniently,
+    /// skipping malformed container entries instead of failing.
+    #[must_use]
+    pub fn start_detection(&self) -> DetectionHandle {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let client = self.clone();
+        debug!("starting container runtime detection");
+        std::thread::spawn(move || {
+            let result = client.query_daemon(started);
+            match &result {
+                Ok(map) => debug!(
+                    "finished container runtime detection: port_mappings={}",
+                    map.len()
+                ),
+                Err(error) => debug!("container runtime detection failed: {error}"),
+            }
+            // Ignore send error: receiver may have timed out and been dropped.
+            drop(tx.send(result));
+        });
+        DetectionHandle {
+            receiver: rx,
+            deadline: started + self.timeout,
+        }
+    }
+
+    /// Stop or kill a running container through the daemon API.
+    ///
+    /// When `force` is false, sends `POST /containers/{id}/stop?t=10`
+    /// (SIGTERM, then SIGKILL after 10 seconds). When `force` is true,
+    /// sends `POST /containers/{id}/kill` (immediate SIGKILL).
+    ///
+    /// The `id` can be a container ID (hex) or a container name. Characters
+    /// that would corrupt the HTTP request path (`/`, `?`, `#`, `%`, control
+    /// characters, spaces) are rejected early with [`StopOutcome::NotFound`].
+    ///
+    /// Tries the same daemons as detection, in priority order
+    /// (`DOCKER_HOST` first, then the platform defaults; a `unix://`
+    /// `DOCKER_HOST` replaces the default sockets). Before the stop request
+    /// is sent to a daemon, it must answer `GET /_ping` on a separate
+    /// connection; a daemon that cannot be reached or does not answer the
+    /// ping (for example a forwarder whose backend is down) is skipped
+    /// without receiving the stop.
+    ///
+    /// Any reply from the `DOCKER_HOST` daemon, including "not found", is
+    /// the result. A "not found" from a default daemon moves on to the next
+    /// one, and the first other reply is the result. Once a daemon has
+    /// received the stop request, a closed or reset connection, a timeout,
+    /// or a partial or malformed reply ends the search with
+    /// [`StopOutcome::NoResponse`], even when an earlier daemon answered
+    /// "not found": that daemon may still be stopping the container, so no
+    /// other daemon is tried. When no daemon could be contacted at all the
+    /// result is [`StopOutcome::Unreachable`], and an unexpected HTTP status
+    /// is [`StopOutcome::Rejected`].
+    ///
+    /// The detection timeout does not apply: a stop allows for the grace
+    /// period plus a margin (20 seconds overall).
+    #[must_use]
+    pub fn stop(&self, id: &str, force: bool) -> StopOutcome {
+        if !is_safe_container_id(id) {
+            debug!("rejected container id with unsafe characters");
+            return StopOutcome::NotFound;
+        }
+
+        let endpoint = stop_endpoint(id, force);
+        let attempt = first_stop_owner(self.stop_targets(), |target| target.send_stop(&endpoint));
+        stop_outcome(attempt, force)
+    }
+}
+
+/// Handle for a container detection running on a background thread.
+///
+/// Created by [`Client::start_detection`] or [`start_detection`]. The
+/// channel inside is private so the detection mechanism can change without
+/// breaking the public API.
 #[derive(Debug)]
-pub struct DetectionHandle(std::sync::mpsc::Receiver<Option<ContainerPortMap>>);
+pub struct DetectionHandle {
+    receiver: std::sync::mpsc::Receiver<Result<ContainerPortMap, Error>>,
+    /// When the waiting side gives up: the start plus the client timeout.
+    deadline: Instant,
+}
 
-// ── Detection orchestration ──────────────────────────────────────────
+impl DetectionHandle {
+    /// Receive the detection result, waiting at most until the deadline.
+    fn receive(self) -> Result<ContainerPortMap, Error> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        match self.receiver.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                debug!("container runtime detection timed out");
+                Err(Error::Timeout)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                debug!("container runtime detection channel disconnected");
+                Err(Error::Io(std::io::Error::other(
+                    "the detection thread stopped without a result",
+                )))
+            }
+        }
+    }
+}
 
-/// Synchronously detect Docker/Podman containers and their published ports.
+// ── Convenience functions ────────────────────────────────────────────
+
+/// Synchronously detect containers with a default [`Client`] whose home
+/// directory is `home`.
 ///
-/// Tries all known daemon transports concurrently under one shared time
-/// budget. A `DOCKER_HOST` `tcp://` daemon is queried alongside the local
-/// Unix sockets or Windows named pipes and is used on its own when it
-/// answers; otherwise the containers of all answering local daemons are
-/// merged. Returns an error if no daemon produced a container list or if
-/// the list could not be parsed.
-///
-/// Unlike [`start_detection`] / [`await_detection`], this function
-/// blocks the calling thread and surfaces errors so the caller can
-/// distinguish "no containers running" (empty map) from "daemon
-/// unreachable" ([`Error::DaemonNotFound`]) or "not allowed"
-/// ([`Error::PermissionDenied`]).
+/// Shorthand for `Client::new().home(home).detect()`; see
+/// [`Client::detect`]. The `home` directory is used on Unix to find
+/// per-user sockets such as Docker Desktop's.
 ///
 /// # Errors
 ///
-/// Fails only when no endpoint produced a container list, with the most
-/// informative endpoint failure (see [`Error`]), or with
-/// [`Error::InvalidResponse`] when the merged list is not valid JSON.
+/// See [`Client::detect`].
 pub fn detect_containers(home: Option<PathBuf>) -> Result<ContainerPortMap, Error> {
-    debug!("starting synchronous container runtime detection");
-    let bodies = query_daemon_bodies(home)?;
-    let body = merge_prioritized_bodies(&bodies).ok_or(Error::DaemonNotFound)?;
-    let map = api::parse_containers_json_strict(&body)?;
-    debug!(
-        "finished synchronous container runtime detection: port_mappings={}",
-        map.len()
-    );
-    Ok(map)
+    Client::new().home(home).detect()
 }
 
-/// Start asynchronous detection of Docker/Podman containers.
+/// Start detection on a background thread with a default [`Client`] whose
+/// home directory is `home`.
 ///
-/// Spawns a background thread to query the Docker/Podman daemon.
-/// The returned handle should be passed to [`await_detection`] to
-/// retrieve the results. This allows other work (socket enumeration,
-/// process metadata refresh) to proceed concurrently.
-///
-/// The `home` parameter provides the user's home directory path, used
-/// on Unix to discover rootless Docker/Podman socket locations.
+/// Shorthand for `Client::new().home(home).start_detection()`; see
+/// [`Client::start_detection`].
 #[must_use]
 pub fn start_detection(home: Option<PathBuf>) -> DetectionHandle {
-    let (tx, rx) = std::sync::mpsc::channel();
-    debug!("starting container runtime detection");
-    std::thread::spawn(move || {
-        let result = query_daemon(home);
-        match &result {
-            Ok(map) => debug!(
-                "finished container runtime detection: port_mappings={}",
-                map.len()
-            ),
-            Err(error) => debug!("container runtime detection failed: {error}"),
-        }
-        // Ignore send error: receiver may have timed out and been dropped.
-        drop(tx.send(result.ok()));
-    });
-    DetectionHandle(rx)
+    Client::new().home(home).start_detection()
 }
 
-/// Wait for Docker/Podman detection to complete.
+/// Wait for a background detection to complete.
 ///
-/// Blocks for at most 3 seconds before returning an empty map.
-/// Never returns an error - this is best-effort enrichment.
+/// Blocks until the client's timeout (3 seconds by default) has passed
+/// since the detection started, then returns an empty map. Never returns
+/// an error: this is best-effort enrichment.
 // The handle wraps a `Receiver` which must be consumed (moved) to
 // read from it; passing by reference is not possible.
 #[allow(clippy::needless_pass_by_value)]
 #[must_use]
 pub fn await_detection(handle: DetectionHandle) -> ContainerPortMap {
-    match handle.0.recv_timeout(ipc::DAEMON_TIMEOUT) {
-        Ok(Some(container_map)) => container_map,
-        Ok(None) => {
-            debug!("container runtime detection returned no data");
-            ContainerPortMap::default()
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            debug!(
-                "container runtime detection timed out: timeout_secs={}",
-                ipc::DAEMON_TIMEOUT.as_secs()
-            );
-            ContainerPortMap::default()
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            debug!("container runtime detection channel disconnected");
-            ContainerPortMap::default()
-        }
-    }
+    handle.receive().unwrap_or_default()
+}
+
+/// Stop or kill a container with a default [`Client`] whose home directory
+/// is `home`.
+///
+/// Shorthand for `Client::new().home(home).stop(id, force)`; see
+/// [`Client::stop`].
+#[must_use]
+pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutcome {
+    Client::new().home(home).stop(id, force)
 }
 
 // ── Container stop / kill ────────────────────────────────────────────
@@ -747,48 +945,6 @@ impl std::fmt::Display for StopOutcome {
             }
         }
     }
-}
-
-/// Stop or kill a running container via the Docker/Podman daemon API.
-///
-/// When `force` is false, sends `POST /containers/{id}/stop?t=10`
-/// (graceful SIGTERM, then SIGKILL after 10 seconds). When `force` is
-/// true, sends `POST /containers/{id}/kill` (immediate SIGKILL).
-///
-/// The `id` parameter can be a container ID (hex) or a container name.
-/// Characters that would corrupt the HTTP request path (`/`, `?`, `#`,
-/// `%`, control characters, spaces) are rejected early with
-/// [`StopOutcome::NotFound`].
-///
-/// The `home` parameter provides the user's home directory path, used
-/// on Unix to discover daemon socket locations.
-///
-/// Tries the same daemons as detection, in priority order (`DOCKER_HOST`
-/// first, then the platform defaults; a `unix://` `DOCKER_HOST` replaces the
-/// default sockets). Before the stop request is sent to a daemon, it must
-/// answer `GET /_ping` on a separate connection; a daemon that cannot be
-/// reached or does not answer the ping (for example a forwarder whose
-/// backend is down) is skipped without receiving the stop.
-///
-/// Any reply from the `DOCKER_HOST` daemon, including "not found", is the
-/// result. A "not found" from a default daemon moves on to the next one,
-/// and the first other reply is the result. Once a daemon has received the
-/// stop request, a closed or reset connection, a timeout, or a partial or
-/// malformed reply ends the search with [`StopOutcome::NoResponse`], even
-/// when an earlier daemon answered "not found": that daemon may still be
-/// stopping the container, so no other daemon is tried. When no daemon could
-/// be contacted at all the result is [`StopOutcome::Unreachable`], and an
-/// unexpected HTTP status is [`StopOutcome::Rejected`].
-#[must_use]
-pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutcome {
-    if !is_safe_container_id(id) {
-        debug!("rejected container id with unsafe characters");
-        return StopOutcome::NotFound;
-    }
-
-    let endpoint = stop_endpoint(id, force);
-    let attempt = first_stop_owner(stop_targets(home), |target| target.send_stop(&endpoint));
-    stop_outcome(attempt, force)
 }
 
 /// Build the stop or kill endpoint for an already validated container id.
@@ -953,9 +1109,11 @@ impl std::fmt::Display for DaemonEndpoint {
     }
 }
 
-/// The `DOCKER_HOST` `tcp://` endpoint, if configured.
-fn docker_host_tcp_endpoint() -> Option<DaemonEndpoint> {
-    ipc::docker_host_tcp_addr().map(DaemonEndpoint::Tcp)
+/// The `tcp://` endpoint of a `DOCKER_HOST` value, if it has one.
+fn docker_host_tcp_endpoint(docker_host: Option<&str>) -> Option<DaemonEndpoint> {
+    docker_host
+        .and_then(ipc::docker_host_tcp_addr)
+        .map(DaemonEndpoint::Tcp)
 }
 
 /// The well-known local daemon sockets for the current user.
@@ -982,15 +1140,20 @@ fn default_local_endpoints(_home: Option<PathBuf>) -> impl Iterator<Item = Daemo
         .map(|path| DaemonEndpoint::Pipe((*path).to_string()))
 }
 
-/// The local `DOCKER_HOST` override (`unix://` or `npipe://`), if configured.
+/// The local endpoint (`unix://` or `npipe://`) of a `DOCKER_HOST` value,
+/// if it has one.
 #[cfg(unix)]
-fn docker_host_local_endpoint() -> Option<DaemonEndpoint> {
-    ipc::docker_host_unix_path().map(|path| DaemonEndpoint::Unix(PathBuf::from(path)))
+fn docker_host_local_endpoint(docker_host: Option<&str>) -> Option<DaemonEndpoint> {
+    docker_host
+        .and_then(ipc::docker_host_unix_path)
+        .map(|path| DaemonEndpoint::Unix(PathBuf::from(path)))
 }
 
 #[cfg(windows)]
-fn docker_host_local_endpoint() -> Option<DaemonEndpoint> {
-    ipc::docker_host_npipe_path().map(DaemonEndpoint::Pipe)
+fn docker_host_local_endpoint(docker_host: Option<&str>) -> Option<DaemonEndpoint> {
+    docker_host
+        .and_then(ipc::docker_host_npipe_path)
+        .map(DaemonEndpoint::Pipe)
 }
 
 /// Whether a local `DOCKER_HOST` override replaces the default endpoints.
@@ -999,30 +1162,49 @@ fn docker_host_local_endpoint() -> Option<DaemonEndpoint> {
 /// `npipe://` pipe is tried alongside the default pipes, like `tcp://`.
 const LOCAL_OVERRIDE_REPLACES_DEFAULTS: bool = cfg!(unix);
 
-/// Endpoints a stop request is tried against, in order, each tagged with
-/// whether it was configured through `DOCKER_HOST`.
-///
-/// The same endpoints, in the same order, as one detection pass (see
-/// [`detection_targets`]), so a stop never reaches a daemon that detection
-/// excluded. Any reply from the `DOCKER_HOST` endpoint, including "not
-/// found", ends the search (see [`first_stop_owner`]); the defaults are
-/// tried only when that endpoint is unreachable.
-fn stop_targets(home: Option<PathBuf>) -> Vec<(bool, DaemonEndpoint)> {
-    detection_targets(home)
-}
+impl Client {
+    /// Endpoints a stop request is tried against, in order, each tagged
+    /// with whether it was configured through `DOCKER_HOST`.
+    ///
+    /// The same endpoints, in the same order, as one detection pass (see
+    /// [`Client::detection_targets`]), so a stop never reaches a daemon that
+    /// detection excluded. Any reply from the `DOCKER_HOST` endpoint,
+    /// including "not found", ends the search (see [`first_stop_owner`]);
+    /// the defaults are tried only when that endpoint is unreachable.
+    fn stop_targets(&self) -> Vec<(bool, DaemonEndpoint)> {
+        self.detection_targets()
+    }
 
-/// Endpoints one detection pass queries, in priority order, each tagged with
-/// whether it was configured through `DOCKER_HOST`.
-///
-/// A `tcp://` daemon is queried alongside the local defaults, so a stale
-/// address cannot use up the budget the local endpoints need.
-fn detection_targets(home: Option<PathBuf>) -> Vec<(bool, DaemonEndpoint)> {
-    prioritized_targets(
-        docker_host_tcp_endpoint(),
-        docker_host_local_endpoint(),
-        LOCAL_OVERRIDE_REPLACES_DEFAULTS,
-        || default_local_endpoints(home).collect(),
-    )
+    /// Endpoints one detection pass queries, in priority order, each tagged
+    /// with whether it was configured through `DOCKER_HOST`.
+    ///
+    /// A `tcp://` daemon is queried alongside the local defaults, so a stale
+    /// address cannot use up the budget the local endpoints need.
+    fn detection_targets(&self) -> Vec<(bool, DaemonEndpoint)> {
+        let docker_host = self.docker_host.as_deref();
+        prioritized_targets(
+            docker_host_tcp_endpoint(docker_host),
+            docker_host_local_endpoint(docker_host),
+            LOCAL_OVERRIDE_REPLACES_DEFAULTS,
+            || default_local_endpoints(self.home.clone()).collect(),
+        )
+    }
+
+    /// Query every detection target concurrently and keep the bodies to
+    /// use, highest priority first. The query budget runs from `started`.
+    fn query_daemon_bodies(&self, started: Instant) -> Result<Vec<String>, Error> {
+        collect_daemon_bodies(
+            self.detection_targets(),
+            DaemonEndpoint::fetch_json,
+            started + query_budget(self.timeout),
+        )
+    }
+
+    /// One lenient detection pass whose budget runs from `started`.
+    fn query_daemon(&self, started: Instant) -> Result<ContainerPortMap, Error> {
+        merge_prioritized_responses(&self.query_daemon_bodies(started)?)
+            .ok_or(Error::DaemonNotFound)
+    }
 }
 
 /// Order daemon endpoints by priority: the `DOCKER_HOST` endpoint first
@@ -1051,16 +1233,6 @@ fn prioritized_targets<P>(
 }
 
 // ── Daemon queries ───────────────────────────────────────────────────
-
-/// Query every detection target concurrently and keep the bodies to use,
-/// highest priority first.
-fn query_daemon_bodies(home: Option<PathBuf>) -> Result<Vec<String>, Error> {
-    collect_daemon_bodies(
-        detection_targets(home),
-        DaemonEndpoint::fetch_json,
-        ipc::query_deadline(),
-    )
-}
 
 /// Run `fetch` for every tagged target on its own thread under one shared
 /// `deadline`, then pick the bodies to use with [`select_daemon_bodies`].
@@ -1144,10 +1316,6 @@ fn merge_prioritized_bodies(bodies: &[String]) -> Option<String> {
 /// publish the same key, the higher-priority daemon overwrites the other.
 fn merge_prioritized_responses(bodies: &[String]) -> Option<ContainerPortMap> {
     merge_daemon_responses(bodies.iter().rev())
-}
-
-fn query_daemon(home: Option<PathBuf>) -> Result<ContainerPortMap, Error> {
-    merge_prioritized_responses(&query_daemon_bodies(home)?).ok_or(Error::DaemonNotFound)
 }
 
 fn merge_daemon_response_bodies<T, I>(responses: I) -> Option<String>
@@ -1810,6 +1978,153 @@ mod tests {
             stop_outcome(attempt, false),
             StopOutcome::Stopped,
             "only an override that never received the stop falls through"
+        );
+    }
+
+    // ── Client ───────────────────────────────────────────────────────
+
+    #[test]
+    fn client_is_shareable() {
+        fn assert_shareable<T: Send + Sync + Clone + std::fmt::Debug + Default>() {}
+        assert_shareable::<Client>();
+    }
+
+    #[test]
+    fn query_budget_fits_inside_every_timeout() {
+        assert_eq!(
+            query_budget(DEFAULT_TIMEOUT),
+            Duration::from_millis(2500),
+            "the default timeout keeps the 0.1.x query budget"
+        );
+        for timeout in [
+            Duration::from_nanos(1),
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            MAX_TIMEOUT,
+        ] {
+            assert!(
+                query_budget(timeout) < timeout,
+                "the daemons must be queried for less than the {timeout:?} timeout"
+            );
+        }
+        assert_eq!(query_budget(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn client_caps_the_timeout() {
+        let client = Client::new().timeout(Duration::MAX);
+        assert_eq!(client.timeout, MAX_TIMEOUT, "deadlines must not overflow");
+    }
+
+    #[test]
+    fn client_docker_host_tcp_is_tried_first() {
+        let client = Client::new()
+            .home(None)
+            .docker_host(Some("tcp://10.0.0.1:2375".to_string()));
+        let targets = client.detection_targets();
+        assert_eq!(
+            targets.first(),
+            Some(&(true, DaemonEndpoint::Tcp("10.0.0.1:2375".to_string())))
+        );
+        assert!(
+            targets.len() > 1,
+            "a tcp:// daemon never replaces the default endpoints"
+        );
+    }
+
+    #[test]
+    fn client_without_docker_host_uses_only_defaults() {
+        let client = Client::new().docker_host(None);
+        assert!(
+            client
+                .detection_targets()
+                .iter()
+                .all(|(from_docker_host, _)| !from_docker_host),
+            "no endpoint comes from DOCKER_HOST"
+        );
+        let ignored = Client::new().docker_host(Some("ssh://host".to_string()));
+        assert_eq!(
+            ignored.detection_targets(),
+            client.detection_targets(),
+            "an unsupported scheme is ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_unix_docker_host_replaces_default_sockets() {
+        let client = Client::new().docker_host(Some("unix:///tmp/custom.sock".to_string()));
+        assert_eq!(
+            client.stop_targets(),
+            vec![(
+                true,
+                DaemonEndpoint::Unix(PathBuf::from("/tmp/custom.sock"))
+            )]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_npipe_docker_host_is_tried_before_default_pipes() {
+        let client = Client::new().docker_host(Some("npipe:////./pipe/custom".to_string()));
+        let targets = client.stop_targets();
+        assert_eq!(
+            targets.first(),
+            Some(&(true, DaemonEndpoint::Pipe(r"\\.\pipe\custom".to_string())))
+        );
+        assert_eq!(targets.len(), 1 + DEFAULT_PIPE_PATHS.len());
+    }
+
+    #[test]
+    fn client_detect_uses_an_answering_docker_host() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("address").to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match std::io::Read::read(&mut stream, &mut byte) {
+                    Ok(1) => request.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let body = r#"[{"Id":"abc","Names":["/web"],"Image":"nginx","Ports":[{"PublicPort":8080,"Type":"tcp"}]}]"#;
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            drop(std::io::Write::write_all(&mut stream, response.as_bytes()));
+        });
+
+        let client = Client::new()
+            .home(None)
+            .docker_host(Some(format!("tcp://{addr}")));
+        let map = client.detect().expect("the TCP daemon answered");
+        drop(server.join());
+
+        assert_eq!(
+            map.get(None, 8080, Protocol::Tcp)
+                .map(|info| info.name.as_str()),
+            Some("web"),
+            "the DOCKER_HOST daemon's containers are used"
+        );
+    }
+
+    #[test]
+    fn detection_handle_times_out_at_its_deadline() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let handle = DetectionHandle {
+            receiver: rx,
+            deadline: Instant::now() + Duration::from_millis(50),
+        };
+        let started = Instant::now();
+        assert!(matches!(handle.receive(), Err(Error::Timeout)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the handle stops waiting at the deadline"
         );
     }
 

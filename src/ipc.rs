@@ -17,24 +17,6 @@ use log::debug;
 
 use crate::http;
 
-/// Maximum time [`crate::await_detection`] waits for the detection thread.
-pub const DAEMON_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Overall budget for one detection pass across every transport.
-///
-/// Strictly shorter than [`DAEMON_TIMEOUT`] so the detection thread always
-/// returns what it collected before `await_detection` gives up on it. The
-/// margin covers JSON parsing and the channel hand-off.
-pub const QUERY_TIMEOUT: Duration = Duration::from_millis(2500);
-
-// Compile-time guard: the internal budget must fit inside the await window.
-const _: () = assert!(QUERY_TIMEOUT.as_millis() < DAEMON_TIMEOUT.as_millis());
-
-/// Deadline for a detection pass that starts now.
-pub fn query_deadline() -> Instant {
-    Instant::now() + QUERY_TIMEOUT
-}
-
 /// Why one daemon endpoint produced no container list.
 #[derive(Debug)]
 pub enum FetchError {
@@ -168,38 +150,35 @@ impl<S: SocketTimeouts + Write> Write for DeadlineStream<S> {
 }
 
 // ---------------------------------------------------------------------------
-// DOCKER_HOST environment variable helpers
+// DOCKER_HOST parsing
 // ---------------------------------------------------------------------------
 
-/// Extract a Unix socket path from the `DOCKER_HOST` environment variable.
+/// Extract a Unix socket path from a `DOCKER_HOST` value.
 ///
-/// Returns the path suffix when `DOCKER_HOST` starts with `unix://`,
-/// or `None` if the variable is unset or uses a different scheme.
+/// Returns the path suffix when `docker_host` starts with `unix://`, or
+/// `None` if it is empty after the scheme or uses a different scheme.
 #[cfg(unix)]
-pub fn docker_host_unix_path() -> Option<String> {
-    let docker_host = std::env::var("DOCKER_HOST").ok()?;
+pub fn docker_host_unix_path(docker_host: &str) -> Option<String> {
     let path = docker_host.strip_prefix("unix://")?;
     (!path.is_empty()).then(|| path.to_string())
 }
 
-/// Extract a named pipe path from the `DOCKER_HOST` environment variable.
+/// Extract a named pipe path from a `DOCKER_HOST` value.
 ///
 /// Returns the pipe path (with forward slashes replaced by backslashes)
-/// when `DOCKER_HOST` starts with `npipe://`, or `None` if the variable
-/// is unset or uses a different scheme.
+/// when `docker_host` starts with `npipe://`, or `None` if it is empty
+/// after the scheme or uses a different scheme.
 #[cfg(windows)]
-pub fn docker_host_npipe_path() -> Option<String> {
-    let docker_host = std::env::var("DOCKER_HOST").ok()?;
+pub fn docker_host_npipe_path(docker_host: &str) -> Option<String> {
     let raw = docker_host.strip_prefix("npipe://")?;
     (!raw.is_empty()).then(|| raw.replace('/', "\\"))
 }
 
-/// Extract a TCP address from the `DOCKER_HOST` environment variable.
+/// Extract a TCP address from a `DOCKER_HOST` value.
 ///
-/// Returns the `host:port` string when `DOCKER_HOST` starts with `tcp://`,
-/// or `None` if the variable is unset or uses a different scheme.
-pub fn docker_host_tcp_addr() -> Option<String> {
-    let docker_host = std::env::var("DOCKER_HOST").ok()?;
+/// Returns the `host:port` string when `docker_host` starts with `tcp://`,
+/// or `None` if it is empty after the scheme or uses a different scheme.
+pub fn docker_host_tcp_addr(docker_host: &str) -> Option<String> {
     let addr = docker_host.strip_prefix("tcp://")?;
     (!addr.is_empty()).then(|| addr.to_string())
 }
@@ -718,7 +697,7 @@ pub fn fetch_tcp_json(addr: &str, deadline: Instant) -> Result<String, FetchErro
 /// the grace period, but connecting should be fast. Capping each attempt
 /// keeps one unreachable address from using up the whole deadline before
 /// the other resolved addresses are tried.
-const CONNECT_ATTEMPT_TIMEOUT: Duration = DAEMON_TIMEOUT;
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Connect to the first reachable address that `addr` resolves to.
 ///
@@ -1125,11 +1104,43 @@ mod tests {
     // ── fetch_all ────────────────────────────────────────────────────
 
     #[test]
-    fn query_budget_is_shorter_than_await_timeout() {
-        assert!(
-            QUERY_TIMEOUT < DAEMON_TIMEOUT,
-            "the detection pass must finish before await_detection gives up"
+    fn docker_host_tcp_addr_parses_only_tcp_values() {
+        assert_eq!(
+            docker_host_tcp_addr("tcp://127.0.0.1:2375").as_deref(),
+            Some("127.0.0.1:2375")
         );
+        assert_eq!(
+            docker_host_tcp_addr("tcp://"),
+            None,
+            "an empty address is ignored"
+        );
+        assert_eq!(
+            docker_host_tcp_addr("ssh://host"),
+            None,
+            "other schemes are ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_host_unix_path_parses_only_unix_values() {
+        assert_eq!(
+            docker_host_unix_path("unix:///run/docker.sock").as_deref(),
+            Some("/run/docker.sock")
+        );
+        assert_eq!(docker_host_unix_path("unix://"), None);
+        assert_eq!(docker_host_unix_path("tcp://127.0.0.1:2375"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn docker_host_npipe_path_converts_slashes() {
+        assert_eq!(
+            docker_host_npipe_path("npipe:////./pipe/docker_engine").as_deref(),
+            Some(r"\\.\pipe\docker_engine")
+        );
+        assert_eq!(docker_host_npipe_path("npipe://"), None);
+        assert_eq!(docker_host_npipe_path("tcp://127.0.0.1:2375"), None);
     }
 
     #[test]

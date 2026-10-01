@@ -10,7 +10,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::{ContainerInfo, ContainerPortMap, ParseError, Protocol};
 
@@ -118,7 +118,9 @@ const PODMAN_COMPOSE_PROJECT_LABEL: &str = "io.podman.compose.project";
 /// The Compose labels of a container, picked out of its `Labels` object.
 ///
 /// Only the labels nanodock reads are kept; every other label value is
-/// skipped without being decoded or copied.
+/// skipped without being decoded or copied. A value that is not a string,
+/// even for a label nanodock reads, is ignored (see [`LabelValue`]) rather
+/// than failing the container.
 #[derive(Default)]
 struct ComposeLabels<'a> {
     project: Option<JsonStr<'a>>,
@@ -175,9 +177,87 @@ impl<'de> Visitor<'de> for ComposeLabelsVisitor {
                     continue;
                 }
             };
-            *slot = map.next_value::<Option<JsonStr<'de>>>()?;
+            *slot = map.next_value::<LabelValue<'de>>()?.0;
         }
         Ok(labels)
+    }
+}
+
+/// One label value: kept when it is a string, `None` for any other JSON
+/// value.
+///
+/// Docker and Podman send string label values, but a number, boolean,
+/// `null`, array, or object must not make the whole container fail to
+/// parse: in lenient detection that would drop the container and every
+/// port it publishes. The value is still consumed so parsing continues.
+struct LabelValue<'a>(Option<JsonStr<'a>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for LabelValue<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(LabelValueVisitor)
+            .map(|value| Self(value.map(JsonStr)))
+    }
+}
+
+struct LabelValueVisitor;
+
+impl<'de> Visitor<'de> for LabelValueVisitor {
+    type Value = Option<Cow<'de, str>>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a label value")
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(Some(Cow::Borrowed(value)))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Some(Cow::Owned(value.to_owned())))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Some(Cow::Owned(value)))
+    }
+
+    fn visit_bool<E: de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E: de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E: de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        de::IgnoredAny.visit_seq(seq).map(|_| None)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        de::IgnoredAny.visit_map(map).map(|_| None)
     }
 }
 
@@ -818,6 +898,63 @@ mod tests {
 
         let strict = parse_containers_json_strict(json).expect("labels are valid JSON");
         assert_eq!(strict, map, "strict and lenient parsing agree on labels");
+    }
+
+    #[test]
+    fn parse_non_string_compose_labels_keeps_the_container() {
+        let json = r#"[
+            {
+                "Names": ["/numeric"],
+                "Image": "app",
+                "Labels": {
+                    "com.docker.compose.project": 5,
+                    "com.docker.compose.service": "web",
+                    "io.podman.compose.project": "shop"
+                },
+                "Ports": [{"PublicPort": 80, "Type": "tcp"}]
+            },
+            {
+                "Names": ["/odd"],
+                "Labels": {
+                    "com.docker.compose.project": {"name": "shop"},
+                    "com.docker.compose.service": ["db"],
+                    "io.podman.compose.project": true,
+                    "unrelated": 1.5
+                },
+                "Ports": [{"PublicPort": 81, "Type": "tcp"}]
+            },
+            {
+                "Names": ["/null"],
+                "Labels": {"com.docker.compose.project": null, "com.docker.compose.service": "cache"},
+                "Ports": [{"PublicPort": 82, "Type": "tcp"}]
+            }
+        ]"#;
+        let lenient = parse_containers_json(json);
+        assert_eq!(
+            lenient.len(),
+            3,
+            "no container is dropped for a label value"
+        );
+
+        let numeric = mapped_container(&lenient, None, 80, Protocol::Tcp);
+        assert_eq!(
+            numeric.compose_project.as_deref(),
+            Some("shop"),
+            "a non-string Docker project label falls back to the Podman one"
+        );
+        assert_eq!(numeric.compose_service.as_deref(), Some("web"));
+
+        let odd = mapped_container(&lenient, None, 81, Protocol::Tcp);
+        assert_eq!(odd.name, "odd");
+        assert_eq!(odd.compose_project, None, "non-string values are ignored");
+        assert_eq!(odd.compose_service, None);
+
+        let null = mapped_container(&lenient, None, 82, Protocol::Tcp);
+        assert_eq!(null.compose_project, None);
+        assert_eq!(null.compose_service.as_deref(), Some("cache"));
+
+        let strict = parse_containers_json_strict(json).expect("label values never fail parsing");
+        assert_eq!(strict, lenient, "strict and lenient parsing agree");
     }
 
     #[test]

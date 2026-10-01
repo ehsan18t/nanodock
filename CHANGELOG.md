@@ -16,7 +16,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout { endpoint }`, `HttpStatus { status }`, `InvalidResponse { source }` (a `ParseError`), and `Io { source, endpoint }` (a `std::io::Error`). `Timeout` and `Io` name the endpoint when it is known, as an `Option<String>`. Every variant that carries data is a `#[non_exhaustive]` struct variant, so later releases can add fields; match it with `..`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
 - `DetectionHandle::wait_result` reports why background detection produced no containers.
 - `ProxyFallback` (`Allow` or `Deny`) says whether `ContainerPortMap::lookup` may match a proxy process on port and protocol alone.
-- `PublishedContainerMatch::container` returns the matched container, if any.
+- `PublishedContainerMatch::container` returns the matched container, if any, and `PublishedContainerMatch::container_arc` returns its shared `Arc<ContainerInfo>`, so a caller can keep the container with a reference count increment instead of cloning it.
 - `StopOutcome::is_stopped` tells whether the container is known to be stopped.
 - An optional `serde` feature derives `Serialize` and `Deserialize` for `ContainerInfo`, `Protocol`, `StopOutcome`, and `ProxyFallback`. docs.rs builds the documentation with every feature enabled.
 - Unix socket discovery now also checks `$XDG_RUNTIME_DIR/docker.sock` and `$XDG_RUNTIME_DIR/podman/podman.sock` (ahead of the hardcoded `/run/user/{uid}` paths), Colima (`~/.colima/default/docker.sock`, `~/.colima/docker.sock`), OrbStack (`~/.orbstack/run/docker.sock`), Rancher Desktop (`~/.rd/docker.sock`), Lima (`~/.lima/default/sock/docker.sock`, `~/.lima/docker/sock/docker.sock`), and Podman machine on macOS (`~/.local/share/containers/podman/machine/podman.sock`, `.../machine/qemu/podman.sock`, `.../machine/podman-machine-default/podman.sock`, and on macOS only `$TMPDIR/podman/podman-machine-default-api.sock`). Existing paths keep their relative priority; see the README for the full order. `$TMPDIR` is not searched outside macOS, because on Linux it is usually the shared `/tmp`, where another local user could plant a socket.
@@ -36,6 +36,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** the `Serialize` and `Deserialize` derives on `ContainerInfo`, `Protocol`, and `StopOutcome` are behind the `serde` feature, which is off by default. Enable it to keep serializing these types. `StopOutcome` now also derives `Deserialize` under that feature.
 - **Breaking:** `detect_containers`, `start_detection`, and `stop_container` no longer take a `home: Option<PathBuf>` argument; they use `Client::new()`, which reads the home directory from the environment. Passing `None` used to skip every per-user socket (Docker Desktop on macOS, Colima, OrbStack, Lima, Rancher Desktop, Podman machine) without any sign. Use `Client::new().home(home)` to search a specific home directory.
 - **Breaking:** stopping and killing are separate calls instead of one call with a `force: bool` argument. `stop_container(id)` and `Client::stop(id)` stop the container gracefully (`POST /containers/{id}/stop?t=10`), and `kill_container(id)` and `Client::kill(id)` kill it at once (`POST /containers/{id}/kill`). Both keep the same daemon selection and fail-closed rules.
+- **Breaking:** `PublishedContainerMatch::Match` holds `&Arc<ContainerInfo>` instead of `&ContainerInfo`. Field access and `Display` work through the `Arc` as before, but code that returns the bound value as `&ContainerInfo` or clones it into a `ContainerInfo` must say so: use `PublishedContainerMatch::container`, or `ContainerInfo::clone(info)` (or `Arc::clone(info)` to share it).
 - **Breaking:** `StopOutcome` no longer implements `Copy`, so a later variant can carry data that is not `Copy`. Clone it where a copy was relied on; `StopOutcome::is_stopped` takes `&self`.
 - **Breaking:** `ContainerInfo` and `PublishedContainerMatch` no longer implement `Hash`, so `ContainerInfo` can gain fields that cannot be hashed (such as a label map) in a minor release. Key a set or map on `info.id` instead of the whole `ContainerInfo`.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
@@ -131,6 +132,19 @@ Err(Error::InvalidResponse { source, .. }) => eprintln!("bad reply: {source}"),
 Err(Error::PermissionDenied { endpoint, .. }) => eprintln!("no access to {endpoint}"),
 Err(Error::HttpStatus { status, .. }) => eprintln!("the daemon answered HTTP {status}"),
 Err(Error::Timeout { endpoint, .. }) => eprintln!("no answer in time from {endpoint:?}"),
+```
+
+Keeping the matched container of a lookup:
+
+```rust,ignore
+// 0.1
+let owned: Option<ContainerInfo> = match found {
+    PublishedContainerMatch::Match(info) => Some(info.clone()),
+    _ => None,
+};
+// 0.2: copy the container, or share it through its Arc
+let owned: Option<ContainerInfo> = found.container().cloned();
+let shared: Option<Arc<ContainerInfo>> = found.container_arc().cloned();
 ```
 
 `parse_containers_json_strict` now fails with `nanodock::ParseError`; code that named `serde_json::Error` should name `ParseError` or use `impl std::error::Error`.

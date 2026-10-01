@@ -279,6 +279,8 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `DetectionHandle::wait_result()`                  | Wait for the result, keeping the `Error`                   |
 | `ContainerPortMap::lookup(ip, port, proto, fallback)` | Match a socket address against the published ports     |
 | `ContainerPortMap::get(host_ip, port, proto)`     | Exact binding lookup                                       |
+| `PublishedContainerMatch::container()`            | The matched `&ContainerInfo`, if any                       |
+| `PublishedContainerMatch::container_arc()`        | The matched `&Arc<ContainerInfo>`, to keep it without a copy |
 | `detect_containers()`                             | Shorthand for `Client::new().detect()`                     |
 | `start_detection()`                               | Shorthand for `Client::new().start_detection()`            |
 | `stop_container(id)`                              | Shorthand for `Client::new().stop(id)`                     |

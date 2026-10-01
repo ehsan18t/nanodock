@@ -524,11 +524,11 @@ impl ContainerPortMap {
         proto: Protocol,
         fallback: ProxyFallback,
     ) -> PublishedContainerMatch<'_> {
-        if let Some(container) = self.get(Some(ip), port, proto) {
+        if let Some(container) = self.bindings.get(&(Some(ip), port, proto)) {
             return PublishedContainerMatch::Match(container);
         }
 
-        if let Some(container) = self.get(None, port, proto) {
+        if let Some(container) = self.bindings.get(&(None, port, proto)) {
             return PublishedContainerMatch::Match(container);
         }
 
@@ -660,11 +660,29 @@ fn insert_test_container(
 }
 
 /// Result of matching a socket against published container port bindings.
+///
+/// A match borrows the [`Arc`] the [`ContainerPortMap`] stores, so a caller
+/// that keeps the container beyond the map can clone the `Arc` (a reference
+/// count increment) instead of the whole [`ContainerInfo`]. Fields and
+/// [`Display`](std::fmt::Display) are reachable through the `Arc` directly.
+///
+/// ```
+/// use std::net::{IpAddr, Ipv4Addr};
+/// use std::sync::Arc;
+/// use nanodock::{ContainerInfo, ContainerPortMap, Protocol, ProxyFallback};
+///
+/// let mut map = ContainerPortMap::new();
+/// map.insert(None, 80, Protocol::Tcp, ContainerInfo::new("abc", "web", "nginx"));
+///
+/// let found = map.lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), 80, Protocol::Tcp, ProxyFallback::Deny);
+/// let kept: Option<Arc<ContainerInfo>> = found.container_arc().cloned();
+/// assert_eq!(kept.map(|info| info.name.clone()).as_deref(), Some("web"));
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishedContainerMatch<'a> {
     /// Exactly one container binding matched the socket.
-    Match(&'a ContainerInfo),
+    Match(&'a Arc<ContainerInfo>),
     /// No published container binding matched the socket.
     NotFound,
     /// Multiple distinct published bindings matched and no safe choice exists.
@@ -675,7 +693,16 @@ impl<'a> PublishedContainerMatch<'a> {
     /// The matched container, or `None` for [`NotFound`](Self::NotFound) and
     /// [`Ambiguous`](Self::Ambiguous).
     #[must_use]
-    pub const fn container(self) -> Option<&'a ContainerInfo> {
+    pub fn container(self) -> Option<&'a ContainerInfo> {
+        self.container_arc().map(Arc::as_ref)
+    }
+
+    /// The shared [`Arc`] of the matched container, or `None` for
+    /// [`NotFound`](Self::NotFound) and [`Ambiguous`](Self::Ambiguous).
+    ///
+    /// Clone the `Arc` to keep the container without copying it.
+    #[must_use]
+    pub const fn container_arc(self) -> Option<&'a Arc<ContainerInfo>> {
         match self {
             Self::Match(info) => Some(info),
             Self::NotFound | Self::Ambiguous => None,
@@ -1705,6 +1732,46 @@ mod tests {
             "get is an exact key lookup"
         );
         assert!(ContainerPortMap::default().is_empty());
+    }
+
+    #[test]
+    fn lookup_shares_the_stored_arc() {
+        let mut map = ContainerPortMap::new();
+        let shared = Arc::new(test_container_info("a", "web", "nginx"));
+        map.insert(None, 80, Protocol::Tcp, Arc::clone(&shared));
+        // Bound on another address, so the lookup below needs the fallback.
+        map.insert(
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            443,
+            Protocol::Tcp,
+            Arc::clone(&shared),
+        );
+
+        for (port, fallback) in [(80, ProxyFallback::Deny), (443, ProxyFallback::Allow)] {
+            let found = map.lookup(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                Protocol::Tcp,
+                fallback,
+            );
+            let arc = found.container_arc().expect("the container is published");
+            assert!(
+                Arc::ptr_eq(arc, &shared),
+                "port {port}: the match hands out the stored Arc, not a copy"
+            );
+            assert_eq!(
+                found.container().map(|info| info.name.as_str()),
+                Some("web")
+            );
+        }
+        let missing = map.lookup(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8080,
+            Protocol::Tcp,
+            ProxyFallback::Allow,
+        );
+        assert!(missing.container_arc().is_none());
+        assert!(missing.container().is_none());
     }
 
     #[test]

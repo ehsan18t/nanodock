@@ -150,7 +150,7 @@ fn proxy_ambiguous_fixture(size: u16) -> LookupFixture {
 }
 
 #[must_use]
-const fn match_score(result: PublishedContainerMatch<'_>) -> usize {
+fn match_score(result: PublishedContainerMatch<'_>) -> usize {
     match result {
         PublishedContainerMatch::Match(info) => info.name.len(),
         PublishedContainerMatch::Ambiguous => usize::MAX,

@@ -285,6 +285,7 @@ CI runs on pushes to `main` and pull requests targeting `main`. Primary jobs:
    `--callgrind-limits='ir=1.0%'` ceiling.
 3. **audit** - `cargo deny check`.
 4. **msrv** (Linux) - `cargo check --locked --all-targets` on Rust 1.89, the `rust-version` declared in `Cargo.toml`.
+5. **package** (Linux) - `cargo package --locked --list` and `cargo publish --locked --dry-run`, so a file missing from the `include` list fails CI rather than the release.
 
 All gates must pass before merge. See `.github/workflows/ci.yml`.
 

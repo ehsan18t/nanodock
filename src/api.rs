@@ -3,11 +3,78 @@
 //! Deserialises the `GET /containers/json` payload and maps published
 //! ports to [`ContainerInfo`] records.
 
-use std::net::IpAddr;
+use std::borrow::Cow;
+use std::fmt;
+use std::net::{IpAddr, Ipv6Addr};
+use std::ops::Deref;
 
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 
 use crate::{ContainerInfo, ContainerPortMap, Protocol};
+
+/// A JSON string that borrows from the input when it contains no escape
+/// sequences and falls back to an owned copy when it does.
+///
+/// Plain `&str` fields fail on any escaped string (for example `"a\"b"` or
+/// `"/"`), and serde's stock `Cow<str>` impl always allocates when it
+/// is wrapped in `Option` or `Vec`, even with `#[serde(borrow)]`. This
+/// newtype keeps the zero-copy fast path while accepting every valid JSON
+/// string.
+struct JsonStr<'a>(Cow<'a, str>);
+
+impl Deref for JsonStr<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for JsonStr<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(JsonStrVisitor).map(JsonStr)
+    }
+}
+
+struct JsonStrVisitor;
+
+impl<'de> Visitor<'de> for JsonStrVisitor {
+    type Value = Cow<'de, str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(Cow::Borrowed(value))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Cow::Owned(value.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Cow::Owned(value))
+    }
+}
+
+/// Host address a port is published on, as reported by the daemon.
+#[derive(Clone, Copy, Default)]
+enum HostIp {
+    /// Absent, empty, or unspecified (`0.0.0.0` / `::`): all interfaces.
+    #[default]
+    Any,
+    /// A concrete host address.
+    Addr(IpAddr),
+    /// Present but not parseable as an IP address. The binding is skipped
+    /// because recording it as a wildcard would misattribute traffic on
+    /// every other address sharing the port.
+    Unparseable,
+}
 
 #[derive(Deserialize)]
 struct DockerPort<'a> {
@@ -17,24 +84,24 @@ struct DockerPort<'a> {
         default,
         deserialize_with = "deserialize_host_ip"
     )]
-    host_ip: Option<IpAddr>,
+    host_ip: HostIp,
     #[serde(rename = "PublicPort", alias = "host_port")]
     public_port: Option<u16>,
-    #[serde(rename = "Type", alias = "protocol")]
-    proto: Option<&'a str>,
+    #[serde(rename = "Type", alias = "protocol", borrow)]
+    proto: Option<JsonStr<'a>>,
     #[serde(alias = "range")]
     port_range: Option<u16>,
 }
 
 #[derive(Deserialize)]
 struct DockerContainer<'a> {
-    #[serde(rename = "Id")]
-    id: Option<&'a str>,
-    #[serde(rename = "Names")]
-    names: Option<Vec<&'a str>>,
-    #[serde(rename = "Image")]
-    image: Option<&'a str>,
-    #[serde(rename = "Ports")]
+    #[serde(rename = "Id", borrow)]
+    id: Option<JsonStr<'a>>,
+    #[serde(rename = "Names", borrow)]
+    names: Option<Vec<JsonStr<'a>>>,
+    #[serde(rename = "Image", borrow)]
+    image: Option<JsonStr<'a>>,
+    #[serde(rename = "Ports", borrow)]
     ports: Option<Vec<DockerPort<'a>>>,
 }
 
@@ -42,14 +109,30 @@ struct DockerContainer<'a> {
 ///
 /// Each container may publish multiple ports. The map keys are
 /// `(public_ip, public_port, protocol)` tuples.
+///
+/// Parsing is lenient per container: a malformed entry is skipped without
+/// discarding the other containers in the array. Input that is not a
+/// syntactically valid JSON array yields an empty map.
 #[must_use]
 pub fn parse_containers_json(json_body: &str) -> ContainerPortMap {
     let mut map = ContainerPortMap::new();
 
-    let Ok(containers) = serde_json::from_str::<Vec<DockerContainer<'_>>>(json_body) else {
+    // Fast path: the whole array deserializes in one zero-copy pass.
+    if let Ok(containers) = serde_json::from_str::<Vec<DockerContainer<'_>>>(json_body) {
+        populate_port_map(&mut map, &containers);
+        return map;
+    }
+
+    // Slow path, only taken for malformed input: decode the array into
+    // untyped values, then convert each element independently so one bad
+    // container cannot poison the rest.
+    let Ok(elements) = serde_json::from_str::<Vec<serde_json::Value>>(json_body) else {
         return map;
     };
-
+    let containers: Vec<DockerContainer<'_>> = elements
+        .iter()
+        .filter_map(|element| DockerContainer::deserialize(element).ok())
+        .collect();
     populate_port_map(&mut map, &containers);
     map
 }
@@ -67,9 +150,9 @@ pub fn parse_containers_json_strict(
 
 fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'_>]) {
     for container in containers {
-        let id = container.id.unwrap_or("").to_string();
+        let id = container.id.as_deref().unwrap_or("").to_string();
         let name = container_display_name(container);
-        let image = container.image.unwrap_or("").to_string();
+        let image = container.image.as_deref().unwrap_or("").to_string();
         let info = ContainerInfo { id, name, image };
 
         let Some(ports) = &container.ports else {
@@ -80,35 +163,58 @@ fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'
             let Some(public_port) = port.public_port else {
                 continue;
             };
-            let Some(proto) = parse_port_protocol(port.proto) else {
+            let Some(proto) = parse_port_protocol(port.proto.as_deref()) else {
                 continue;
             };
+            let host_ip = match port.host_ip {
+                HostIp::Any => None,
+                HostIp::Addr(ip) => Some(ip),
+                HostIp::Unparseable => continue,
+            };
 
-            let port_count = port.port_range.unwrap_or(1);
+            // Podman may report `range: 0` for a single-port binding; treat
+            // it like 1 so the binding is not silently dropped.
+            let port_count = port.port_range.unwrap_or(1).max(1);
             for offset in 0..port_count {
                 let Some(mapped_port) = public_port.checked_add(offset) else {
                     break;
                 };
 
-                map.insert((port.host_ip, mapped_port, proto), info.clone());
+                map.insert((host_ip, mapped_port, proto), info.clone());
             }
         }
     }
 }
 
-fn deserialize_host_ip<'de, D>(deserializer: D) -> Result<Option<IpAddr>, D::Error>
+fn deserialize_host_ip<'de, D>(deserializer: D) -> Result<HostIp, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|ip| !ip.is_empty())
-        .map(str::parse)
-        .transpose()
-        .map(|host_ip| host_ip.filter(|ip: &IpAddr| !ip.is_unspecified()))
-        .map_err(serde::de::Error::custom)
+    let value = Option::<JsonStr<'de>>::deserialize(deserializer)?;
+    Ok(value.map_or(HostIp::Any, |raw| parse_host_ip(&raw)))
+}
+
+/// Classify a daemon-reported host IP string.
+///
+/// IPv6 zone identifiers (`fe80::1%eth0`) are stripped: [`IpAddr`] cannot
+/// carry a scope, and the address part is what a socket lookup compares.
+fn parse_host_ip(raw: &str) -> HostIp {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return HostIp::Any;
+    }
+
+    let parsed = match trimmed.split_once('%') {
+        Some((addr, zone)) if !zone.is_empty() => addr.parse::<Ipv6Addr>().map(IpAddr::V6),
+        Some(_) => return HostIp::Unparseable,
+        None => trimmed.parse::<IpAddr>(),
+    };
+
+    match parsed {
+        Ok(ip) if ip.is_unspecified() => HostIp::Any,
+        Ok(ip) => HostIp::Addr(ip),
+        Err(_) => HostIp::Unparseable,
+    }
 }
 
 const fn parse_port_protocol(proto: Option<&str>) -> Option<Protocol> {
@@ -124,10 +230,11 @@ fn container_display_name(container: &DockerContainer<'_>) -> String {
     container
         .names
         .as_ref()
-        .and_then(|names| names.iter().copied().find_map(normalize_container_name))
+        .and_then(|names| names.iter().find_map(|name| normalize_container_name(name)))
         .or_else(|| {
             container
                 .image
+                .as_deref()
                 .map(str::trim)
                 .filter(|image| !image.is_empty())
                 .map(ToOwned::to_owned)
@@ -135,6 +242,7 @@ fn container_display_name(container: &DockerContainer<'_>) -> String {
         .or_else(|| {
             container
                 .id
+                .as_deref()
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(short_container_id)
@@ -477,6 +585,129 @@ mod tests {
             "backend-postgres-1",
             "postgres:16",
         );
+    }
+
+    #[test]
+    fn parse_escaped_strings() {
+        let json = r#"[{
+            "Id": "abc1",
+            "Names": ["/web\"edge"],
+            "Image": "ngi\"nx:latest",
+            "Ports": [{"PrivatePort": 80, "PublicPort": 8080, "Type": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+        let info = mapped_container(&map, None, 8080, Protocol::Tcp);
+        assert_eq!(info.id, "abc1");
+        assert_eq!(info.name, "web\"edge");
+        assert_eq!(info.image, "ngi\"nx:latest");
+
+        let strict = parse_containers_json_strict(json).expect("escaped strings are valid JSON");
+        assert_eq!(strict, map);
+    }
+
+    #[test]
+    fn parse_link_local_ipv6_with_zone_id_keeps_other_containers() {
+        let json = r#"[
+            {
+                "Names": ["/linklocal"],
+                "Image": "app:latest",
+                "Ports": [{"IP": "fe80::1%eth0", "PrivatePort": 80, "PublicPort": 8080, "Type": "tcp"}]
+            },
+            {
+                "Names": ["/web"],
+                "Image": "nginx:latest",
+                "Ports": [{"IP": "0.0.0.0", "PrivatePort": 80, "PublicPort": 80, "Type": "tcp"}]
+            }
+        ]"#;
+        let expected_ip = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )));
+
+        let map = parse_containers_json(json);
+        assert_container_mapping(
+            &map,
+            expected_ip,
+            8080,
+            Protocol::Tcp,
+            "linklocal",
+            "app:latest",
+        );
+        assert_container_mapping(&map, None, 80, Protocol::Tcp, "web", "nginx:latest");
+
+        let strict = parse_containers_json_strict(json).expect("zone ids are not a parse error");
+        assert_eq!(strict, map);
+    }
+
+    #[test]
+    fn parse_unparseable_host_ip_skips_only_that_binding() {
+        let json = r#"[
+            {
+                "Names": ["/odd"],
+                "Image": "app:latest",
+                "Ports": [
+                    {"IP": "not-an-ip", "PrivatePort": 80, "PublicPort": 8080, "Type": "tcp"},
+                    {"IP": "127.0.0.1", "PrivatePort": 81, "PublicPort": 8081, "Type": "tcp"}
+                ]
+            },
+            {
+                "Names": ["/web"],
+                "Image": "nginx:latest",
+                "Ports": [{"PrivatePort": 80, "PublicPort": 80, "Type": "tcp"}]
+            }
+        ]"#;
+        let map = parse_containers_json(json);
+
+        assert_eq!(map.len(), 2);
+        assert!(
+            !map.contains_key(&(None, 8080, Protocol::Tcp)),
+            "an unparseable host IP must not be widened to a wildcard binding"
+        );
+        assert_container_mapping(
+            &map,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            8081,
+            Protocol::Tcp,
+            "odd",
+            "app:latest",
+        );
+        assert_container_mapping(&map, None, 80, Protocol::Tcp, "web", "nginx:latest");
+    }
+
+    #[test]
+    fn parse_malformed_container_does_not_drop_the_rest() {
+        let json = r#"[
+            {
+                "Names": ["/broken"],
+                "Image": "app:latest",
+                "Ports": [{"PrivatePort": 80, "PublicPort": "eighty", "Type": "tcp"}]
+            },
+            42,
+            {
+                "Names": ["/web"],
+                "Image": "nginx:latest",
+                "Ports": [{"PrivatePort": 80, "PublicPort": 80, "Type": "tcp"}]
+            }
+        ]"#;
+        let map = parse_containers_json(json);
+
+        assert_eq!(map.len(), 1, "only the well-formed container is mapped");
+        assert_container_mapping(&map, None, 80, Protocol::Tcp, "web", "nginx:latest");
+        assert!(
+            parse_containers_json_strict(json).is_err(),
+            "strict parser must still report the malformed element"
+        );
+    }
+
+    #[test]
+    fn parse_podman_zero_range_as_single_port() {
+        let json = r#"[{
+            "Names": ["single"],
+            "Image": "app:latest",
+            "Ports": [{"host_ip": "", "container_port": 80, "host_port": 8080, "range": 0, "protocol": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+        assert_eq!(map.len(), 1);
+        assert_container_mapping(&map, None, 8080, Protocol::Tcp, "single", "app:latest");
     }
 
     #[test]

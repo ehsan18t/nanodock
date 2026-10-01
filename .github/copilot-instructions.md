@@ -279,7 +279,7 @@ Good examples:
 CI runs on pushes to `main` and pull requests targeting `main`. Three primary
 jobs:
 
-1. **quality-gate** (Linux + Windows matrix) - fmt, clippy,
+1. **quality-gate** (Linux + Windows + macOS matrix) - fmt, clippy,
    `cargo test --locked`, build, cargo doc.
 2. **benchmark-regression** (Linux only) - Uses `gungraun` to verify instruction
    counts against the PR `merge-base`. Enforces a strict

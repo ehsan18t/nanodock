@@ -68,7 +68,7 @@ All of the following must pass before merging:
 | 7    | `cargo deny check`                                                       | No vulnerable/banned deps                           |
 
 CI runs on every push to `main` **and** on every pull request targeting `main`,
-so cross-platform issues (Linux + Windows matrix) are caught before a PR is merged.
+so cross-platform issues (Linux + Windows + macOS matrix) are caught before a PR is merged.
 
 Workflow dependencies in `.github/workflows/` are pinned to full commit SHAs.
 When updating an action, keep the trailing version comment (for example `# v6`)

@@ -70,7 +70,9 @@ All of the following must pass before merging:
 CI runs on every push to `main` **and** on every pull request targeting `main`,
 so cross-platform issues (Linux + Windows + macOS matrix) are caught before a PR is merged.
 
-A separate MSRV job runs `cargo check --locked --all-targets` on Rust 1.89, the `rust-version` declared in `Cargo.toml`. Development and the lint gates use the latest stable toolchain, but code must keep compiling on 1.89; raising the MSRV is a deliberate change that updates `rust-version`, this job, and the README together.
+The crate has one optional feature, `serde`, which derives `Serialize` and `Deserialize` on the public data types. The local hooks check the default features; CI also runs clippy with `--all-features` and runs the tests and docs with `--all-features`. Before pushing a change that touches a `cfg_attr(feature = "serde", ...)` attribute, run `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --lib --tests --all-features` too.
+
+A separate MSRV job runs `cargo check --locked --all-targets --all-features` on Rust 1.89, the `rust-version` declared in `Cargo.toml`. Development and the lint gates use the latest stable toolchain, but code must keep compiling on 1.89; raising the MSRV is a deliberate change that updates `rust-version`, this job, and the README together.
 
 A package job runs `cargo package --locked --list` and `cargo publish --locked --dry-run`, which builds the packaged crate from only the files Cargo.toml `include` ships. If you add a file the crate needs at build time, add it to `include` too.
 

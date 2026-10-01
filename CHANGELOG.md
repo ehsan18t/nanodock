@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `StopOutcome::Failed` is split into `StopOutcome::Unreachable` (no daemon could be contacted, so the container was not touched), `StopOutcome::NoResponse` (a daemon received the request but gave no usable reply, so the container may or may not be stopping), and `StopOutcome::Rejected { status }` (the daemon answered with an unexpected HTTP status). The stop semantics are unchanged: the ping preflight, the rule that no second daemon is tried once one may have received the request, and the rule that any reply from the `DOCKER_HOST` daemon ends the search all still apply.
 - The `DetectionHandle` wait window is now measured from the moment detection started rather than from the call, so it never waits longer than the detection timeout after `start_detection`.
 - `DetectionHandle::wait_result` reports why background detection produced no containers.
+- **Breaking:** the `Serialize` and `Deserialize` derives on public types (`ContainerInfo`, `Protocol`, `StopOutcome`, and the new `ProxyFallback`) are behind the new `serde` feature, which is off by default. Enable it with `features = ["serde"]` to keep serializing these types. `StopOutcome` now also derives `Deserialize` under that feature. The docs on docs.rs are built with every feature enabled.
 
 ### Removed
 

@@ -13,6 +13,14 @@ repository = "https://github.com/ehsan18t/nanodock"
 documentation = "https://docs.rs/nanodock"
 include = ["src/**", "LICENSE", "README.md", "CHANGELOG.md"]
 
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Derive serde `Serialize` and `Deserialize` for the public data types.
+# serde itself is always a dependency: it parses the daemon's JSON.
+serde = []
+
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }

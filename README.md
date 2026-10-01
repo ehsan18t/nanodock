@@ -49,7 +49,14 @@ Add nanodock to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanodock = "0.1"
+nanodock = "0.2"
+```
+
+Enable the optional `serde` feature to derive `Serialize` and `Deserialize` for `ContainerInfo`, `Protocol`, `StopOutcome`, and `ProxyFallback`:
+
+```toml
+[dependencies]
+nanodock = { version = "0.2", features = ["serde"] }
 ```
 
 ### Detect containers and map ports

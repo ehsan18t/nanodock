@@ -4,6 +4,13 @@
 //! detection, port mapping, and lifecycle control. Runtime dependencies are
 //! `serde`, `serde_json`, `httparse`, and `log`, plus `libc` on Unix.
 //!
+//! ## Cargo features
+//!
+//! - `serde` (off by default): derives `Serialize` and `Deserialize` for
+//!   [`ContainerInfo`], [`Protocol`], [`StopOutcome`], and [`ProxyFallback`].
+//!   The daemon's JSON is parsed with `serde` either way; the feature only
+//!   adds the derives on the public types.
+//!
 //! ## Module structure
 //!
 //! - `api` - JSON response parsing and container name resolution.
@@ -54,6 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use log::debug;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 // ── Public API re-exports ────────────────────────────────────────────
@@ -224,13 +232,14 @@ impl std::error::Error for ParseError {}
 
 /// Network transport protocol.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Protocol {
     /// Transmission Control Protocol.
-    #[serde(rename = "TCP")]
+    #[cfg_attr(feature = "serde", serde(rename = "TCP"))]
     Tcp,
     /// User Datagram Protocol.
-    #[serde(rename = "UDP")]
+    #[cfg_attr(feature = "serde", serde(rename = "UDP"))]
     Udp,
 }
 
@@ -263,7 +272,8 @@ impl std::fmt::Display for Protocol {
 /// assert_eq!(info.compose_service.as_deref(), Some("db"));
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ContainerInfo {
     /// Full container ID (hex string) for API calls, empty when unavailable.
     pub id: String,
@@ -275,11 +285,11 @@ pub struct ContainerInfo {
     /// `com.docker.compose.project` label (or `io.podman.compose.project`
     /// when only that one is set). `None` when the container was not
     /// started by Docker Compose or `podman-compose`.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub compose_project: Option<String>,
     /// Compose service name, read from the `com.docker.compose.service`
     /// label. `None` when the label is absent.
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub compose_service: Option<String>,
 }
 
@@ -538,6 +548,7 @@ impl std::iter::FusedIterator for PortMapIter<'_> {}
 /// unrelated listener to a container.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ProxyFallback {
     /// Accept a unique container on the same port and protocol when no
     /// address-level binding matches.
@@ -912,7 +923,8 @@ pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutco
 
 /// Result of attempting to stop or kill a container via the daemon API.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum StopOutcome {
     /// Container was successfully stopped (HTTP 204).
     Stopped,
@@ -1609,6 +1621,31 @@ mod tests {
             Some("api")
         );
         assert_eq!(ProxyFallback::default(), ProxyFallback::Deny);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn public_types_round_trip_through_serde() {
+        let info = ContainerInfo::new("abc", "web", "nginx").with_compose_project("shop");
+        let json = serde_json::to_string(&info).expect("serialize");
+        let back: ContainerInfo = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, info);
+
+        let legacy: ContainerInfo =
+            serde_json::from_str(r#"{"id":"abc","name":"web","image":"nginx"}"#)
+                .expect("0.1 records without compose fields still deserialize");
+        assert_eq!(legacy, ContainerInfo::new("abc", "web", "nginx"));
+
+        assert_eq!(
+            serde_json::to_string(&Protocol::Tcp).expect("serialize"),
+            r#""TCP""#
+        );
+        let outcome = StopOutcome::Rejected { status: 500 };
+        let json = serde_json::to_string(&outcome).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<StopOutcome>(&json).expect("deserialize"),
+            outcome
+        );
     }
 
     // ── interpret_stop_status ────────────────────────────────────────

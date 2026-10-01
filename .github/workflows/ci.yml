@@ -3,7 +3,8 @@
 #
 # Gates (ALL must pass):
 #   1. cargo fmt --check            -> consistent formatting
-#   2. cargo clippy (deny)          -> zero lint warnings (all+pedantic+nursery)
+#   2. cargo clippy (deny)          -> zero lint warnings (all+pedantic+nursery),
+#                                      default and all features
 #   3. cargo test --locked          -> all tests pass, Cargo.lock respected
 #   4. cargo bench --no-run         -> benchmarks compile without errors
 #   5. cargo build                  -> library compiles
@@ -70,13 +71,15 @@ jobs:
       # Gate 2: Clippy (all+pedantic+nursery at deny level) - rejects lint violations.
       # Lint levels and per-lint overrides are configured in Cargo.toml [lints.clippy].
       - name: "Gate 2: cargo clippy"
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # Gate 3: Tests - rejects broken logic; --locked ensures Cargo.lock is honoured
       - name: "Gate 3: cargo test"
         run: |
-          cargo test --locked --lib --tests
-          cargo test --locked --doc
+          cargo test --locked --lib --tests --all-features
+          cargo test --locked --doc --all-features
 
       # Gate 4: Benchmarks - rejects benchmarks that do not compile
       - name: "Gate 4: cargo bench --no-run"
@@ -89,7 +92,7 @@ jobs:
       # Gate 6: Documentation & doc-comment format - rejects broken links, bare URLs,
       # invalid code blocks, and missing crate-level docs.
       - name: "Gate 6: cargo doc"
-        run: cargo doc --locked --no-deps
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: >-
             -D warnings
@@ -123,7 +126,7 @@ jobs:
           key: msrv
 
       - name: "MSRV: cargo check --all-targets"
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets --all-features
 
   # Package verification: lists the files that would ship to crates.io and runs
   # a publish dry run, which builds the packaged crate in isolation. Catches a

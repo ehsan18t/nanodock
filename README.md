@@ -102,17 +102,16 @@ fn main() {
 ### Look up which container owns a socket
 
 ```rust,no_run
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use nanodock::{
-    start_detection, await_detection,
-    lookup_published_container, PublishedContainerMatch, Protocol,
+    start_detection, await_detection, Protocol, ProxyFallback, PublishedContainerMatch,
 };
 
 fn main() {
     let port_map = await_detection(start_detection(None));
 
-    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432);
-    match lookup_published_container(&port_map, socket, Protocol::Tcp, false) {
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    match port_map.lookup(ip, 5432, Protocol::Tcp, ProxyFallback::Deny) {
         PublishedContainerMatch::Match(info) => {
             println!("Port 5432 belongs to '{}' ({})", info.name, info.image);
         }
@@ -198,7 +197,8 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | ------------------------- | --------------------------------------------------------- |
 | `Protocol`                | Network protocol enum (`Tcp`, `Udp`)                      |
 | `ContainerInfo`           | Container metadata (id, name, image, Compose project and service) |
-| `ContainerPortMap`        | HashMap mapping `(ip, port, protocol)` to `ContainerInfo` |
+| `ContainerPortMap`        | Map from `(ip, port, protocol)` to a shared `ContainerInfo`, with `get`, `iter`, and `lookup` |
+| `ProxyFallback`           | Whether `ContainerPortMap::lookup` may match on port and protocol alone |
 | `PublishedContainerMatch` | Result of looking up a socket in the port map             |
 | `StopOutcome`             | Result of a stop/kill request                             |
 | `DetectionHandle`         | Handle for in-progress background detection               |
@@ -211,7 +211,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `detect_containers(home)`         | Synchronous detection, returns `Result<Map, Error>` |
 | `start_detection(home)`           | Spawn background daemon query, returns handle       |
 | `await_detection(handle)`         | Block for results (3s timeout), returns map         |
-| `lookup_published_container()`    | Match a socket against the port map                 |
+| `ContainerPortMap::lookup()`      | Match a socket address against the port map         |
 | `stop_container(id, force, home)` | Stop or kill a container by ID                      |
 | `parse_containers_json(body)`     | Parse raw `/containers/json` response               |
 | `parse_containers_json_strict()`  | Strict parse that returns `Result` on invalid JSON  |

@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use gungraun::prelude::*;
 use nanodock::{
-    ContainerInfo, ContainerPortMap, Protocol, PublishedContainerMatch, lookup_published_container,
+    ContainerInfo, ContainerPortMap, Protocol, ProxyFallback, PublishedContainerMatch,
     parse_containers_json,
 };
 
@@ -41,12 +41,12 @@ fn insert_mapping(
     proto: Protocol,
     index: u16,
 ) {
-    map.insert((host_ip, port, proto), container_info(index));
+    map.insert(host_ip, port, proto, container_info(index));
 }
 
 #[must_use]
 fn exact_lookup_fixture(size: u16) -> (ContainerPortMap, SocketAddr) {
-    let mut map = ContainerPortMap::with_capacity(usize::from(size));
+    let mut map = ContainerPortMap::new();
     let base_port = 20_000_u16;
 
     for index in 0..size {
@@ -68,7 +68,7 @@ fn exact_lookup_fixture(size: u16) -> (ContainerPortMap, SocketAddr) {
 
 #[must_use]
 fn wildcard_lookup_fixture(size: u16) -> LookupFixture {
-    let mut map = ContainerPortMap::with_capacity(usize::from(size));
+    let mut map = ContainerPortMap::new();
     let base_port = 26_000_u16;
 
     for index in 0..size {
@@ -84,7 +84,7 @@ fn wildcard_lookup_fixture(size: u16) -> LookupFixture {
 
 #[must_use]
 fn proxy_unique_fixture(size: u16) -> LookupFixture {
-    let mut map = ContainerPortMap::with_capacity(usize::from(size));
+    let mut map = ContainerPortMap::new();
     let base_port = 32_000_u16;
 
     for index in 0..size.saturating_sub(1) {
@@ -114,7 +114,7 @@ fn proxy_unique_fixture(size: u16) -> LookupFixture {
 
 #[must_use]
 fn proxy_ambiguous_fixture(size: u16) -> LookupFixture {
-    let mut map = ContainerPortMap::with_capacity(usize::from(size));
+    let mut map = ContainerPortMap::new();
     let base_port = 38_000_u16;
 
     for index in 0..size.saturating_sub(2) {
@@ -211,11 +211,11 @@ fn daemon_response(container_count: u16) -> String {
 #[bench::entries_500(args = (LOOKUP_BENCH_ENTRY_COUNT), setup = exact_lookup_fixture)]
 #[bench::entries_4096(args = (LARGE_LOOKUP_ENTRY_COUNT), setup = exact_lookup_fixture)]
 fn bench_lookup_exact((map, socket): LookupFixture) -> usize {
-    black_box(match_score(lookup_published_container(
-        black_box(&map),
-        black_box(socket),
+    black_box(match_score(black_box(&map).lookup(
+        black_box(socket.ip()),
+        black_box(socket.port()),
         Protocol::Tcp,
-        false,
+        ProxyFallback::Deny,
     )))
 }
 
@@ -224,11 +224,11 @@ fn bench_lookup_exact((map, socket): LookupFixture) -> usize {
 #[bench::entries_500(args = (LOOKUP_BENCH_ENTRY_COUNT), setup = wildcard_lookup_fixture)]
 #[bench::entries_4096(args = (LARGE_LOOKUP_ENTRY_COUNT), setup = wildcard_lookup_fixture)]
 fn bench_lookup_wildcard((map, socket): LookupFixture) -> usize {
-    black_box(match_score(lookup_published_container(
-        black_box(&map),
-        black_box(socket),
+    black_box(match_score(black_box(&map).lookup(
+        black_box(socket.ip()),
+        black_box(socket.port()),
         Protocol::Tcp,
-        false,
+        ProxyFallback::Deny,
     )))
 }
 
@@ -237,11 +237,11 @@ fn bench_lookup_wildcard((map, socket): LookupFixture) -> usize {
 #[bench::entries_500(args = (LOOKUP_BENCH_ENTRY_COUNT), setup = proxy_unique_fixture)]
 #[bench::entries_4096(args = (LARGE_LOOKUP_ENTRY_COUNT), setup = proxy_unique_fixture)]
 fn bench_lookup_proxy_unique((map, socket): LookupFixture) -> usize {
-    black_box(match_score(lookup_published_container(
-        black_box(&map),
-        black_box(socket),
+    black_box(match_score(black_box(&map).lookup(
+        black_box(socket.ip()),
+        black_box(socket.port()),
         Protocol::Tcp,
-        true,
+        ProxyFallback::Allow,
     )))
 }
 
@@ -250,11 +250,11 @@ fn bench_lookup_proxy_unique((map, socket): LookupFixture) -> usize {
 #[bench::entries_500(args = (LOOKUP_BENCH_ENTRY_COUNT), setup = proxy_ambiguous_fixture)]
 #[bench::entries_4096(args = (LARGE_LOOKUP_ENTRY_COUNT), setup = proxy_ambiguous_fixture)]
 fn bench_lookup_proxy_ambiguous((map, socket): LookupFixture) -> usize {
-    black_box(match_score(lookup_published_container(
-        black_box(&map),
-        black_box(socket),
+    black_box(match_score(black_box(&map).lookup(
+        black_box(socket.ip()),
+        black_box(socket.port()),
         Protocol::Tcp,
-        true,
+        ProxyFallback::Allow,
     )))
 }
 

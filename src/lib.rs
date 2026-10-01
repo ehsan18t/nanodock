@@ -48,8 +48,9 @@ mod ipc;
 mod podman;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use log::debug;
@@ -217,8 +218,227 @@ impl std::fmt::Display for ContainerInfo {
     }
 }
 
-/// Maps `(host_ip, host_port, protocol)` to container info.
-pub type ContainerPortMap = HashMap<(Option<IpAddr>, u16, Protocol), ContainerInfo>;
+/// Key of one published binding: host IP (`None` for every interface),
+/// host port, and protocol.
+type PortKey = (Option<IpAddr>, u16, Protocol);
+
+/// Published container ports: maps `(host_ip, host_port, protocol)` to the
+/// container that publishes it.
+///
+/// A host IP of `None` is a wildcard binding (`0.0.0.0`, `::`, or no
+/// address). Every binding of one container shares a single
+/// [`ContainerInfo`] through an [`Arc`], so a container that publishes a
+/// large port range costs one pointer per port rather than one copy.
+///
+/// ```
+/// use std::net::{IpAddr, Ipv4Addr};
+/// use nanodock::{ContainerInfo, ContainerPortMap, Protocol, ProxyFallback};
+///
+/// let mut map = ContainerPortMap::default();
+/// map.insert(None, 5432, Protocol::Tcp, ContainerInfo::new("abc", "db", "postgres:16"));
+///
+/// assert_eq!(map.len(), 1);
+/// assert_eq!(map.get(None, 5432, Protocol::Tcp).map(|info| info.name.as_str()), Some("db"));
+///
+/// // A socket on any address matches the wildcard binding.
+/// let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
+/// let found = map.lookup(localhost, 5432, Protocol::Tcp, ProxyFallback::Deny);
+/// assert_eq!(found.container().map(|info| info.name.as_str()), Some("db"));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerPortMap {
+    bindings: HashMap<PortKey, Arc<ContainerInfo>>,
+}
+
+impl ContainerPortMap {
+    /// Create an empty map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of published bindings (one per host IP, port, and protocol).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Whether no binding is published.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    /// The container published on exactly this binding.
+    ///
+    /// This is an exact key lookup: `host_ip` of `None` finds only wildcard
+    /// bindings. Use [`ContainerPortMap::lookup`] to match a local socket
+    /// address, which also falls back to wildcard bindings.
+    #[must_use]
+    pub fn get(
+        &self,
+        host_ip: Option<IpAddr>,
+        port: u16,
+        proto: Protocol,
+    ) -> Option<&ContainerInfo> {
+        self.bindings.get(&(host_ip, port, proto)).map(Arc::as_ref)
+    }
+
+    /// Record that `info` publishes `(host_ip, port, proto)`, returning the
+    /// container previously recorded for that binding, if any.
+    ///
+    /// Pass an `Arc<ContainerInfo>` to share one container between several
+    /// bindings, or a plain [`ContainerInfo`].
+    pub fn insert(
+        &mut self,
+        host_ip: Option<IpAddr>,
+        port: u16,
+        proto: Protocol,
+        info: impl Into<Arc<ContainerInfo>>,
+    ) -> Option<Arc<ContainerInfo>> {
+        self.bindings.insert((host_ip, port, proto), info.into())
+    }
+
+    /// Iterate over every binding in arbitrary order.
+    #[must_use]
+    pub fn iter(&self) -> PortMapIter<'_> {
+        PortMapIter {
+            inner: self.bindings.iter(),
+        }
+    }
+
+    /// Match a local socket address against the published bindings.
+    ///
+    /// Exact `(ip, port, proto)` matches win first. If the daemon reported an
+    /// unspecified host IP (stored as `None`), the wildcard binding is used
+    /// next. For known proxy or helper processes (`docker-proxy`,
+    /// `rootlessport`, and similar), [`ProxyFallback::Allow`] also accepts a
+    /// unique `(port, proto)` match when the proxy's socket address does not
+    /// line up with the published host IP; more than one distinct container
+    /// on that port and protocol is [`PublishedContainerMatch::Ambiguous`].
+    #[must_use]
+    pub fn lookup(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        proto: Protocol,
+        fallback: ProxyFallback,
+    ) -> PublishedContainerMatch<'_> {
+        if let Some(container) = self.get(Some(ip), port, proto) {
+            return PublishedContainerMatch::Match(container);
+        }
+
+        if let Some(container) = self.get(None, port, proto) {
+            return PublishedContainerMatch::Match(container);
+        }
+
+        match fallback {
+            ProxyFallback::Allow => self.unique_published_container(port, proto),
+            ProxyFallback::Deny => PublishedContainerMatch::NotFound,
+        }
+    }
+
+    fn unique_published_container(
+        &self,
+        port: u16,
+        proto: Protocol,
+    ) -> PublishedContainerMatch<'_> {
+        let mut matches = self
+            .bindings
+            .iter()
+            .filter(|((_, candidate_port, candidate_proto), _)| {
+                *candidate_port == port && *candidate_proto == proto
+            })
+            .map(|(_, container)| container);
+
+        let Some(first) = matches.next() else {
+            return PublishedContainerMatch::NotFound;
+        };
+
+        if matches.all(|candidate| Arc::ptr_eq(candidate, first) || candidate == first) {
+            PublishedContainerMatch::Match(first)
+        } else {
+            PublishedContainerMatch::Ambiguous
+        }
+    }
+
+    /// Add every binding of `other`, replacing bindings with the same key.
+    fn merge(&mut self, other: Self) {
+        self.bindings.extend(other.bindings);
+    }
+}
+
+impl<'a> IntoIterator for &'a ContainerPortMap {
+    type Item = ((Option<IpAddr>, u16, Protocol), &'a ContainerInfo);
+    type IntoIter = PortMapIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<I: Into<Arc<ContainerInfo>>> FromIterator<((Option<IpAddr>, u16, Protocol), I)>
+    for ContainerPortMap
+{
+    fn from_iter<T: IntoIterator<Item = ((Option<IpAddr>, u16, Protocol), I)>>(iter: T) -> Self {
+        let mut map = Self::new();
+        map.extend(iter);
+        map
+    }
+}
+
+impl<I: Into<Arc<ContainerInfo>>> Extend<((Option<IpAddr>, u16, Protocol), I)>
+    for ContainerPortMap
+{
+    fn extend<T: IntoIterator<Item = ((Option<IpAddr>, u16, Protocol), I)>>(&mut self, iter: T) {
+        self.bindings
+            .extend(iter.into_iter().map(|(key, info)| (key, info.into())));
+    }
+}
+
+/// Iterator over the bindings of a [`ContainerPortMap`], created by
+/// [`ContainerPortMap::iter`].
+///
+/// Yields `((host_ip, port, protocol), container)` in arbitrary order.
+#[derive(Debug, Clone)]
+pub struct PortMapIter<'a> {
+    inner: std::collections::hash_map::Iter<'a, PortKey, Arc<ContainerInfo>>,
+}
+
+impl<'a> Iterator for PortMapIter<'a> {
+    type Item = ((Option<IpAddr>, u16, Protocol), &'a ContainerInfo);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(key, info)| (*key, info.as_ref()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for PortMapIter<'_> {}
+
+impl std::iter::FusedIterator for PortMapIter<'_> {}
+
+/// Whether [`ContainerPortMap::lookup`] may fall back to matching on port
+/// and protocol alone.
+///
+/// Docker's `docker-proxy` and Podman's `rootlessport` hold the host socket
+/// for a published port, and the address they listen on does not always
+/// equal the host IP the daemon reports. Allow the fallback only for such
+/// processes: for any other process a port-only match would attribute an
+/// unrelated listener to a container.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ProxyFallback {
+    /// Accept a unique container on the same port and protocol when no
+    /// address-level binding matches.
+    Allow,
+    /// Match on the address-level bindings only.
+    #[default]
+    Deny,
+}
 
 #[cfg(test)]
 fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
@@ -235,7 +455,7 @@ fn insert_test_container(
     name: &str,
     image: &str,
 ) {
-    map.insert((host_ip, port, proto), test_container_info(id, name, image));
+    map.insert(host_ip, port, proto, test_container_info(id, name, image));
 }
 
 /// Result of matching a socket against published container port bindings.
@@ -248,6 +468,18 @@ pub enum PublishedContainerMatch<'a> {
     NotFound,
     /// Multiple distinct published bindings matched and no safe choice exists.
     Ambiguous,
+}
+
+impl<'a> PublishedContainerMatch<'a> {
+    /// The matched container, or `None` for [`NotFound`](Self::NotFound) and
+    /// [`Ambiguous`](Self::Ambiguous).
+    #[must_use]
+    pub const fn container(self) -> Option<&'a ContainerInfo> {
+        match self {
+            Self::Match(info) => Some(info),
+            Self::NotFound | Self::Ambiguous => None,
+        }
+    }
 }
 
 impl std::fmt::Display for PublishedContainerMatch<'_> {
@@ -267,58 +499,6 @@ impl std::fmt::Display for PublishedContainerMatch<'_> {
 /// mechanism without breaking the public API.
 #[derive(Debug)]
 pub struct DetectionHandle(std::sync::mpsc::Receiver<Option<ContainerPortMap>>);
-
-/// Match a local socket against known published container bindings.
-///
-/// Exact `(host_ip, port, proto)` matches win first. If the daemon reported an
-/// unspecified host IP (stored as `None`), the wildcard binding is used next.
-/// For known proxy/helper processes, callers may enable `allow_proxy_fallback`
-/// to accept a unique `(port, proto)` match when the proxy socket address does
-/// not line up with the published host IP.
-#[must_use]
-pub fn lookup_published_container(
-    container_map: &ContainerPortMap,
-    socket: SocketAddr,
-    proto: Protocol,
-    allow_proxy_fallback: bool,
-) -> PublishedContainerMatch<'_> {
-    if let Some(container) = container_map.get(&(Some(socket.ip()), socket.port(), proto)) {
-        return PublishedContainerMatch::Match(container);
-    }
-
-    if let Some(container) = container_map.get(&(None, socket.port(), proto)) {
-        return PublishedContainerMatch::Match(container);
-    }
-
-    if allow_proxy_fallback {
-        return unique_published_container(container_map, socket.port(), proto);
-    }
-
-    PublishedContainerMatch::NotFound
-}
-
-fn unique_published_container(
-    container_map: &ContainerPortMap,
-    port: u16,
-    proto: Protocol,
-) -> PublishedContainerMatch<'_> {
-    let mut matches = container_map
-        .iter()
-        .filter(|((_, candidate_port, candidate_proto), _)| {
-            *candidate_port == port && *candidate_proto == proto
-        })
-        .map(|(_, container)| container);
-
-    let Some(first) = matches.next() else {
-        return PublishedContainerMatch::NotFound;
-    };
-
-    if matches.all(|candidate| candidate == first) {
-        PublishedContainerMatch::Match(first)
-    } else {
-        PublishedContainerMatch::Ambiguous
-    }
-}
 
 // ── Detection orchestration ──────────────────────────────────────────
 
@@ -369,7 +549,7 @@ pub fn start_detection(home: Option<PathBuf>) -> DetectionHandle {
         let result = query_daemon(home);
         debug!(
             "finished container runtime detection: port_mappings={}",
-            result.as_ref().map_or(0, HashMap::len)
+            result.as_ref().map_or(0, ContainerPortMap::len)
         );
         // Ignore send error: receiver may have timed out and been dropped.
         drop(tx.send(result));
@@ -832,7 +1012,7 @@ where
 
     for response in responses {
         saw_response = true;
-        merged.extend(api::parse_containers_json(response.as_ref()));
+        merged.merge(api::parse_containers_json(response.as_ref()));
     }
 
     saw_response.then_some(merged)
@@ -856,14 +1036,14 @@ mod tests {
         .expect("at least one daemon response should produce a map");
 
         let container = merged
-            .get(&(None, 5432, Protocol::Tcp))
+            .get(None, 5432, Protocol::Tcp)
             .expect("podman/docker ports should survive multi-daemon merging");
         assert_eq!(container.name, "backend-postgres-1");
         assert_eq!(container.image, "postgres:16");
     }
 
     #[test]
-    fn lookup_published_container_keeps_protocol_bindings_separate() {
+    fn lookup_keeps_protocol_bindings_separate() {
         let mut map = ContainerPortMap::new();
         insert_test_container(
             &mut map,
@@ -884,17 +1064,17 @@ mod tests {
             "bind9",
         );
 
-        let tcp = lookup_published_container(
-            &map,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        let tcp = map.lookup(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            53,
             Protocol::Tcp,
-            false,
+            ProxyFallback::Deny,
         );
-        let udp = lookup_published_container(
-            &map,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        let udp = map.lookup(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            53,
             Protocol::Udp,
-            false,
+            ProxyFallback::Deny,
         );
 
         assert!(matches!(
@@ -908,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_published_container_marks_ambiguous_proxy_matches() {
+    fn lookup_marks_ambiguous_proxy_matches() {
         let mut map = ContainerPortMap::new();
         insert_test_container(
             &mut map,
@@ -929,18 +1109,18 @@ mod tests {
             "node:22",
         );
 
-        let result = lookup_published_container(
-            &map,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
+        let result = map.lookup(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            8080,
             Protocol::Tcp,
-            true,
+            ProxyFallback::Allow,
         );
 
         assert_eq!(result, PublishedContainerMatch::Ambiguous);
     }
 
     #[test]
-    fn lookup_published_container_uses_normalized_wildcard_bindings() {
+    fn lookup_uses_normalized_wildcard_bindings() {
         let map = api::parse_containers_json(
             r#"[{
                 "Names": ["/postgres"],
@@ -949,17 +1129,121 @@ mod tests {
             }]"#,
         );
 
-        let result = lookup_published_container(
-            &map,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432),
+        let result = map.lookup(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            5432,
             Protocol::Tcp,
-            false,
+            ProxyFallback::Deny,
         );
 
         assert!(matches!(
             result,
             PublishedContainerMatch::Match(info) if info.name == "postgres"
         ));
+    }
+
+    #[test]
+    fn port_range_bindings_share_one_container() {
+        let map = api::parse_containers_json(
+            r#"[{"Names": ["/range"], "Ports": [{"host_port": 4000, "range": 100, "protocol": "tcp"}]}]"#,
+        );
+        assert_eq!(map.len(), 100, "every port in the range is mapped");
+        let first = map
+            .bindings
+            .get(&(None, 4000, Protocol::Tcp))
+            .expect("first port");
+        let last = map
+            .bindings
+            .get(&(None, 4099, Protocol::Tcp))
+            .expect("last port");
+        assert!(
+            Arc::ptr_eq(first, last),
+            "a port range must not clone the container per port"
+        );
+    }
+
+    #[test]
+    fn port_map_collects_and_iterates_bindings() {
+        let map: ContainerPortMap = [
+            (
+                (None, 80, Protocol::Tcp),
+                test_container_info("a", "web", "nginx"),
+            ),
+            (
+                (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 53, Protocol::Udp),
+                test_container_info("b", "dns", "bind9"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(map.len(), 2);
+        assert!(!map.is_empty());
+        let mut names: Vec<_> = map.iter().map(|(_, info)| info.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["dns", "web"]);
+        assert_eq!(map.iter().len(), 2, "the iterator knows its length");
+        assert!(
+            map.get(None, 53, Protocol::Udp).is_none(),
+            "get is an exact key lookup"
+        );
+        assert!(ContainerPortMap::default().is_empty());
+    }
+
+    #[test]
+    fn insert_returns_the_replaced_container() {
+        let mut map = ContainerPortMap::new();
+        assert!(
+            map.insert(
+                None,
+                80,
+                Protocol::Tcp,
+                test_container_info("a", "old", "img")
+            )
+            .is_none()
+        );
+        let previous = map.insert(
+            None,
+            80,
+            Protocol::Tcp,
+            test_container_info("b", "new", "img"),
+        );
+        assert_eq!(
+            previous.map(|info| info.name.clone()).as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            map.get(None, 80, Protocol::Tcp)
+                .map(|info| info.name.as_str()),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn proxy_fallback_finds_unique_container_on_other_address() {
+        let mut map = ContainerPortMap::new();
+        insert_test_container(
+            &mut map,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            8080,
+            Protocol::Tcp,
+            "api",
+            "api",
+            "node:22",
+        );
+        let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+        assert_eq!(
+            map.lookup(unspecified, 8080, Protocol::Tcp, ProxyFallback::Deny),
+            PublishedContainerMatch::NotFound,
+            "without the fallback only address-level bindings match"
+        );
+        let found = map.lookup(unspecified, 8080, Protocol::Tcp, ProxyFallback::Allow);
+        assert_eq!(
+            found.container().map(|info| info.name.as_str()),
+            Some("api")
+        );
+        assert_eq!(ProxyFallback::default(), ProxyFallback::Deny);
     }
 
     // ── interpret_stop_status ────────────────────────────────────────
@@ -1397,14 +1681,15 @@ mod tests {
     fn merge_keeps_higher_priority_daemon_regardless_of_arrival_order() {
         let first = (0, false, shared_port_body("from-first-default"));
         let second = (1, false, shared_port_body("from-second-default"));
-        let key = (None, 8080, Protocol::Tcp);
 
         for responses in [vec![first.clone(), second.clone()], vec![second, first]] {
             let bodies = select_daemon_bodies(responses);
 
             let lenient = merge_prioritized_responses(&bodies).expect("responses were given");
             assert_eq!(
-                lenient.get(&key).map(|info| info.name.as_str()),
+                lenient
+                    .get(None, 8080, Protocol::Tcp)
+                    .map(|info| info.name.as_str()),
                 Some("from-first-default"),
                 "the earlier default endpoint wins a shared key"
             );
@@ -1412,7 +1697,9 @@ mod tests {
             let merged = merge_prioritized_bodies(&bodies).expect("responses were given");
             let strict = api::parse_containers_json_strict(&merged).expect("valid JSON");
             assert_eq!(
-                strict.get(&key).map(|info| info.name.as_str()),
+                strict
+                    .get(None, 8080, Protocol::Tcp)
+                    .map(|info| info.name.as_str()),
                 Some("from-first-default"),
                 "the strict path resolves a shared key the same way"
             );

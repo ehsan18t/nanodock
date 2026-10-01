@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
@@ -233,6 +234,8 @@ fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'
             info.compose_project = labels.project();
             info.compose_service = labels.service();
         }
+        // Shared by every binding of this container.
+        let info = Arc::new(info);
 
         let Some(ports) = &container.ports else {
             continue;
@@ -259,7 +262,7 @@ fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'
                     break;
                 };
 
-                map.insert((host_ip, mapped_port, proto), info.clone());
+                map.insert(host_ip, mapped_port, proto, Arc::clone(&info));
             }
         }
     }
@@ -380,7 +383,7 @@ mod tests {
         public_port: u16,
         proto: Protocol,
     ) -> &ContainerInfo {
-        map.get(&(host_ip, public_port, proto))
+        map.get(host_ip, public_port, proto)
             .expect("expected container port mapping to exist")
     }
 
@@ -476,8 +479,8 @@ mod tests {
         }]"#;
         let map = parse_containers_json(json);
         assert_eq!(map.len(), 2);
-        assert!(map.contains_key(&(None, 8080, Protocol::Tcp)));
-        assert!(map.contains_key(&(None, 8443, Protocol::Tcp)));
+        assert!(map.get(None, 8080, Protocol::Tcp).is_some());
+        assert!(map.get(None, 8443, Protocol::Tcp).is_some());
     }
 
     #[test]
@@ -489,7 +492,7 @@ mod tests {
         }]"#;
         let map = parse_containers_json(json);
         assert!(
-            map.contains_key(&(None, 8080, Protocol::Tcp)),
+            map.get(None, 8080, Protocol::Tcp).is_some(),
             "missing Type should default to TCP"
         );
     }
@@ -504,7 +507,7 @@ mod tests {
         let map = parse_containers_json(json);
 
         assert!(
-            map.contains_key(&(None, 5353, Protocol::Udp)),
+            map.get(None, 5353, Protocol::Udp).is_some(),
             "protocol parsing should accept uppercase protocol tokens"
         );
     }
@@ -552,9 +555,9 @@ mod tests {
         }]"#;
         let map = parse_containers_json(json);
 
-        assert!(map.contains_key(&(None, 4510, Protocol::Tcp)));
-        assert!(map.contains_key(&(None, 4511, Protocol::Tcp)));
-        assert!(map.contains_key(&(None, 4512, Protocol::Tcp)));
+        assert!(map.get(None, 4510, Protocol::Tcp).is_some());
+        assert!(map.get(None, 4511, Protocol::Tcp).is_some());
+        assert!(map.get(None, 4512, Protocol::Tcp).is_some());
     }
 
     #[test]
@@ -617,7 +620,8 @@ mod tests {
 
         assert_container_mapping(&map, None, 5432, Protocol::Tcp, "postgres", "postgres:16");
         assert!(
-            !map.contains_key(&(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 5432, Protocol::Tcp)),
+            map.get(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 5432, Protocol::Tcp)
+                .is_none(),
             "unspecified IPv4 bindings should be normalized to the wildcard key"
         );
     }
@@ -633,11 +637,12 @@ mod tests {
 
         assert_container_mapping(&map, None, 5353, Protocol::Udp, "dns", "bind9:latest");
         assert!(
-            !map.contains_key(&(
+            map.get(
                 Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
                 5353,
                 Protocol::Udp
-            )),
+            )
+            .is_none(),
             "unspecified IPv6 bindings should be normalized to the wildcard key"
         );
     }
@@ -738,7 +743,7 @@ mod tests {
 
         assert_eq!(map.len(), 2);
         assert!(
-            !map.contains_key(&(None, 8080, Protocol::Tcp)),
+            map.get(None, 8080, Protocol::Tcp).is_none(),
             "an unparseable host IP must not be widened to a wildcard binding"
         );
         assert_container_mapping(

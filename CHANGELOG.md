@@ -10,10 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
+- `PublishedContainerMatch::container` returns the matched container, if any.
 
 ### Changed
 
 - **Breaking:** `ContainerInfo` is `#[non_exhaustive]`. Its fields stay public for reading, but code outside the crate can no longer build it with a struct literal; use `ContainerInfo::new` instead.
+- **Breaking:** `ContainerPortMap` is a struct instead of a `HashMap` type alias. It offers `new`, `len`, `is_empty`, `get(host_ip, port, proto)`, `insert(host_ip, port, proto, info)`, `iter`, `lookup`, `Default`, `FromIterator`, and `Extend`, and `&ContainerPortMap` iterates as `((host_ip, port, proto), &ContainerInfo)`. Every binding of one container shares a single `Arc<ContainerInfo>`, so a container that publishes a large port range is no longer cloned once per port.
+
+### Removed
+
+- **Breaking:** `lookup_published_container(map, socket, proto, allow_proxy_fallback)` is replaced by the `ContainerPortMap::lookup(ip, port, proto, fallback)` method, and the `allow_proxy_fallback: bool` argument by the `ProxyFallback` enum (`Allow` or `Deny`).
 
 ## [0.1.2] - 2026-10-01
 

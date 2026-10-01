@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-01
+
 ### Fixed
 
 - Container names, images, and other strings that contain JSON escape sequences (for example `\/` or `\"`) no longer make the whole container list fail to parse.
@@ -43,6 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release: synchronous Docker/Podman container detection, port mapping, and stop/kill over Unix sockets, Windows named pipes, and TCP.
 
-[Unreleased]: https://github.com/ehsan18t/nanodock/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ehsan18t/nanodock/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ehsan18t/nanodock/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ehsan18t/nanodock/compare/0.1.0...v0.1.1
 [0.1.0]: https://github.com/ehsan18t/nanodock/releases/tag/0.1.0

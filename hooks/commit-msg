@@ -5,18 +5,18 @@
 # Format: <type>(<optional-scope>): <description>
 #
 # Allowed types:
-#   feat      — New feature or capability
-#   fix       — Bug fix
-#   docs      — Documentation only changes
-#   style     — Formatting, whitespace, no code change
-#   refactor  — Code change that neither fixes a bug nor adds a feature
-#   perf      — Performance improvement
-#   test      — Adding or updating tests
-#   build     — Build system or external dependency changes
-#   ci        — CI/CD configuration changes
-#   chore     — Maintenance tasks, tooling, config
-#   revert    — Reverts a previous commit
-#   enforce   — Adding or updating enforcement rules/quality gates
+#   feat      - New feature or capability
+#   fix       - Bug fix
+#   docs      - Documentation only changes
+#   style     - Formatting, whitespace, no code change
+#   refactor  - Code change that neither fixes a bug nor adds a feature
+#   perf      - Performance improvement
+#   test      - Adding or updating tests
+#   build     - Build system or external dependency changes
+#   ci        - CI/CD configuration changes
+#   chore     - Maintenance tasks, tooling, config
+#   revert    - Reverts a previous commit
+#   enforce   - Adding or updating enforcement rules/quality gates
 #
 # Rules:
 #   - Type is required and must be one of the above

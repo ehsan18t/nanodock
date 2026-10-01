@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 
-use crate::{ContainerInfo, ContainerPortMap, Protocol};
+use crate::{ContainerInfo, ContainerPortMap, ParseError, Protocol};
 
 /// A JSON string that borrows from the input when it contains no escape
 /// sequences and falls back to an owned copy when it does.
@@ -213,12 +213,16 @@ pub fn parse_containers_json(json_body: &str) -> ContainerPortMap {
     map
 }
 
-/// Strict variant of [`parse_containers_json`] that propagates JSON
-/// deserialization errors instead of silently returning an empty map.
-pub fn parse_containers_json_strict(
-    json_body: &str,
-) -> Result<ContainerPortMap, serde_json::Error> {
-    let containers = serde_json::from_str::<Vec<DockerContainer<'_>>>(json_body)?;
+/// Strict variant of [`parse_containers_json`] that reports invalid JSON
+/// instead of skipping it.
+///
+/// # Errors
+///
+/// Fails with a [`ParseError`] when the body is not a JSON array of
+/// well-formed container objects.
+pub fn parse_containers_json_strict(json_body: &str) -> Result<ContainerPortMap, ParseError> {
+    let containers =
+        serde_json::from_str::<Vec<DockerContainer<'_>>>(json_body).map_err(ParseError::json)?;
     let mut map = ContainerPortMap::new();
     populate_port_map(&mut map, &containers);
     Ok(map)

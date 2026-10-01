@@ -202,7 +202,8 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `PublishedContainerMatch` | Result of looking up a socket in the port map             |
 | `StopOutcome`             | Result of a stop/kill request                             |
 | `DetectionHandle`         | Handle for in-progress background detection               |
-| `Error`                   | Error type for strict-path detection failures             |
+| `Error`                   | Why strict-path detection failed (daemon not found, permission denied, timeout, HTTP status, invalid response, I/O) |
+| `ParseError`              | Opaque error for a reply that is not valid HTTP or container-list JSON |
 
 ### Core Functions
 

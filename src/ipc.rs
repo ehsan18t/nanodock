@@ -2,7 +2,8 @@
 //!
 //! Provides Unix socket, Windows named pipe, and TCP connection functions.
 //! Each transport connects to the daemon, delegates to the HTTP engine for
-//! request/response handling, and returns the raw JSON body string.
+//! request/response handling, and returns the raw JSON body string, or a
+//! [`FetchError`] that says why the endpoint produced none.
 //!
 //! Every query and stop request runs against one overall deadline. Socket
 //! read timeouts only apply per call, so streams are wrapped in
@@ -32,6 +33,57 @@ const _: () = assert!(QUERY_TIMEOUT.as_millis() < DAEMON_TIMEOUT.as_millis());
 /// Deadline for a detection pass that starts now.
 pub fn query_deadline() -> Instant {
     Instant::now() + QUERY_TIMEOUT
+}
+
+/// Why one daemon endpoint produced no container list.
+#[derive(Debug)]
+pub enum FetchError {
+    /// Nothing answers at the endpoint: the socket or pipe does not exist,
+    /// or the connection was refused.
+    NotFound,
+    /// The endpoint exists but the current user may not connect to it.
+    PermissionDenied,
+    /// The endpoint did not finish answering before the deadline.
+    Timeout,
+    /// The daemon answered with a non-2xx HTTP status.
+    Status(u16),
+    /// The reply was not a well-formed HTTP response.
+    Malformed(&'static str),
+    /// Any other I/O failure.
+    Io(io::Error),
+}
+
+impl FetchError {
+    /// Classify a failure to connect to (or open) an endpoint.
+    pub fn from_connect_error(error: io::Error) -> Self {
+        match error.kind() {
+            // A stale socket file with no listener refuses the connection:
+            // no daemon is running there.
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Self::NotFound,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            kind if is_timeout(kind) => Self::Timeout,
+            _ => Self::Io(error),
+        }
+    }
+}
+
+impl From<http::ResponseError> for FetchError {
+    fn from(error: http::ResponseError) -> Self {
+        match error {
+            http::ResponseError::Io(error) if is_timeout(error.kind()) => Self::Timeout,
+            http::ResponseError::Io(error) => Self::Io(error),
+            http::ResponseError::Status(status_code) => Self::Status(status_code),
+            http::ResponseError::Malformed(reason) => Self::Malformed(reason),
+        }
+    }
+}
+
+/// Whether an I/O error kind means a deadline or socket timeout passed.
+///
+/// [`DeadlineStream`] reports an expired deadline as `TimedOut`; a socket
+/// read timeout surfaces as `WouldBlock` on Unix and `TimedOut` on Windows.
+const fn is_timeout(kind: io::ErrorKind) -> bool {
+    matches!(kind, io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
 }
 
 /// Time left before `deadline`, or `None` when it has passed.
@@ -156,7 +208,16 @@ pub fn docker_host_tcp_addr() -> Option<String> {
 // Concurrent fan-out across daemon endpoints
 // ---------------------------------------------------------------------------
 
-/// Query every candidate on its own thread and collect the successes that
+/// Results of querying several endpoints concurrently.
+#[derive(Debug)]
+pub struct FanOut<T> {
+    /// Results that arrived before the deadline, in arrival order.
+    pub results: Vec<T>,
+    /// Workers still running at the deadline; their results are dropped.
+    pub unfinished: usize,
+}
+
+/// Query every candidate on its own thread and collect the results that
 /// arrive before `deadline`.
 ///
 /// Returns as soon as every worker has finished, or at the deadline with
@@ -164,42 +225,47 @@ pub fn docker_host_tcp_addr() -> Option<String> {
 /// detached rather than joined: a stuck endpoint must not delay or discard
 /// the answers of the others. Detached workers are bounded by their own
 /// transport deadline, and their late results are dropped with the channel.
-pub fn fetch_all_successes<P, T, I, F>(candidates: I, fetch: F, deadline: Instant) -> Vec<T>
+pub fn fetch_all<P, T, I, F>(candidates: I, fetch: F, deadline: Instant) -> FanOut<T>
 where
     P: Send + 'static,
     T: Send + 'static,
     I: IntoIterator<Item = P>,
-    F: Fn(P) -> Option<T> + Send + Sync + 'static,
+    F: Fn(P) -> T + Send + Sync + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     let fetch = std::sync::Arc::new(fetch);
+    let mut spawned = 0_usize;
 
     for candidate in candidates {
+        spawned += 1;
         let tx = tx.clone();
         let fetch = std::sync::Arc::clone(&fetch);
         // Detached on purpose: the collector below never joins workers.
         drop(std::thread::spawn(move || {
-            if let Some(body) = fetch(candidate) {
-                // The receiver is gone once the deadline passed; ignore that.
-                drop(tx.send(body));
-            }
+            // The receiver is gone once the deadline passed; ignore that.
+            drop(tx.send(fetch(candidate)));
         }));
     }
 
     drop(tx);
-    let mut responses = Vec::new();
+    let mut results = Vec::with_capacity(spawned);
 
     while let Some(remaining) = remaining_until(deadline) {
         match rx.recv_timeout(remaining) {
-            Ok(body) => responses.push(body),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return responses,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Ok(result) => results.push(result),
+            Err(
+                std::sync::mpsc::RecvTimeoutError::Disconnected
+                | std::sync::mpsc::RecvTimeoutError::Timeout,
+            ) => break,
         }
     }
 
     // Keep anything that landed right at the deadline boundary.
-    responses.extend(rx.try_iter());
-    responses
+    results.extend(rx.try_iter());
+    FanOut {
+        unfinished: spawned.saturating_sub(results.len()),
+        results,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,17 +292,19 @@ pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<std:
 }
 
 #[cfg(unix)]
-pub fn fetch_unix_socket_json(path: &std::path::Path, deadline: Instant) -> Option<String> {
-    let stream = connect_unix_stream(path, "")?;
+pub fn fetch_unix_socket_json(
+    path: &std::path::Path,
+    deadline: Instant,
+) -> Result<String, FetchError> {
+    let stream = connect_unix_stream(path, "").map_err(FetchError::from_connect_error)?;
     let mut stream = DeadlineStream::new(stream, deadline);
-    let response = http::send_http_request(&mut stream);
-    if response.is_none() {
+    http::send_http_request(&mut stream).map_err(|error| {
         debug!(
-            "container runtime socket returned no usable response: socket={}",
+            "container runtime socket returned no usable response: socket={} error={error:?}",
             path.display()
         );
-    }
-    response
+        FetchError::from(error)
+    })
 }
 
 /// Connect to a local Unix stream socket.
@@ -252,17 +320,13 @@ pub fn fetch_unix_socket_json(path: &std::path::Path, deadline: Instant) -> Opti
 fn connect_unix_stream(
     path: &std::path::Path,
     operation_suffix: &str,
-) -> Option<std::os::unix::net::UnixStream> {
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(stream) => Some(stream),
-        Err(error) => {
-            debug!(
-                "failed to connect to container runtime socket{operation_suffix}: socket={} error={error}",
-                path.display()
-            );
-            None
-        }
-    }
+) -> io::Result<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(path).inspect_err(|error| {
+        debug!(
+            "failed to connect to container runtime socket{operation_suffix}: socket={} error={error}",
+            path.display()
+        );
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -308,72 +372,96 @@ unsafe extern "system" {
 }
 
 #[cfg(windows)]
-pub fn fetch_named_pipe_json(path: &str, deadline: Instant) -> Option<String> {
-    let mut stream = open_named_pipe(path, deadline, "")?;
-    let response = send_http_request_windows(&mut stream, deadline);
-    if response.is_none() {
-        debug!("container runtime named pipe returned no usable response: pipe={path}");
-    }
-    response
+pub fn fetch_named_pipe_json(path: &str, deadline: Instant) -> Result<String, FetchError> {
+    let mut stream = open_named_pipe(path, deadline, "").map_err(FetchError::from_connect_error)?;
+    send_http_request_windows(&mut stream, deadline).inspect_err(|error| {
+        debug!(
+            "container runtime named pipe returned no usable response: pipe={path} error={error:?}"
+        );
+    })
 }
 
 #[cfg(windows)]
-fn send_http_request_windows(stream: &mut std::fs::File, deadline: Instant) -> Option<String> {
-    stream.write_all(http::CONTAINERS_HTTP_REQUEST).ok()?;
+fn send_http_request_windows(
+    stream: &mut std::fs::File,
+    deadline: Instant,
+) -> Result<String, FetchError> {
+    stream
+        .write_all(http::CONTAINERS_HTTP_REQUEST)
+        .map_err(|error| FetchError::from(http::ResponseError::Io(error)))?;
 
     let mut response = Vec::with_capacity(8192);
     let mut chunk = [0_u8; 8192];
     let mut headers: Option<http::ParsedHeaders> = None;
+    let mut failure: Option<http::ResponseError> = None;
 
     let result = poll_named_pipe_response(
         stream,
         deadline,
         &mut chunk,
         &mut response,
-        |response, eof| {
-            if eof {
-                return http::extract_body_at_eof(response, headers.as_ref())
-                    .map_or(PipeParseState::Failed, PipeParseState::Done);
-            }
-            // Once headers are parsed, continue extracting against the buffered
-            // body instead of reparsing the header boundary.
-            if let Some(ref hdr) = headers {
-                return match http::extract_http_body_from_buffer(response, hdr, eof) {
-                    Ok(Some(body)) => PipeParseState::Done(body),
-                    Ok(None) => PipeParseState::Pending,
-                    Err(()) => PipeParseState::Failed,
-                };
-            }
-
-            let hdr = match http::response_header_state(response) {
-                http::HeaderState::Pending => return PipeParseState::Pending,
-                http::HeaderState::Invalid => return PipeParseState::Failed,
-                http::HeaderState::Complete(hdr) => hdr,
-            };
-            if !hdr.status_ok {
-                return PipeParseState::Failed;
-            }
-
-            match http::extract_http_body_from_buffer(response, &hdr, eof) {
-                Ok(Some(body)) => PipeParseState::Done(body),
-                Ok(None) => {
-                    headers = Some(hdr);
-                    PipeParseState::Pending
-                }
-                Err(()) => PipeParseState::Failed,
+        |response, eof| match container_list_step(response, eof, &mut headers) {
+            Ok(Some(body)) => PipeParseState::Done(body),
+            Ok(None) => PipeParseState::Pending,
+            Err(error) => {
+                failure = Some(error);
+                PipeParseState::Failed
             }
         },
     );
-    result.ok()
+    match result {
+        Ok(body) => Ok(body),
+        Err(PipeFailure::TimedOut) => Err(FetchError::Timeout),
+        Err(PipeFailure::Closed | PipeFailure::Failed) => Err(failure.map_or_else(
+            || FetchError::Io(io::Error::other("reading the named pipe failed")),
+            FetchError::from,
+        )),
+    }
+}
+
+/// One parse step over the container-list reply buffered so far: `Ok(None)`
+/// while more bytes are needed.
+///
+/// Once the headers are parsed they are kept in `headers`, so later steps
+/// extract against the buffered body instead of reparsing the header block.
+#[cfg(windows)]
+fn container_list_step(
+    response: &[u8],
+    eof: bool,
+    headers: &mut Option<http::ParsedHeaders>,
+) -> Result<Option<String>, http::ResponseError> {
+    if eof {
+        return http::extract_body_at_eof(response, headers.as_ref()).map(Some);
+    }
+    if let Some(hdr) = headers.as_ref() {
+        return http::extract_http_body_from_buffer(response, hdr, false);
+    }
+
+    let hdr = match http::response_header_state(response) {
+        http::HeaderState::Pending => return Ok(None),
+        http::HeaderState::Invalid => {
+            return Err(http::ResponseError::Malformed(http::MALFORMED_HEADERS));
+        }
+        http::HeaderState::Complete(hdr) => hdr,
+    };
+    let body = http::extract_http_body_from_buffer(response, &hdr, false)?;
+    if body.is_none() {
+        *headers = Some(hdr);
+    }
+    Ok(body)
 }
 
 #[cfg(windows)]
-fn open_named_pipe(path: &str, deadline: Instant, operation_suffix: &str) -> Option<std::fs::File> {
+fn open_named_pipe(
+    path: &str,
+    deadline: Instant,
+    operation_suffix: &str,
+) -> io::Result<std::fs::File> {
     use std::fs::OpenOptions;
 
     loop {
         match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(stream) => return Some(stream),
+            Ok(stream) => return Ok(stream),
             Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 wait_named_pipe(path, deadline)?;
             }
@@ -381,7 +469,7 @@ fn open_named_pipe(path: &str, deadline: Instant, operation_suffix: &str) -> Opt
                 debug!(
                     "failed to open container runtime named pipe{operation_suffix}: pipe={path} error={error}"
                 );
-                return None;
+                return Err(error);
             }
         }
     }
@@ -407,8 +495,9 @@ enum PipeParseState<T> {
 enum PipeFailure {
     /// The server closed the pipe before a complete reply was parsed.
     Closed,
-    /// The reply was invalid or too large, a read failed, or the deadline
-    /// passed.
+    /// The deadline passed before a complete reply was parsed.
+    TimedOut,
+    /// The reply was invalid or too large, or a read failed.
     Failed,
 }
 
@@ -444,10 +533,10 @@ where
             if available == 0 {
                 // Idle at the deadline: treat the buffered bytes as the
                 // complete response, as before.
-                return finalize_pipe_parse(response, &mut parse, PipeFailure::Failed);
+                return finalize_pipe_parse(response, &mut parse, PipeFailure::TimedOut);
             }
             debug!("container runtime named pipe still streaming at deadline");
-            return Err(PipeFailure::Failed);
+            return Err(PipeFailure::TimedOut);
         }
 
         if available == 0 {
@@ -525,15 +614,22 @@ fn append_within_limit(response: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bo
     true
 }
 
+/// Wait until a busy pipe instance is free, failing with the OS error (or
+/// [`io::ErrorKind::TimedOut`] once the deadline has passed).
 #[cfg(windows)]
-fn wait_named_pipe(path: &str, deadline: Instant) -> Option<()> {
-    let timeout_ms = remaining_timeout_ms(deadline)?;
+fn wait_named_pipe(path: &str, deadline: Instant) -> io::Result<()> {
+    let timeout_ms =
+        remaining_timeout_ms(deadline).ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
     let wide_path = wide_string(path);
     // SAFETY: `wide_path` is a valid null-terminated UTF-16 string produced by
     // `wide_string`, and `timeout_ms` is a plain u32. No aliasing or lifetime
     // invariants apply; the kernel copies the string internally.
     let success = unsafe { WaitNamedPipeW(wide_path.as_ptr(), timeout_ms) };
-    (success != 0).then_some(())
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -605,14 +701,15 @@ fn last_os_error_is_pipe_closed() -> bool {
 ///
 /// Used when `DOCKER_HOST` is set to `tcp://host:port`. Connecting, writing
 /// and reading all share `deadline`.
-pub fn fetch_tcp_json(addr: &str, deadline: Instant) -> Option<String> {
-    let stream = connect_tcp_stream(addr, deadline)?;
+pub fn fetch_tcp_json(addr: &str, deadline: Instant) -> Result<String, FetchError> {
+    let stream = connect_tcp_stream(addr, deadline).map_err(FetchError::from_connect_error)?;
     let mut stream = DeadlineStream::new(stream, deadline);
-    let response = http::send_http_request(&mut stream);
-    if response.is_none() {
-        debug!("container runtime TCP endpoint returned no usable response: tcp={addr}");
-    }
-    response
+    http::send_http_request(&mut stream).map_err(|error| {
+        debug!(
+            "container runtime TCP endpoint returned no usable response: tcp={addr} error={error:?}"
+        );
+        FetchError::from(error)
+    })
 }
 
 /// Upper bound for one TCP connect attempt.
@@ -628,35 +725,37 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = DAEMON_TIMEOUT;
 /// The connect attempts share `deadline`, and each one is further capped
 /// at [`CONNECT_ATTEMPT_TIMEOUT`]. Name resolution itself has no timeout in
 /// std; `DOCKER_HOST` normally names a literal IP or `localhost`, which
-/// resolve locally.
-fn connect_tcp_stream(addr: &str, deadline: Instant) -> Option<std::net::TcpStream> {
+/// resolve locally. Fails with the error of the last attempt, or with
+/// [`io::ErrorKind::TimedOut`] once the deadline has passed.
+fn connect_tcp_stream(addr: &str, deadline: Instant) -> io::Result<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
 
-    let socket_addrs = match addr.to_socket_addrs() {
-        Ok(socket_addrs) => socket_addrs,
-        Err(error) => {
-            debug!("failed to resolve container runtime TCP address: tcp={addr} error={error}");
-            return None;
-        }
-    };
+    let socket_addrs = addr.to_socket_addrs().inspect_err(|error| {
+        debug!("failed to resolve container runtime TCP address: tcp={addr} error={error}");
+    })?;
 
+    let mut last_error = io::Error::new(
+        io::ErrorKind::NotFound,
+        "the address resolved to no socket address",
+    );
     for socket_addr in socket_addrs {
         let Some(remaining) = remaining_until(deadline) else {
             debug!("container runtime TCP connect deadline expired: tcp={addr}");
-            return None;
+            return Err(io::ErrorKind::TimedOut.into());
         };
         let attempt_timeout = remaining.min(CONNECT_ATTEMPT_TIMEOUT);
         match std::net::TcpStream::connect_timeout(&socket_addr, attempt_timeout) {
-            Ok(stream) => return Some(stream),
+            Ok(stream) => return Ok(stream),
             Err(error) => {
                 debug!(
                     "failed to connect to container runtime TCP address: socket_addr={socket_addr} error={error}"
                 );
+                last_error = error;
             }
         }
     }
 
-    None
+    Err(last_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,7 +865,7 @@ pub fn stop_via_unix_socket(path: &std::path::Path, endpoint: &str) -> StopAttem
     if !ping_unix_socket(path, ping_deadline(deadline)) {
         return StopAttempt::Unreachable;
     }
-    let Some(stream) = connect_unix_stream(path, " for stop") else {
+    let Ok(stream) = connect_unix_stream(path, " for stop") else {
         return StopAttempt::Unreachable;
     };
     let mut stream = DeadlineStream::new(stream, deadline);
@@ -776,7 +875,7 @@ pub fn stop_via_unix_socket(path: &std::path::Path, endpoint: &str) -> StopAttem
 /// Whether the daemon behind a Unix socket answers `GET /_ping`.
 #[cfg(unix)]
 fn ping_unix_socket(path: &std::path::Path, deadline: Instant) -> bool {
-    let Some(stream) = connect_unix_stream(path, " for ping") else {
+    let Ok(stream) = connect_unix_stream(path, " for ping") else {
         return false;
     };
     let mut stream = DeadlineStream::new(stream, deadline);
@@ -794,7 +893,7 @@ pub fn stop_via_named_pipe(path: &str, endpoint: &str) -> StopAttempt {
     if !ping_named_pipe(path, ping_deadline(deadline)) {
         return StopAttempt::Unreachable;
     }
-    let Some(mut stream) = open_named_pipe(path, deadline, " for stop") else {
+    let Ok(mut stream) = open_named_pipe(path, deadline, " for stop") else {
         return StopAttempt::Unreachable;
     };
     stop_attempt_from(send_http_status_request_windows(
@@ -807,7 +906,7 @@ pub fn stop_via_named_pipe(path: &str, endpoint: &str) -> StopAttempt {
 /// Whether the daemon behind a named pipe answers `GET /_ping`.
 #[cfg(windows)]
 fn ping_named_pipe(path: &str, deadline: Instant) -> bool {
-    let Some(mut stream) = open_named_pipe(path, deadline, " for ping") else {
+    let Ok(mut stream) = open_named_pipe(path, deadline, " for ping") else {
         return false;
     };
     let result = send_http_status_request_windows(&mut stream, http::PING_HTTP_REQUEST, deadline);
@@ -866,7 +965,7 @@ fn stop_via_tcp_until(addr: &str, endpoint: &str, deadline: Instant) -> StopAtte
     if !ping_tcp(addr, ping_deadline(deadline)) {
         return StopAttempt::Unreachable;
     }
-    let Some(stream) = connect_tcp_stream(addr, deadline) else {
+    let Ok(stream) = connect_tcp_stream(addr, deadline) else {
         return StopAttempt::Unreachable;
     };
     let mut stream = DeadlineStream::new(stream, deadline);
@@ -875,7 +974,7 @@ fn stop_via_tcp_until(addr: &str, endpoint: &str, deadline: Instant) -> StopAtte
 
 /// Whether the daemon behind a TCP address answers `GET /_ping`.
 fn ping_tcp(addr: &str, deadline: Instant) -> bool {
-    let Some(stream) = connect_tcp_stream(addr, deadline) else {
+    let Ok(stream) = connect_tcp_stream(addr, deadline) else {
         return false;
     };
     let mut stream = DeadlineStream::new(stream, deadline);
@@ -1023,7 +1122,7 @@ mod tests {
         );
     }
 
-    // ── fetch_all_successes ──────────────────────────────────────────
+    // ── fetch_all ────────────────────────────────────────────────────
 
     #[test]
     fn query_budget_is_shorter_than_await_timeout() {
@@ -1034,12 +1133,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_all_successes_collects_multiple_responses() {
-        let mut responses = fetch_all_successes(
+    fn fetch_all_collects_every_result() {
+        let fan_out = fetch_all(
             [1_u8, 2, 3],
             |candidate| (candidate != 2).then(|| candidate.to_string()),
             Instant::now() + Duration::from_secs(5),
         );
+        let mut responses: Vec<_> = fan_out.results.into_iter().flatten().collect();
         responses.sort();
 
         assert_eq!(
@@ -1047,21 +1147,26 @@ mod tests {
             vec!["1".to_string(), "3".to_string()],
             "every successful candidate should be returned"
         );
+        assert_eq!(fan_out.unfinished, 0, "every worker reported back");
     }
 
     #[test]
-    fn fetch_all_successes_returns_early_when_all_workers_finish() {
+    fn fetch_all_returns_early_when_all_workers_finish() {
         let started = Instant::now();
-        let responses = fetch_all_successes(
+        let fan_out = fetch_all(
             [1_u8, 2],
             |candidate| {
                 std::thread::sleep(Duration::from_millis(20));
-                Some(candidate)
+                candidate
             },
             started + Duration::from_secs(10),
         );
 
-        assert_eq!(responses.len(), 2, "both late-ish answers should be kept");
+        assert_eq!(
+            fan_out.results.len(),
+            2,
+            "both late-ish answers should be kept"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the collector should not wait for the deadline once all workers are done"
@@ -1069,22 +1174,23 @@ mod tests {
     }
 
     #[test]
-    fn fetch_all_successes_does_not_wait_for_stuck_workers() {
+    fn fetch_all_does_not_wait_for_stuck_workers() {
         let started = Instant::now();
-        let responses = fetch_all_successes(
+        let fan_out = fetch_all(
             [0_u64, 3000],
             |delay_ms| {
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                Some(delay_ms)
+                delay_ms
             },
             started + Duration::from_millis(300),
         );
 
         assert_eq!(
-            responses,
+            fan_out.results,
             vec![0],
             "the fast answer must survive a stuck sibling"
         );
+        assert_eq!(fan_out.unfinished, 1, "the stuck worker is counted");
         assert!(
             started.elapsed() < Duration::from_millis(2000),
             "a stuck worker must be detached, not joined"
@@ -1102,10 +1208,56 @@ mod tests {
             drop(stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n[]"));
         });
 
-        let body = fetch_tcp_json(&addr, Instant::now() + Duration::from_secs(5));
+        let body = fetch_tcp_json(&addr, Instant::now() + Duration::from_secs(5)).ok();
         drop(server.join());
 
         assert_eq!(body.as_deref(), Some("[]"), "body should pass through");
+    }
+
+    #[test]
+    fn fetch_tcp_json_reports_http_status() {
+        let (listener, addr) = loopback_listener();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            drain_request(&mut stream);
+            drop(stream.write_all(b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n"));
+        });
+
+        let result = fetch_tcp_json(&addr, Instant::now() + Duration::from_secs(5));
+        drop(server.join());
+
+        assert!(
+            matches!(result, Err(FetchError::Status(403))),
+            "a non-2xx reply is reported with its status, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn connect_errors_are_classified() {
+        let classify = |kind: io::ErrorKind| FetchError::from_connect_error(kind.into());
+        assert!(matches!(
+            classify(io::ErrorKind::NotFound),
+            FetchError::NotFound
+        ));
+        assert!(
+            matches!(
+                classify(io::ErrorKind::ConnectionRefused),
+                FetchError::NotFound
+            ),
+            "a refused connection means no daemon listens there"
+        );
+        assert!(matches!(
+            classify(io::ErrorKind::PermissionDenied),
+            FetchError::PermissionDenied
+        ));
+        assert!(matches!(
+            classify(io::ErrorKind::TimedOut),
+            FetchError::Timeout
+        ));
+        assert!(matches!(
+            classify(io::ErrorKind::ConnectionReset),
+            FetchError::Io(_)
+        ));
     }
 
     #[test]
@@ -1128,7 +1280,10 @@ mod tests {
         let elapsed = started.elapsed();
         drop(server.join());
 
-        assert!(body.is_none(), "a trickled response must time out");
+        assert!(
+            matches!(body, Err(FetchError::Timeout)),
+            "a trickled response must time out, got {body:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(3),
             "the overall deadline must stop the read, took {elapsed:?}"
@@ -1142,8 +1297,10 @@ mod tests {
             .checked_sub(Duration::from_millis(1))
             .unwrap_or_else(Instant::now);
 
-        assert!(
-            connect_tcp_stream(&addr, past).is_none(),
+        let error = connect_tcp_stream(&addr, past).expect_err("deadline already passed");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
             "no connect attempt should start after the deadline"
         );
     }
@@ -1614,7 +1771,7 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(PipeFailure::Failed),
+            Err(PipeFailure::TimedOut),
             "an unfinished response must not succeed"
         );
         assert!(

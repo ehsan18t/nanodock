@@ -16,7 +16,7 @@
 //! pipes use non-blocking peek-and-read loops that accumulate into a
 //! single buffer, while Unix/TCP sockets use blocking `BufReader` I/O.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 
 /// Upper bound on a decoded response body (64 MiB).
 ///
@@ -58,6 +58,37 @@ pub enum TransferEncoding {
     Unsupported,
 }
 
+/// Why a daemon reply could not be turned into a response body.
+#[derive(Debug)]
+pub enum ResponseError {
+    /// Reading or writing the stream failed (including the deadline
+    /// passing, which surfaces as [`io::ErrorKind::TimedOut`]).
+    Io(io::Error),
+    /// The daemon answered with a non-2xx HTTP status.
+    Status(u16),
+    /// The reply was not a well-formed HTTP response within the size caps.
+    Malformed(&'static str),
+}
+
+impl From<io::Error> for ResponseError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Reply ended before its headers or body were complete.
+pub const INCOMPLETE_RESPONSE: &str = "connection closed before the response was complete";
+/// Status line or headers could not be parsed, or exceed the header cap.
+pub const MALFORMED_HEADERS: &str = "malformed or oversized response headers";
+/// Decoded body exceeds [`MAX_RESPONSE_BODY`].
+const BODY_TOO_LARGE: &str = "response body exceeds 64 MiB";
+/// Chunked framing is invalid.
+const MALFORMED_CHUNKS: &str = "malformed chunked transfer encoding";
+/// Body is not UTF-8.
+const BODY_NOT_UTF8: &str = "response body is not valid UTF-8";
+/// Transfer coding other than `chunked` or `identity`.
+const UNSUPPORTED_ENCODING: &str = "unsupported transfer encoding";
+
 /// Raw HTTP/1.0 request sent to the Docker/Podman daemon to list running
 /// containers. The API version prefix is intentionally omitted so the daemon
 /// uses its own default, avoiding 400 errors on older engines.
@@ -69,14 +100,16 @@ pub const CONTAINERS_HTTP_REQUEST: &[u8] =
 // ---------------------------------------------------------------------------
 
 /// Send the container-list request and read the complete response body.
-pub fn send_http_request(stream: &mut (impl Read + std::io::Write)) -> Option<String> {
-    stream.write_all(CONTAINERS_HTTP_REQUEST).ok()?;
+pub fn send_http_request(
+    stream: &mut (impl Read + std::io::Write),
+) -> Result<String, ResponseError> {
+    stream.write_all(CONTAINERS_HTTP_REQUEST)?;
 
     let mut reader = BufReader::new(stream);
 
     let headers = read_response_headers(&mut reader)?;
     if !headers.status_ok {
-        return None;
+        return Err(ResponseError::Status(headers.status_code));
     }
 
     read_response_body(&mut reader, &headers)
@@ -87,7 +120,7 @@ pub fn send_http_request(stream: &mut (impl Read + std::io::Write)) -> Option<St
 /// Reads raw bytes until the header/body boundary (empty `\r\n` line),
 /// then delegates to `httparse::Response::parse` for robust parsing.
 /// The reader is left positioned at the start of the response body.
-fn read_response_headers(reader: &mut impl BufRead) -> Option<ParsedHeaders> {
+fn read_response_headers(reader: &mut impl BufRead) -> Result<ParsedHeaders, ResponseError> {
     // Pre-allocate for a typical Docker daemon header payload.
     let mut raw = Vec::with_capacity(1024);
 
@@ -99,9 +132,11 @@ fn read_response_headers(reader: &mut impl BufRead) -> Option<ParsedHeaders> {
     // newline-free stream cannot be buffered without bound.
     loop {
         let start = raw.len();
-        let budget = MAX_HEADER_SIZE.checked_sub(start)?;
-        if read_line_bounded(reader, &mut raw, budget)? == 0 {
-            return None;
+        let budget = MAX_HEADER_SIZE
+            .checked_sub(start)
+            .ok_or(ResponseError::Malformed(MALFORMED_HEADERS))?;
+        if read_line_bounded(reader, &mut raw, budget, MALFORMED_HEADERS)? == 0 {
+            return Err(ResponseError::Malformed(INCOMPLETE_RESPONSE));
         }
         let line = &raw[start..];
         if line == b"\r\n" || line == b"\n" {
@@ -112,15 +147,18 @@ fn read_response_headers(reader: &mut impl BufRead) -> Option<ParsedHeaders> {
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut response = httparse::Response::new(&mut headers_buf);
 
-    if response.parse(&raw).ok()?.is_partial() {
-        return None;
+    let parsed = response
+        .parse(&raw)
+        .map_err(|_| ResponseError::Malformed(MALFORMED_HEADERS))?;
+    if parsed.is_partial() {
+        return Err(ResponseError::Malformed(MALFORMED_HEADERS));
     }
 
     let status_code = response.code.unwrap_or(0);
     let status_ok = (200..300).contains(&status_code);
     let (content_length, transfer_encoding) = extract_header_metadata(response.headers);
 
-    Some(ParsedHeaders {
+    Ok(ParsedHeaders {
         status_ok,
         status_code,
         #[cfg(any(windows, test))]
@@ -130,16 +168,21 @@ fn read_response_headers(reader: &mut impl BufRead) -> Option<ParsedHeaders> {
     })
 }
 
-fn read_response_body(reader: &mut impl BufRead, headers: &ParsedHeaders) -> Option<String> {
+fn read_response_body(
+    reader: &mut impl BufRead,
+    headers: &ParsedHeaders,
+) -> Result<String, ResponseError> {
     let body = match headers.transfer_encoding {
         TransferEncoding::Identity => match headers.content_length {
             Some(content_length) => read_exact_body(reader, content_length)?,
             None => read_body_to_eof(reader)?,
         },
         TransferEncoding::Chunked => read_chunked_body(reader)?,
-        TransferEncoding::Unsupported => return None,
+        TransferEncoding::Unsupported => {
+            return Err(ResponseError::Malformed(UNSUPPORTED_ENCODING));
+        }
     };
-    String::from_utf8(body).ok()
+    String::from_utf8(body).map_err(|_| ResponseError::Malformed(BODY_NOT_UTF8))
 }
 
 /// Read exactly `content_length` body bytes.
@@ -148,85 +191,104 @@ fn read_response_body(reader: &mut impl BufRead, headers: &ParsedHeaders) -> Opt
 /// never sized from the header alone: it starts small and grows only as
 /// bytes are actually received, so a lying `Content-Length` cannot trigger
 /// a huge allocation.
-fn read_exact_body(reader: &mut impl BufRead, content_length: usize) -> Option<Vec<u8>> {
+fn read_exact_body(
+    reader: &mut impl BufRead,
+    content_length: usize,
+) -> Result<Vec<u8>, ResponseError> {
     if content_length > MAX_RESPONSE_BODY {
-        return None;
+        return Err(ResponseError::Malformed(BODY_TOO_LARGE));
     }
     let mut body = Vec::with_capacity(content_length.min(INITIAL_BODY_CAPACITY));
-    let limit = u64::try_from(content_length).ok()?;
-    let read = Read::take(&mut *reader, limit)
-        .read_to_end(&mut body)
-        .ok()?;
+    let limit =
+        u64::try_from(content_length).map_err(|_| ResponseError::Malformed(BODY_TOO_LARGE))?;
+    let read = Read::take(&mut *reader, limit).read_to_end(&mut body)?;
     // A short read means the daemon closed the connection mid-body.
-    (read == content_length).then_some(body)
+    if read == content_length {
+        Ok(body)
+    } else {
+        Err(ResponseError::Malformed(INCOMPLETE_RESPONSE))
+    }
 }
 
 /// Read the body until EOF, failing if it exceeds [`MAX_RESPONSE_BODY`].
-fn read_body_to_eof(reader: &mut impl BufRead) -> Option<Vec<u8>> {
+fn read_body_to_eof(reader: &mut impl BufRead) -> Result<Vec<u8>, ResponseError> {
     // Allow one byte past the cap so an oversize body is detectable.
-    let limit = u64::try_from(MAX_RESPONSE_BODY.checked_add(1)?).ok()?;
+    let limit = MAX_RESPONSE_BODY
+        .checked_add(1)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .ok_or(ResponseError::Malformed(BODY_TOO_LARGE))?;
     let mut body = Vec::new();
-    Read::take(&mut *reader, limit)
-        .read_to_end(&mut body)
-        .ok()?;
-    (body.len() <= MAX_RESPONSE_BODY).then_some(body)
+    Read::take(&mut *reader, limit).read_to_end(&mut body)?;
+    if body.len() <= MAX_RESPONSE_BODY {
+        Ok(body)
+    } else {
+        Err(ResponseError::Malformed(BODY_TOO_LARGE))
+    }
 }
 
 /// Append one `\n`-terminated line from `reader` to `buf`, reading at most
 /// `max_len` bytes.
 ///
-/// Returns the number of bytes appended (`0` at EOF), or `None` on an I/O
-/// error or when the line does not terminate within `max_len` bytes.
+/// Returns the number of bytes appended (`0` at EOF). Fails on an I/O error,
+/// or with `overlong` when the line does not terminate within `max_len`
+/// bytes.
 fn read_line_bounded(
     reader: &mut impl BufRead,
     buf: &mut Vec<u8>,
     max_len: usize,
-) -> Option<usize> {
+    overlong: &'static str,
+) -> Result<usize, ResponseError> {
     // Allow one byte past the budget so an overlong line is detectable.
-    let limit = u64::try_from(max_len.checked_add(1)?).ok()?;
-    let read = Read::take(&mut *reader, limit)
-        .read_until(b'\n', buf)
-        .ok()?;
-    (read <= max_len).then_some(read)
+    let limit = max_len
+        .checked_add(1)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .ok_or(ResponseError::Malformed(overlong))?;
+    let read = Read::take(&mut *reader, limit).read_until(b'\n', buf)?;
+    if read <= max_len {
+        Ok(read)
+    } else {
+        Err(ResponseError::Malformed(overlong))
+    }
 }
 
-fn read_chunked_body(reader: &mut impl BufRead) -> Option<Vec<u8>> {
+fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, ResponseError> {
     let mut body = Vec::new();
     let mut size_line = Vec::with_capacity(16);
 
     loop {
         size_line.clear();
-        if read_line_bounded(reader, &mut size_line, MAX_CHUNK_LINE)? == 0 {
-            return None;
+        if read_line_bounded(reader, &mut size_line, MAX_CHUNK_LINE, MALFORMED_CHUNKS)? == 0 {
+            return Err(ResponseError::Malformed(INCOMPLETE_RESPONSE));
         }
 
-        let chunk_size = parse_streaming_chunk_size(&size_line)?;
+        let chunk_size = parse_streaming_chunk_size(&size_line)
+            .ok_or(ResponseError::Malformed(MALFORMED_CHUNKS))?;
         if chunk_size == 0 {
             consume_chunked_trailers(reader);
-            return Some(body);
+            return Ok(body);
         }
 
         // Enforce the cap on the cumulative decoded body. `checked_add`
         // guards against chunk sizes near `usize::MAX`.
-        let expected_len = body.len().checked_add(chunk_size)?;
-        if expected_len > MAX_RESPONSE_BODY {
-            return None;
-        }
+        let expected_len = body
+            .len()
+            .checked_add(chunk_size)
+            .filter(|len| *len <= MAX_RESPONSE_BODY)
+            .ok_or(ResponseError::Malformed(BODY_TOO_LARGE))?;
 
         // Grow the buffer as bytes arrive instead of pre-sizing it from
         // the untrusted chunk header.
-        let limit = u64::try_from(chunk_size).ok()?;
-        Read::take(&mut *reader, limit)
-            .read_to_end(&mut body)
-            .ok()?;
+        let limit =
+            u64::try_from(chunk_size).map_err(|_| ResponseError::Malformed(BODY_TOO_LARGE))?;
+        Read::take(&mut *reader, limit).read_to_end(&mut body)?;
         if body.len() != expected_len {
-            return None;
+            return Err(ResponseError::Malformed(INCOMPLETE_RESPONSE));
         }
 
         let mut chunk_terminator = [0_u8; 2];
-        reader.read_exact(&mut chunk_terminator).ok()?;
+        reader.read_exact(&mut chunk_terminator)?;
         if chunk_terminator != *b"\r\n" {
-            return None;
+            return Err(ResponseError::Malformed(MALFORMED_CHUNKS));
         }
     }
 }
@@ -249,7 +311,9 @@ fn consume_chunked_trailers(reader: &mut impl BufRead) {
         trailer_line.clear();
         // EOF, an I/O error, or an oversized trailer section after the
         // terminal chunk all end consumption: the body is already complete.
-        let Some(bytes_read) = read_line_bounded(reader, &mut trailer_line, budget) else {
+        let Ok(bytes_read) =
+            read_line_bounded(reader, &mut trailer_line, budget, MALFORMED_HEADERS)
+        else {
             return;
         };
         if bytes_read == 0 || trailer_line.trim_ascii().is_empty() {
@@ -300,7 +364,7 @@ pub fn send_http_status_request(
     let mut reader = BufReader::new(stream);
     read_response_headers(&mut reader)
         .map(|headers| headers.status_code)
-        .ok_or(StatusFailure::NoReply)
+        .map_err(|_| StatusFailure::NoReply)
 }
 
 /// Send an HTTP POST request and return the response status code.
@@ -369,7 +433,7 @@ pub fn response_header_state(response: &[u8]) -> HeaderState {
 ///
 /// Returns `None` if the header/body boundary (`\r\n\r\n`) has not yet
 /// been received or the headers are invalid (see [`response_header_state`]).
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub fn parse_response_headers(response: &[u8]) -> Option<ParsedHeaders> {
     match response_header_state(response) {
         HeaderState::Complete(headers) => Some(headers),
@@ -380,17 +444,28 @@ pub fn parse_response_headers(response: &[u8]) -> Option<ParsedHeaders> {
 /// Extract the body from a fully received (EOF) response, using
 /// pre-parsed headers if available, or falling back to a full parse.
 #[cfg(any(windows, test))]
-pub fn extract_body_at_eof(response: &[u8], headers: Option<&ParsedHeaders>) -> Option<String> {
-    if let Some(hdr) = headers {
-        return extract_http_body_from_buffer(response, hdr, true)
-            .ok()
-            .flatten();
-    }
-    // Headers not yet parsed at EOF: fall back to a full single-pass parse.
-    try_extract_http_body(response, true)
+pub fn extract_body_at_eof(
+    response: &[u8],
+    headers: Option<&ParsedHeaders>,
+) -> Result<String, ResponseError> {
+    let parsed;
+    let headers = match headers {
+        Some(headers) => headers,
+        // Headers not yet parsed at EOF: fall back to a full single-pass parse.
+        None => match response_header_state(response) {
+            HeaderState::Complete(headers) => {
+                parsed = headers;
+                &parsed
+            }
+            HeaderState::Pending => return Err(ResponseError::Malformed(INCOMPLETE_RESPONSE)),
+            HeaderState::Invalid => return Err(ResponseError::Malformed(MALFORMED_HEADERS)),
+        },
+    };
+    extract_http_body_from_buffer(response, headers, true)?
+        .ok_or(ResponseError::Malformed(INCOMPLETE_RESPONSE))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub fn try_extract_http_body(response: &[u8], eof: bool) -> Option<String> {
     let hdr = parse_response_headers(response)?;
     extract_http_body_from_buffer(response, &hdr, eof)
@@ -398,54 +473,69 @@ pub fn try_extract_http_body(response: &[u8], eof: bool) -> Option<String> {
         .flatten()
 }
 
+/// Extract the body buffered so far: `Ok(None)` while more bytes are
+/// needed, `Ok(Some(body))` once it is complete.
 #[cfg(any(windows, test))]
 pub fn extract_http_body_from_buffer(
     response: &[u8],
     headers: &ParsedHeaders,
     eof: bool,
-) -> Result<Option<String>, ()> {
+) -> Result<Option<String>, ResponseError> {
     if !headers.status_ok {
-        return Err(());
+        return Err(ResponseError::Status(headers.status_code));
     }
 
-    let body = response.get(headers.body_offset..).ok_or(())?;
-    match headers.transfer_encoding {
-        TransferEncoding::Identity => {
-            if let Some(content_length) = headers.content_length {
-                if content_length > MAX_RESPONSE_BODY {
-                    return Err(());
-                }
-                if body.len() < content_length {
-                    return Ok(None);
-                }
-                return String::from_utf8(body[..content_length].to_vec())
-                    .map(Some)
-                    .map_err(|_| ());
-            }
-
-            // Without a length, the body runs to EOF. Fail as soon as the
-            // buffered bytes exceed the cap so the caller stops reading.
-            if body.len() > MAX_RESPONSE_BODY {
-                return Err(());
-            }
-
-            if eof {
-                return String::from_utf8(body.to_vec()).map(Some).map_err(|_| ());
-            }
-
-            Ok(None)
-        }
-        TransferEncoding::Chunked => match decode_chunked_body(body, eof) {
-            Ok(Some(decoded)) => String::from_utf8(decoded).map(Some).map_err(|_| ()),
-            Ok(None) => Ok(None),
-            Err(()) => Err(()),
+    let body = response
+        .get(headers.body_offset..)
+        .ok_or(ResponseError::Malformed(MALFORMED_HEADERS))?;
+    let decoded = match headers.transfer_encoding {
+        TransferEncoding::Identity => match identity_body(body, headers.content_length, eof)? {
+            Some(body) => body.to_vec(),
+            None => return Ok(None),
         },
-        TransferEncoding::Unsupported => Err(()),
+        TransferEncoding::Chunked => match decode_chunked_body(body, eof)? {
+            Some(decoded) => decoded,
+            None => return Ok(None),
+        },
+        TransferEncoding::Unsupported => {
+            return Err(ResponseError::Malformed(UNSUPPORTED_ENCODING));
+        }
+    };
+    String::from_utf8(decoded)
+        .map(Some)
+        .map_err(|_| ResponseError::Malformed(BODY_NOT_UTF8))
+}
+
+/// The complete identity-encoded body in `body`, or `None` while more bytes
+/// are needed.
+#[cfg(any(windows, test))]
+fn identity_body(
+    body: &[u8],
+    content_length: Option<usize>,
+    eof: bool,
+) -> Result<Option<&[u8]>, ResponseError> {
+    if let Some(content_length) = content_length {
+        if content_length > MAX_RESPONSE_BODY {
+            return Err(ResponseError::Malformed(BODY_TOO_LARGE));
+        }
+        return Ok(body.get(..content_length));
     }
+
+    // Without a length, the body runs to EOF. Fail as soon as the buffered
+    // bytes exceed the cap so the caller stops reading.
+    if body.len() > MAX_RESPONSE_BODY {
+        return Err(ResponseError::Malformed(BODY_TOO_LARGE));
+    }
+    Ok(eof.then_some(body))
 }
 
 #[cfg(any(windows, test))]
-fn decode_chunked_body(body: &[u8], eof: bool) -> Result<Option<Vec<u8>>, ()> {
+fn decode_chunked_body(body: &[u8], eof: bool) -> Result<Option<Vec<u8>>, ResponseError> {
+    decode_chunked_frames(body, eof).map_err(|()| ResponseError::Malformed(MALFORMED_CHUNKS))
+}
+
+#[cfg(any(windows, test))]
+fn decode_chunked_frames(body: &[u8], eof: bool) -> Result<Option<Vec<u8>>, ()> {
     let mut decoded = Vec::new();
     let mut offset = 0;
 
@@ -645,7 +735,7 @@ mod tests {
         let mut stream = MockDaemonStream {
             reader: std::io::Cursor::new(response_data.to_vec()),
         };
-        let body = send_http_request(&mut stream);
+        let body = send_http_request(&mut stream).ok();
         assert_eq!(
             body.as_deref(),
             Some("[]"),
@@ -696,7 +786,7 @@ mod tests {
     fn extract_body_at_eof_returns_body_without_content_length() {
         let response = b"HTTP/1.0 200 OK\r\nServer: docker\r\n\r\n[1,2]";
         let hdr = parse_response_headers(response).unwrap();
-        let body = extract_body_at_eof(response, Some(&hdr));
+        let body = extract_body_at_eof(response, Some(&hdr)).ok();
         assert_eq!(body.as_deref(), Some("[1,2]"));
     }
 
@@ -722,7 +812,52 @@ mod tests {
     }
 
     fn stream_response(reader: impl Read) -> Option<String> {
-        send_http_request(&mut MockStream { reader })
+        send_http_request(&mut MockStream { reader }).ok()
+    }
+
+    #[test]
+    fn streaming_reports_non_2xx_status() {
+        let result = send_http_request(&mut MockStream {
+            reader: &b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n"[..],
+        });
+        assert!(
+            matches!(result, Err(ResponseError::Status(403))),
+            "a non-2xx reply reports its status, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_reports_malformed_and_truncated_replies() {
+        let garbage = send_http_request(&mut MockStream {
+            reader: &b"NOT-HTTP garbage\r\n\r\n"[..],
+        });
+        assert!(
+            matches!(garbage, Err(ResponseError::Malformed(MALFORMED_HEADERS))),
+            "got {garbage:?}"
+        );
+        let truncated = send_http_request(&mut MockStream {
+            reader: &b"HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\n[]"[..],
+        });
+        assert!(
+            matches!(
+                truncated,
+                Err(ResponseError::Malformed(INCOMPLETE_RESPONSE))
+            ),
+            "got {truncated:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_reports_io_errors() {
+        let mut stream = FailingStream {
+            write_error: None,
+            read_error: std::io::ErrorKind::TimedOut,
+        };
+        let result = send_http_request(&mut stream);
+        assert!(
+            matches!(&result, Err(ResponseError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -817,11 +952,8 @@ mod tests {
     fn buffered_rejects_content_length_above_cap() {
         let response = b"HTTP/1.0 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n[]";
         let hdr = parse_response_headers(response).expect("headers should parse");
-        assert_eq!(
-            extract_http_body_from_buffer(response, &hdr, false),
-            Err(())
-        );
-        assert!(extract_body_at_eof(response, Some(&hdr)).is_none());
+        assert!(extract_http_body_from_buffer(response, &hdr, false).is_err());
+        assert!(extract_body_at_eof(response, Some(&hdr)).is_err());
     }
 
     #[test]
@@ -829,10 +961,7 @@ mod tests {
         let response =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\nffffffffffffffff\r\n";
         let hdr = parse_response_headers(response).expect("headers should parse");
-        assert_eq!(
-            extract_http_body_from_buffer(response, &hdr, false),
-            Err(())
-        );
+        assert!(extract_http_body_from_buffer(response, &hdr, false).is_err());
     }
 
     #[test]
@@ -842,10 +971,7 @@ mod tests {
             MAX_RESPONSE_BODY - 1
         );
         let hdr = parse_response_headers(response.as_bytes()).expect("headers should parse");
-        assert_eq!(
-            extract_http_body_from_buffer(response.as_bytes(), &hdr, false),
-            Err(())
-        );
+        assert!(extract_http_body_from_buffer(response.as_bytes(), &hdr, false).is_err());
     }
 
     #[test]
@@ -853,16 +979,13 @@ mod tests {
         let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         response.resize(response.len() + MAX_CHUNK_LINE + 1, b'0');
         let hdr = parse_response_headers(&response).expect("headers should parse");
-        assert_eq!(
-            extract_http_body_from_buffer(&response, &hdr, false),
-            Err(())
-        );
+        assert!(extract_http_body_from_buffer(&response, &hdr, false).is_err());
     }
 
     #[test]
     fn extract_body_at_eof_falls_back_when_no_headers_parsed() {
         let response = b"HTTP/1.0 200 OK\r\n\r\nhello";
-        let body = extract_body_at_eof(response, None);
+        let body = extract_body_at_eof(response, None).ok();
         assert_eq!(body.as_deref(), Some("hello"));
     }
 

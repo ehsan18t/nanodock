@@ -11,11 +11,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
 - `PublishedContainerMatch::container` returns the matched container, if any.
+- `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout`, `HttpStatus(u16)`, `InvalidResponse(ParseError)`, and `Io(std::io::Error)`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
 
 ### Changed
 
 - **Breaking:** `ContainerInfo` is `#[non_exhaustive]`. Its fields stay public for reading, but code outside the crate can no longer build it with a struct literal; use `ContainerInfo::new` instead.
 - **Breaking:** `ContainerPortMap` is a struct instead of a `HashMap` type alias. It offers `new`, `len`, `is_empty`, `get(host_ip, port, proto)`, `insert(host_ip, port, proto, info)`, `iter`, `lookup`, `Default`, `FromIterator`, and `Extend`, and `&ContainerPortMap` iterates as `((host_ip, port, proto), &ContainerInfo)`. Every binding of one container shares a single `Arc<ContainerInfo>`, so a container that publishes a large port range is no longer cloned once per port.
+- **Breaking:** `Error::InvalidJson(serde_json::Error)` is replaced by `Error::InvalidResponse(ParseError)`, and `From<serde_json::Error> for Error` is removed. `ParseError` is an opaque error type, so no `serde_json` type is part of the public API any more.
+- **Breaking:** `parse_containers_json_strict` returns `Result<ContainerPortMap, ParseError>` instead of `Result<_, serde_json::Error>`.
+- **Breaking:** `Error::DaemonNotFound` now means that no daemon listens on any known endpoint. Failures that were reported as `DaemonNotFound` before (permission denied, timeout, an error status, a malformed reply) now have their own variants.
+- `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
 
 ### Removed
 

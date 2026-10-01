@@ -68,32 +68,83 @@ pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
 
 // ── Error type ───────────────────────────────────────────────────────
 
-/// Error returned by [`detect_containers`] when the daemon cannot be
-/// reached or returns an unusable response.
+/// Why container detection failed.
+///
+/// Detection queries every known daemon endpoint at once. It fails only
+/// when none of them produced a container list, and then reports the most
+/// informative of their failures: a daemon that answered badly
+/// ([`InvalidResponse`](Self::InvalidResponse),
+/// [`HttpStatus`](Self::HttpStatus)) beats one that refused the connection
+/// ([`PermissionDenied`](Self::PermissionDenied)), which beats one that was
+/// too slow ([`Timeout`](Self::Timeout)) or failed with another I/O error
+/// ([`Io`](Self::Io)), which beats finding no daemon at all
+/// ([`DaemonNotFound`](Self::DaemonNotFound)).
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
-    /// No container runtime daemon was reachable on any known transport
-    /// (Unix sockets, Windows named pipes, or TCP via `DOCKER_HOST`).
+    /// No container runtime daemon is listening on any known endpoint: no
+    /// socket or named pipe exists, or every connection was refused.
     DaemonNotFound,
 
-    /// A daemon transport connected but the response body was not valid
-    /// JSON for the container-list endpoint.
-    InvalidJson(serde_json::Error),
+    /// A daemon endpoint exists but the current user may not connect to it.
+    ///
+    /// On Linux this usually means the user is not in the `docker` group
+    /// (or the socket belongs to another user).
+    PermissionDenied {
+        /// The endpoint that refused access, such as
+        /// `/var/run/docker.sock`, `\\.\pipe\docker_engine`, or
+        /// `tcp://host:port`.
+        endpoint: String,
+    },
+
+    /// No daemon finished answering within the detection timeout.
+    Timeout,
+
+    /// A daemon answered with this unexpected (non-2xx) HTTP status.
+    HttpStatus(u16),
+
+    /// A daemon answered, but the reply was not a valid HTTP response or
+    /// container list.
+    InvalidResponse(ParseError),
+
+    /// Another I/O error occurred while talking to the daemon.
+    Io(std::io::Error),
+}
+
+impl Error {
+    /// How much the error tells the caller; when every endpoint fails,
+    /// detection reports the error that ranks highest.
+    const fn informativeness(&self) -> u8 {
+        match self {
+            Self::DaemonNotFound => 0,
+            Self::Io(_) => 1,
+            Self::Timeout => 2,
+            Self::PermissionDenied { .. } => 3,
+            Self::HttpStatus(_) => 4,
+            Self::InvalidResponse(_) => 5,
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DaemonNotFound => {
-                write!(
-                    f,
-                    "no container runtime daemon found on any known transport"
-                )
+                f.write_str("no container runtime daemon found on any known endpoint")
             }
-            Self::InvalidJson(source) => {
-                write!(f, "container daemon returned invalid JSON: {source}")
+            Self::PermissionDenied { endpoint } => write!(
+                f,
+                "permission denied connecting to the container runtime at {endpoint}"
+            ),
+            Self::Timeout => f.write_str("the container runtime daemon did not answer in time"),
+            Self::HttpStatus(status) => write!(
+                f,
+                "the container runtime daemon answered with HTTP status {status}"
+            ),
+            Self::InvalidResponse(_) => {
+                f.write_str("the container runtime daemon sent an invalid response")
             }
+            Self::Io(_) => f.write_str("I/O error talking to the container runtime daemon"),
         }
     }
 }
@@ -101,17 +152,73 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::DaemonNotFound => None,
-            Self::InvalidJson(source) => Some(source),
+            Self::InvalidResponse(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::DaemonNotFound
+            | Self::PermissionDenied { .. }
+            | Self::Timeout
+            | Self::HttpStatus(_) => None,
         }
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        Self::InvalidJson(err)
+impl From<ParseError> for Error {
+    fn from(error: ParseError) -> Self {
+        Self::InvalidResponse(error)
     }
 }
+
+/// Pick the most informative of several endpoint failures, keeping the
+/// earliest (highest priority) one on a tie.
+fn most_informative(errors: impl IntoIterator<Item = Error>) -> Error {
+    let mut best: Option<Error> = None;
+    for error in errors {
+        if best
+            .as_ref()
+            .is_none_or(|best| error.informativeness() > best.informativeness())
+        {
+            best = Some(error);
+        }
+    }
+    best.unwrap_or(Error::DaemonNotFound)
+}
+
+/// A daemon reply that could not be parsed: malformed HTTP framing or a
+/// container list that is not valid JSON.
+///
+/// The type is opaque so the JSON parser behind it stays an implementation
+/// detail; its [`Display`](std::fmt::Display) output describes the problem.
+#[derive(Debug)]
+pub struct ParseError(ParseErrorKind);
+
+#[derive(Debug)]
+enum ParseErrorKind {
+    Json(serde_json::Error),
+    Http(&'static str),
+}
+
+impl ParseError {
+    /// The container list is not valid JSON.
+    const fn json(error: serde_json::Error) -> Self {
+        Self(ParseErrorKind::Json(error))
+    }
+
+    /// The HTTP reply is malformed.
+    const fn http(reason: &'static str) -> Self {
+        Self(ParseErrorKind::Http(reason))
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            ParseErrorKind::Json(error) => write!(f, "invalid container list JSON: {error}"),
+            ParseErrorKind::Http(reason) => write!(f, "malformed HTTP response: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 // ── Protocol ─────────────────────────────────────────────────────────
 
@@ -508,23 +615,25 @@ pub struct DetectionHandle(std::sync::mpsc::Receiver<Option<ContainerPortMap>>);
 /// budget. A `DOCKER_HOST` `tcp://` daemon is queried alongside the local
 /// Unix sockets or Windows named pipes and is used on its own when it
 /// answers; otherwise the containers of all answering local daemons are
-/// merged. Returns an error if no daemon could be
-/// reached or if the response could not be parsed.
+/// merged. Returns an error if no daemon produced a container list or if
+/// the list could not be parsed.
 ///
 /// Unlike [`start_detection`] / [`await_detection`], this function
 /// blocks the calling thread and surfaces errors so the caller can
 /// distinguish "no containers running" (empty map) from "daemon
-/// unreachable" ([`Error::DaemonNotFound`]).
+/// unreachable" ([`Error::DaemonNotFound`]) or "not allowed"
+/// ([`Error::PermissionDenied`]).
 ///
 /// # Errors
 ///
-/// Returns [`Error::DaemonNotFound`] when no transport connected.
-/// Returns [`Error::InvalidJson`] when the daemon responded but the
-/// body was not valid container-list JSON.
+/// Fails only when no endpoint produced a container list, with the most
+/// informative endpoint failure (see [`Error`]), or with
+/// [`Error::InvalidResponse`] when the merged list is not valid JSON.
 pub fn detect_containers(home: Option<PathBuf>) -> Result<ContainerPortMap, Error> {
     debug!("starting synchronous container runtime detection");
-    let body = query_daemon_body(home).ok_or(Error::DaemonNotFound)?;
-    let map = api::parse_containers_json_strict(&body).map_err(Error::InvalidJson)?;
+    let bodies = query_daemon_bodies(home)?;
+    let body = merge_prioritized_bodies(&bodies).ok_or(Error::DaemonNotFound)?;
+    let map = api::parse_containers_json_strict(&body)?;
     debug!(
         "finished synchronous container runtime detection: port_mappings={}",
         map.len()
@@ -547,12 +656,15 @@ pub fn start_detection(home: Option<PathBuf>) -> DetectionHandle {
     debug!("starting container runtime detection");
     std::thread::spawn(move || {
         let result = query_daemon(home);
-        debug!(
-            "finished container runtime detection: port_mappings={}",
-            result.as_ref().map_or(0, ContainerPortMap::len)
-        );
+        match &result {
+            Ok(map) => debug!(
+                "finished container runtime detection: port_mappings={}",
+                map.len()
+            ),
+            Err(error) => debug!("container runtime detection failed: {error}"),
+        }
         // Ignore send error: receiver may have timed out and been dropped.
-        drop(tx.send(result));
+        drop(tx.send(result.ok()));
     });
     DetectionHandle(rx)
 }
@@ -768,13 +880,28 @@ enum DaemonEndpoint {
 
 impl DaemonEndpoint {
     /// Fetch the container list JSON body before `deadline`.
-    fn fetch_json(&self, deadline: Instant) -> Option<String> {
-        match self {
+    fn fetch_json(&self, deadline: Instant) -> Result<String, Error> {
+        let result = match self {
             Self::Tcp(addr) => ipc::fetch_tcp_json(addr, deadline),
             #[cfg(unix)]
             Self::Unix(path) => ipc::fetch_unix_socket_json(path, deadline),
             #[cfg(windows)]
             Self::Pipe(path) => ipc::fetch_named_pipe_json(path, deadline),
+        };
+        result.map_err(|error| self.error(error))
+    }
+
+    /// Turn a transport failure at this endpoint into a public [`Error`].
+    fn error(&self, error: ipc::FetchError) -> Error {
+        match error {
+            ipc::FetchError::NotFound => Error::DaemonNotFound,
+            ipc::FetchError::PermissionDenied => Error::PermissionDenied {
+                endpoint: self.to_string(),
+            },
+            ipc::FetchError::Timeout => Error::Timeout,
+            ipc::FetchError::Status(status) => Error::HttpStatus(status),
+            ipc::FetchError::Malformed(reason) => Error::InvalidResponse(ParseError::http(reason)),
+            ipc::FetchError::Io(error) => Error::Io(error),
         }
     }
 
@@ -786,6 +913,18 @@ impl DaemonEndpoint {
             Self::Unix(path) => ipc::stop_via_unix_socket(path, endpoint),
             #[cfg(windows)]
             Self::Pipe(path) => ipc::stop_via_named_pipe(path, endpoint),
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "tcp://{addr}"),
+            #[cfg(unix)]
+            Self::Unix(path) => write!(f, "{}", path.display()),
+            #[cfg(windows)]
+            Self::Pipe(path) => f.write_str(path),
         }
     }
 }
@@ -891,7 +1030,7 @@ fn prioritized_targets<P>(
 
 /// Query every detection target concurrently and keep the bodies to use,
 /// highest priority first.
-fn query_daemon_bodies(home: Option<PathBuf>) -> Vec<String> {
+fn query_daemon_bodies(home: Option<PathBuf>) -> Result<Vec<String>, Error> {
     collect_daemon_bodies(
         detection_targets(home),
         DaemonEndpoint::fetch_json,
@@ -903,20 +1042,46 @@ fn query_daemon_bodies(home: Option<PathBuf>) -> Vec<String> {
 /// `deadline`, then pick the bodies to use with [`select_daemon_bodies`].
 ///
 /// `targets` must be in priority order. Each response is tagged with its
-/// target index, so the result does not depend on arrival order.
-fn collect_daemon_bodies<P, F>(targets: Vec<(bool, P)>, fetch: F, deadline: Instant) -> Vec<String>
+/// target index, so the result does not depend on arrival order. When no
+/// target produced a body, the most informative failure is returned; a
+/// target still running at the deadline counts as [`Error::Timeout`].
+fn collect_daemon_bodies<P, F>(
+    targets: Vec<(bool, P)>,
+    fetch: F,
+    deadline: Instant,
+) -> Result<Vec<String>, Error>
 where
     P: Send + 'static,
-    F: Fn(&P, Instant) -> Option<String> + Send + Sync + 'static,
+    F: Fn(&P, Instant) -> Result<String, Error> + Send + Sync + 'static,
 {
-    let responses = ipc::fetch_all_successes(
+    let fan_out = ipc::fetch_all(
         targets.into_iter().enumerate(),
         move |(priority, (from_docker_host, target))| {
-            fetch(&target, deadline).map(|body| (priority, from_docker_host, body))
+            (priority, from_docker_host, fetch(&target, deadline))
         },
         deadline,
     );
-    select_daemon_bodies(responses)
+
+    let mut responses = Vec::new();
+    let mut failures = Vec::new();
+    for (priority, from_docker_host, result) in fan_out.results {
+        match result {
+            Ok(body) => responses.push((priority, from_docker_host, body)),
+            Err(error) => failures.push((priority, error)),
+        }
+    }
+
+    if responses.is_empty() {
+        failures.sort_by_key(|(priority, _)| *priority);
+        let timed_out = (fan_out.unfinished > 0).then_some(Error::Timeout);
+        return Err(most_informative(
+            failures
+                .into_iter()
+                .map(|(_, error)| error)
+                .chain(timed_out),
+        ));
+    }
+    Ok(select_daemon_bodies(responses))
 }
 
 /// Pick the bodies to use from daemon responses tagged with their target
@@ -957,12 +1122,8 @@ fn merge_prioritized_responses(bodies: &[String]) -> Option<ContainerPortMap> {
     merge_daemon_responses(bodies.iter().rev())
 }
 
-fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
-    merge_prioritized_bodies(&query_daemon_bodies(home))
-}
-
-fn query_daemon(home: Option<PathBuf>) -> Option<ContainerPortMap> {
-    merge_prioritized_responses(&query_daemon_bodies(home))
+fn query_daemon(home: Option<PathBuf>) -> Result<ContainerPortMap, Error> {
+    merge_prioritized_responses(&query_daemon_bodies(home)?).ok_or(Error::DaemonNotFound)
 }
 
 fn merge_daemon_response_bodies<T, I>(responses: I) -> Option<String>
@@ -1734,22 +1895,166 @@ mod tests {
         );
     }
 
-    /// Stand-in detection target: a real TCP address or a canned local reply.
+    /// Stand-in detection target: a real TCP address, a canned local reply,
+    /// a canned failure, or an endpoint that never answers in time.
     enum FakeTarget {
         Tcp(String),
         Local(&'static str),
+        Fail(fn() -> Error),
         Hung,
     }
 
-    fn fetch_fake(target: &FakeTarget, deadline: Instant) -> Option<String> {
+    fn fetch_fake(target: &FakeTarget, deadline: Instant) -> Result<String, Error> {
         match target {
-            FakeTarget::Tcp(addr) => ipc::fetch_tcp_json(addr, deadline),
-            FakeTarget::Local(body) => Some((*body).to_string()),
+            FakeTarget::Tcp(addr) => DaemonEndpoint::Tcp(addr.clone()).fetch_json(deadline),
+            FakeTarget::Local(body) => Ok((*body).to_string()),
+            FakeTarget::Fail(error) => Err(error()),
             FakeTarget::Hung => {
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                None
+                Err(Error::Timeout)
             }
         }
+    }
+
+    fn permission_denied() -> Error {
+        Error::PermissionDenied {
+            endpoint: "/var/run/docker.sock".to_string(),
+        }
+    }
+
+    #[test]
+    fn collect_daemon_bodies_reports_permission_denied_over_missing_daemons() {
+        let error = collect_daemon_bodies(
+            vec![
+                (false, FakeTarget::Fail(|| Error::DaemonNotFound)),
+                (false, FakeTarget::Fail(permission_denied)),
+                (false, FakeTarget::Fail(|| Error::DaemonNotFound)),
+            ],
+            fetch_fake,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect_err("no endpoint answered");
+
+        assert!(
+            matches!(&error, Error::PermissionDenied { endpoint } if endpoint == "/var/run/docker.sock"),
+            "the actionable failure wins, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn collect_daemon_bodies_reports_daemon_not_found_when_nothing_listens() {
+        let error = collect_daemon_bodies(
+            vec![
+                (true, FakeTarget::Fail(|| Error::DaemonNotFound)),
+                (false, FakeTarget::Fail(|| Error::DaemonNotFound)),
+            ],
+            fetch_fake,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect_err("no endpoint answered");
+        assert!(matches!(error, Error::DaemonNotFound), "got {error:?}");
+
+        let no_targets = collect_daemon_bodies(
+            Vec::<(bool, FakeTarget)>::new(),
+            fetch_fake,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect_err("there was nothing to query");
+        assert!(matches!(no_targets, Error::DaemonNotFound));
+    }
+
+    #[test]
+    fn collect_daemon_bodies_reports_timeout_for_unfinished_endpoints() {
+        let error = collect_daemon_bodies(
+            vec![
+                (false, FakeTarget::Fail(|| Error::DaemonNotFound)),
+                (false, FakeTarget::Hung),
+            ],
+            fetch_fake,
+            Instant::now() + std::time::Duration::from_millis(200),
+        )
+        .expect_err("no endpoint answered in time");
+        assert!(matches!(error, Error::Timeout), "got {error:?}");
+    }
+
+    #[test]
+    fn collect_daemon_bodies_ignores_failures_when_a_daemon_answers() {
+        let bodies = collect_daemon_bodies(
+            vec![
+                (false, FakeTarget::Fail(permission_denied)),
+                (false, FakeTarget::Local("[1]")),
+            ],
+            fetch_fake,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect("one daemon answered");
+        assert_eq!(bodies, vec!["[1]".to_string()]);
+    }
+
+    #[test]
+    fn most_informative_prefers_answers_and_keeps_priority_on_ties() {
+        let error = most_informative([
+            Error::DaemonNotFound,
+            Error::Timeout,
+            Error::HttpStatus(500),
+            permission_denied(),
+            Error::HttpStatus(503),
+        ]);
+        assert!(
+            matches!(error, Error::HttpStatus(500)),
+            "a daemon that answered beats one that refused, and the first answer wins a tie, got {error:?}"
+        );
+        assert!(matches!(
+            most_informative(std::iter::empty()),
+            Error::DaemonNotFound
+        ));
+    }
+
+    #[test]
+    fn errors_describe_what_happened_and_chain_their_source() {
+        use std::error::Error as _;
+
+        assert_eq!(
+            permission_denied().to_string(),
+            "permission denied connecting to the container runtime at /var/run/docker.sock"
+        );
+        assert_eq!(
+            Error::HttpStatus(500).to_string(),
+            "the container runtime daemon answered with HTTP status 500"
+        );
+
+        let json_error = api::parse_containers_json_strict("not json").expect_err("invalid JSON");
+        assert!(
+            json_error
+                .to_string()
+                .starts_with("invalid container list JSON"),
+            "got {json_error}"
+        );
+        let error = Error::from(json_error);
+        assert!(
+            error.source().is_some(),
+            "an invalid response chains the parse error"
+        );
+        assert!(
+            Error::Io(std::io::ErrorKind::ConnectionReset.into())
+                .source()
+                .is_some()
+        );
+        assert!(Error::Timeout.source().is_none());
+    }
+
+    #[test]
+    fn endpoint_permission_failure_names_the_endpoint() {
+        let endpoint = DaemonEndpoint::Tcp("127.0.0.1:2375".to_string());
+        let error = endpoint.error(ipc::FetchError::PermissionDenied);
+        assert!(
+            matches!(&error, Error::PermissionDenied { endpoint } if endpoint == "tcp://127.0.0.1:2375"),
+            "got {error:?}"
+        );
+        assert!(matches!(
+            endpoint.error(ipc::FetchError::Malformed("bad")),
+            Error::InvalidResponse(_)
+        ));
     }
 
     #[test]
@@ -1767,7 +2072,8 @@ mod tests {
             ],
             fetch_fake,
             started + std::time::Duration::from_millis(300),
-        );
+        )
+        .expect("the local daemons answered");
         let elapsed = started.elapsed();
         bodies.sort();
 
@@ -1789,7 +2095,8 @@ mod tests {
             vec![(true, FakeTarget::Hung), (false, FakeTarget::Local("[1]"))],
             fetch_fake,
             started + std::time::Duration::from_millis(200),
-        );
+        )
+        .expect("the local daemon answered");
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -1830,7 +2137,8 @@ mod tests {
             ],
             fetch_fake,
             Instant::now() + std::time::Duration::from_secs(5),
-        );
+        )
+        .expect("the TCP daemon answered");
         drop(server.join());
 
         assert_eq!(

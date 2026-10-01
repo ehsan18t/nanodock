@@ -208,7 +208,7 @@ nanodock communicates directly with the Docker/Podman daemon using the
 ### Transport Discovery Order
 
 1. **`DOCKER_HOST` environment variable** (or `Client::docker_host`) - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
-2. **Platform-native sockets** - On Linux, well-known Unix socket paths are probed (rootful Docker, rootless Docker, Podman). On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged.
+2. **Platform-native sockets** - On Linux and macOS, the well-known Unix socket paths below are checked (rootful and rootless Docker, Podman, Docker Desktop, Colima, OrbStack, Rancher Desktop, Lima, and Podman machine). Paths that do not exist are skipped before any connection is attempted, and paths that resolve to the same file (for example `/var/run/docker.sock` symlinked to another runtime's socket) are queried once, at the first position. On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged; when two daemons report the same port, the one earlier in this list wins.
 3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless
    Podman, nanodock reads the overlay storage metadata to resolve container
    names from network namespace paths. This handles the case where
@@ -217,17 +217,31 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Supported Daemon Paths
 
-| Platform | Transport   | Path                                 |
-| -------- | ----------- | ------------------------------------ |
-| Linux    | Unix socket | `/var/run/docker.sock`               |
-| Linux    | Unix socket | `/run/user/{uid}/docker.sock`        |
-| Linux    | Unix socket | `$HOME/.docker/desktop/docker.sock`  |
-| Linux    | Unix socket | `$HOME/.docker/run/docker.sock`      |
-| Linux    | Unix socket | `/run/user/{uid}/podman/podman.sock` |
-| Linux    | Unix socket | `/run/podman/podman.sock`            |
-| Windows  | Named pipe  | `\\.\pipe\docker_engine`             |
-| Windows  | Named pipe  | `\\.\pipe\podman-machine-default`    |
-| Both     | TCP         | `DOCKER_HOST=tcp://host:port`        |
+Unix sockets in priority order. `$XDG_RUNTIME_DIR` and `$TMPDIR` are used only when set to an absolute path, and a `$XDG_RUNTIME_DIR` entry equal to its `/run/user/{uid}` fallback is listed once.
+
+| Platform | Transport   | Path                                                                              | Runtime                                 |
+| -------- | ----------- | --------------------------------------------------------------------------------- | --------------------------------------- |
+| Unix     | Unix socket | `/var/run/docker.sock`                                                            | Rootful Docker (or a runtime's symlink) |
+| Unix     | Unix socket | `$XDG_RUNTIME_DIR/docker.sock`                                                    | Rootless Docker                         |
+| Unix     | Unix socket | `/run/user/{uid}/docker.sock`                                                     | Rootless Docker                         |
+| Unix     | Unix socket | `$XDG_RUNTIME_DIR/podman/podman.sock`                                             | Rootless Podman                         |
+| Unix     | Unix socket | `/run/user/{uid}/podman/podman.sock`                                              | Rootless Podman                         |
+| Unix     | Unix socket | `/run/podman/podman.sock`                                                         | Rootful Podman                          |
+| Unix     | Unix socket | `$HOME/.docker/desktop/docker.sock`                                               | Docker Desktop for Linux                |
+| Unix     | Unix socket | `$HOME/.docker/run/docker.sock`                                                   | Docker Desktop for macOS                |
+| Unix     | Unix socket | `$HOME/.colima/default/docker.sock`                                               | Colima (0.4 and later)                  |
+| Unix     | Unix socket | `$HOME/.colima/docker.sock`                                                       | Colima (before 0.4)                     |
+| Unix     | Unix socket | `$HOME/.orbstack/run/docker.sock`                                                 | OrbStack                                |
+| Unix     | Unix socket | `$HOME/.rd/docker.sock`                                                           | Rancher Desktop (moby)                  |
+| Unix     | Unix socket | `$HOME/.lima/default/sock/docker.sock`                                            | Lima `default` instance                 |
+| Unix     | Unix socket | `$HOME/.lima/docker/sock/docker.sock`                                             | Lima `template://docker` instance       |
+| Unix     | Unix socket | `$HOME/.local/share/containers/podman/machine/podman.sock`                        | Podman machine (macOS, Podman 4)        |
+| Unix     | Unix socket | `$HOME/.local/share/containers/podman/machine/qemu/podman.sock`                   | Podman machine (macOS, Podman 4)        |
+| Unix     | Unix socket | `$HOME/.local/share/containers/podman/machine/podman-machine-default/podman.sock` | Podman machine (macOS, Podman 4)        |
+| Unix     | Unix socket | `$TMPDIR/podman/podman-machine-default-api.sock`                                  | Podman machine (macOS, Podman 5)        |
+| Windows  | Named pipe  | `\\.\pipe\docker_engine`                                                          | Docker Desktop                          |
+| Windows  | Named pipe  | `\\.\pipe\podman-machine-default`                                                 | Podman machine                          |
+| Both     | TCP         | `DOCKER_HOST=tcp://host:port`                                                     | Any                                     |
 
 ## API Reference
 

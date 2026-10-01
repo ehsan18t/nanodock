@@ -248,27 +248,149 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Unix socket transport
+// Unix socket discovery
 // ---------------------------------------------------------------------------
+//
+// The pure helpers below are also compiled for tests on every host, so the
+// candidate order and the existence and symlink filtering are tested on
+// Windows too. Only the Unix transport uses them at runtime.
 
-#[cfg(unix)]
-pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
-    let mut socket_paths = vec![
-        std::path::PathBuf::from("/var/run/docker.sock"),
-        std::path::PathBuf::from(format!("/run/user/{uid}/docker.sock")),
-        std::path::PathBuf::from(format!("/run/user/{uid}/podman/podman.sock")),
-        std::path::PathBuf::from("/run/podman/podman.sock"),
-    ];
+/// Well-known daemon sockets below the user's home directory, in priority
+/// order.
+#[cfg(any(unix, test))]
+const HOME_SOCKET_PATHS: &[&str] = &[
+    // Docker Desktop for Linux.
+    ".docker/desktop/docker.sock",
+    // Docker Desktop for macOS (4.13 and later).
+    ".docker/run/docker.sock",
+    // Colima default profile (0.4 and later), then its pre-0.4 location.
+    ".colima/default/docker.sock",
+    ".colima/docker.sock",
+    // OrbStack.
+    ".orbstack/run/docker.sock",
+    // Rancher Desktop with the moby engine.
+    ".rd/docker.sock",
+    // Lima: the `default` instance and the instance `template://docker` creates.
+    ".lima/default/sock/docker.sock",
+    ".lima/docker/sock/docker.sock",
+    // Podman machine API forwarding on macOS (Podman 4).
+    ".local/share/containers/podman/machine/podman.sock",
+    ".local/share/containers/podman/machine/qemu/podman.sock",
+    ".local/share/containers/podman/machine/podman-machine-default/podman.sock",
+];
 
+/// Podman machine API socket below `$TMPDIR` on macOS (Podman 5).
+#[cfg(any(unix, test))]
+const TMPDIR_SOCKET_PATH: &str = "podman/podman-machine-default-api.sock";
+
+/// Every default Unix socket candidate, in priority order, without duplicates.
+///
+/// A pure function of its inputs so the order can be tested without touching
+/// the process environment. `xdg_runtime_dir` (where rootless Docker and
+/// Podman put their sockets) is tried before the hardcoded `/run/user/{uid}`
+/// fallback; when the two are the same directory it is listed once.
+#[cfg(any(unix, test))]
+fn unix_socket_candidates(
+    uid: u32,
+    home: Option<std::path::PathBuf>,
+    xdg_runtime_dir: Option<&std::path::Path>,
+    tmpdir: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let user_runtime_dir = std::path::PathBuf::from(format!("/run/user/{uid}"));
+    let runtime_dirs: Vec<&std::path::Path> = xdg_runtime_dir
+        .into_iter()
+        .chain([user_runtime_dir.as_path()])
+        .collect();
+
+    let mut candidates = vec![std::path::PathBuf::from("/var/run/docker.sock")];
+    candidates.extend(runtime_dirs.iter().map(|dir| dir.join("docker.sock")));
+    candidates.extend(
+        runtime_dirs
+            .iter()
+            .map(|dir| dir.join("podman/podman.sock")),
+    );
+    candidates.push(std::path::PathBuf::from("/run/podman/podman.sock"));
     if let Some(home) = home {
-        socket_paths.extend([
-            home.join(".docker/desktop/docker.sock"),
-            home.join(".docker/run/docker.sock"),
-        ]);
+        candidates.extend(HOME_SOCKET_PATHS.iter().map(|path| home.join(path)));
+    }
+    if let Some(tmpdir) = tmpdir {
+        candidates.push(tmpdir.join(TMPDIR_SOCKET_PATH));
     }
 
-    socket_paths
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|path| seen.insert(path.clone()));
+    candidates
 }
+
+/// Keep the candidates whose file exists, in order, dropping any that resolve
+/// to the same file as an earlier one.
+///
+/// Checking up front means no worker thread is spawned for a socket that is
+/// not there. Comparing canonical paths means a socket reachable through
+/// several paths (for example `/var/run/docker.sock` symlinked to Docker
+/// Desktop's or Podman's socket) is queried once, at its highest-priority
+/// position. Dangling symlinks are skipped like missing files.
+#[cfg(any(unix, test))]
+fn existing_unique_sockets(candidates: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|path| match std::fs::canonicalize(path) {
+            Ok(resolved) => {
+                let first = seen.insert(resolved);
+                if !first {
+                    debug!(
+                        "skipping socket that resolves to an earlier candidate: {}",
+                        path.display()
+                    );
+                }
+                first
+            }
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    debug!(
+                        "skipping unusable socket candidate: path={} error={error}",
+                        path.display()
+                    );
+                }
+                false
+            }
+        })
+        .collect()
+}
+
+/// An absolute path from the environment variable `name`, if set.
+///
+/// Relative and empty values are ignored, as the XDG Base Directory
+/// specification requires for `XDG_RUNTIME_DIR`.
+#[cfg(unix)]
+fn absolute_env_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(name)
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// The default Unix daemon sockets that exist for this user, in priority
+/// order, each real socket listed once.
+///
+/// Reads `XDG_RUNTIME_DIR` and `TMPDIR` from the environment; see
+/// [`unix_socket_candidates`] for the order and [`existing_unique_sockets`]
+/// for the filtering.
+#[cfg(unix)]
+pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let xdg_runtime_dir = absolute_env_path("XDG_RUNTIME_DIR");
+    let tmpdir = absolute_env_path("TMPDIR");
+    existing_unique_sockets(unix_socket_candidates(
+        uid,
+        home,
+        xdg_runtime_dir.as_deref(),
+        tmpdir.as_deref(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Unix socket transport
+// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 pub fn fetch_unix_socket_json(
@@ -964,13 +1086,11 @@ fn ping_tcp(addr: &str, deadline: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
-
-    #[cfg(unix)]
-    use std::path::PathBuf;
 
     use super::*;
 
@@ -1084,20 +1204,133 @@ mod tests {
         requests.iter().any(|line| line.starts_with("POST "))
     }
 
+    // ── Unix socket discovery ────────────────────────────────────────
+
+    #[test]
+    fn unix_socket_candidates_follow_documented_priority_order() {
+        let home = PathBuf::from("/home/tester");
+        let xdg = PathBuf::from("/xdg/runtime");
+        let tmpdir = PathBuf::from("/var/folders/xy/T");
+
+        let paths = unix_socket_candidates(1000, Some(home.clone()), Some(&xdg), Some(&tmpdir));
+
+        let expected: Vec<PathBuf> = [
+            PathBuf::from("/var/run/docker.sock"),
+            xdg.join("docker.sock"),
+            PathBuf::from("/run/user/1000/docker.sock"),
+            xdg.join("podman/podman.sock"),
+            PathBuf::from("/run/user/1000/podman/podman.sock"),
+            PathBuf::from("/run/podman/podman.sock"),
+            home.join(".docker/desktop/docker.sock"),
+            home.join(".docker/run/docker.sock"),
+            home.join(".colima/default/docker.sock"),
+            home.join(".colima/docker.sock"),
+            home.join(".orbstack/run/docker.sock"),
+            home.join(".rd/docker.sock"),
+            home.join(".lima/default/sock/docker.sock"),
+            home.join(".lima/docker/sock/docker.sock"),
+            home.join(".local/share/containers/podman/machine/podman.sock"),
+            home.join(".local/share/containers/podman/machine/qemu/podman.sock"),
+            home.join(".local/share/containers/podman/machine/podman-machine-default/podman.sock"),
+            tmpdir.join("podman/podman-machine-default-api.sock"),
+        ]
+        .into();
+        assert_eq!(paths, expected, "candidates must keep the documented order");
+    }
+
+    #[test]
+    fn unix_socket_candidates_list_matching_xdg_runtime_dir_once() {
+        let xdg = PathBuf::from("/run/user/1000/");
+
+        let paths = unix_socket_candidates(1000, None, Some(&xdg), None);
+
+        assert_eq!(
+            paths,
+            [
+                "/var/run/docker.sock",
+                "/run/user/1000/docker.sock",
+                "/run/user/1000/podman/podman.sock",
+                "/run/podman/podman.sock",
+            ]
+            .map(PathBuf::from),
+            "XDG_RUNTIME_DIR equal to /run/user/{{uid}} must not be listed twice"
+        );
+    }
+
+    #[test]
+    fn unix_socket_candidates_without_env_or_home_keep_system_paths() {
+        let paths = unix_socket_candidates(501, None, None, None);
+
+        assert_eq!(
+            paths,
+            [
+                "/var/run/docker.sock",
+                "/run/user/501/docker.sock",
+                "/run/user/501/podman/podman.sock",
+                "/run/podman/podman.sock",
+            ]
+            .map(PathBuf::from),
+            "without home, XDG_RUNTIME_DIR or TMPDIR only the system paths remain"
+        );
+    }
+
+    #[test]
+    fn existing_unique_sockets_skips_missing_files_and_keeps_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("first.sock");
+        let second = dir.path().join("second.sock");
+        std::fs::write(&first, b"").expect("create first");
+        std::fs::write(&second, b"").expect("create second");
+
+        let kept = existing_unique_sockets(vec![
+            dir.path().join("missing.sock"),
+            second.clone(),
+            dir.path().join("missing-dir/docker.sock"),
+            first.clone(),
+        ]);
+
+        assert_eq!(
+            kept,
+            vec![second, first],
+            "missing candidates are dropped and the rest keep their order"
+        );
+    }
+
+    #[test]
+    fn existing_unique_sockets_queries_one_file_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        let socket = dir.path().join("podman.sock");
+        std::fs::write(&socket, b"").expect("create socket file");
+        let other_spelling = dir.path().join("sub/../podman.sock");
+
+        let kept = existing_unique_sockets(vec![socket.clone(), other_spelling]);
+
+        assert_eq!(
+            kept,
+            vec![socket],
+            "two spellings of one file must be queried once, at the first position"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn unix_socket_paths_include_user_scoped_docker_locations() {
-        let home = PathBuf::from("/home/tester");
-        let paths = unix_socket_paths(1000, Some(home));
+    fn existing_unique_sockets_follows_symlinks_and_drops_dangling_ones() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let podman = dir.path().join("podman.sock");
+        std::fs::write(&podman, b"").expect("create podman socket file");
+        let docker = dir.path().join("docker.sock");
+        std::os::unix::fs::symlink(&podman, &docker).expect("symlink docker.sock");
+        let dangling = dir.path().join("dangling.sock");
+        std::os::unix::fs::symlink(dir.path().join("gone.sock"), &dangling)
+            .expect("symlink dangling.sock");
 
-        assert!(paths.contains(&PathBuf::from("/run/user/1000/docker.sock")));
-        assert!(
-            paths.contains(&PathBuf::from("/home/tester/.docker/desktop/docker.sock")),
-            "docker desktop linux socket should be probed"
-        );
-        assert!(
-            paths.contains(&PathBuf::from("/home/tester/.docker/run/docker.sock")),
-            "legacy user-scoped docker socket should still be probed"
+        let kept = existing_unique_sockets(vec![dangling, docker.clone(), podman]);
+
+        assert_eq!(
+            kept,
+            vec![docker],
+            "docker.sock symlinked to podman.sock is one daemon, and a dangling link is skipped"
         );
     }
 

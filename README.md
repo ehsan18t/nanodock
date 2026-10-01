@@ -110,7 +110,7 @@ fn main() {
                 println!("{proto} port {port} -> '{}' (compose project: {project})", info.name);
             }
         }
-        Err(Error::PermissionDenied { endpoint }) => {
+        Err(Error::PermissionDenied { endpoint, .. }) => {
             eprintln!("no permission to use {endpoint}; is this user in the docker group?");
         }
         Err(Error::DaemonNotFound) => eprintln!("no Docker or Podman daemon is running"),

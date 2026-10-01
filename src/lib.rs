@@ -61,7 +61,7 @@
 //!             println!("{proto} port {port} -> {} ({})", info.name, info.image);
 //!         }
 //!     }
-//!     Err(Error::PermissionDenied { endpoint }) => {
+//!     Err(Error::PermissionDenied { endpoint, .. }) => {
 //!         eprintln!("no permission to use {endpoint}");
 //!     }
 //!     Err(e) => eprintln!("detection failed: {e}"),
@@ -127,6 +127,10 @@ pub use proxy::is_container_proxy_process;
 /// too slow ([`Timeout`](Self::Timeout)) or failed with another I/O error
 /// ([`Io`](Self::Io)), which beats finding no daemon at all
 /// ([`DaemonNotFound`](Self::DaemonNotFound)).
+///
+/// Every variant that carries data is a `#[non_exhaustive]` struct variant,
+/// so later releases can add fields: match it with `..`, as in
+/// `Error::HttpStatus { status, .. }`.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
@@ -138,6 +142,7 @@ pub enum Error {
     ///
     /// On Linux this usually means the user is not in the `docker` group
     /// (or the socket belongs to another user).
+    #[non_exhaustive]
     PermissionDenied {
         /// The endpoint that refused access, such as
         /// `/var/run/docker.sock`, `\\.\pipe\docker_engine`, or
@@ -146,17 +151,38 @@ pub enum Error {
     },
 
     /// No daemon finished answering within the detection timeout.
-    Timeout,
+    #[non_exhaustive]
+    Timeout {
+        /// The endpoint that was still answering, when one is known. It is
+        /// `None` when the [`DetectionHandle`] stopped waiting for the
+        /// detection thread.
+        endpoint: Option<String>,
+    },
 
-    /// A daemon answered with this unexpected (non-2xx) HTTP status.
-    HttpStatus(u16),
+    /// A daemon answered with an unexpected (non-2xx) HTTP status.
+    #[non_exhaustive]
+    HttpStatus {
+        /// The HTTP status code of the reply.
+        status: u16,
+    },
 
     /// A daemon answered, but the reply was not a valid HTTP response or
     /// container list.
-    InvalidResponse(ParseError),
+    #[non_exhaustive]
+    InvalidResponse {
+        /// What was wrong with the reply.
+        source: ParseError,
+    },
 
     /// Another I/O error occurred while talking to the daemon.
-    Io(std::io::Error),
+    #[non_exhaustive]
+    Io {
+        /// The underlying I/O error.
+        source: std::io::Error,
+        /// The endpoint the error occurred at, when one is known. It is
+        /// `None` when the detection thread itself failed.
+        endpoint: Option<String>,
+    },
 }
 
 impl Error {
@@ -165,11 +191,11 @@ impl Error {
     const fn informativeness(&self) -> u8 {
         match self {
             Self::DaemonNotFound => 0,
-            Self::Io(_) => 1,
-            Self::Timeout => 2,
+            Self::Io { .. } => 1,
+            Self::Timeout { .. } => 2,
             Self::PermissionDenied { .. } => 3,
-            Self::HttpStatus(_) => 4,
-            Self::InvalidResponse(_) => 5,
+            Self::HttpStatus { .. } => 4,
+            Self::InvalidResponse { .. } => 5,
         }
     }
 }
@@ -184,15 +210,32 @@ impl std::fmt::Display for Error {
                 f,
                 "permission denied connecting to the container runtime at {endpoint}"
             ),
-            Self::Timeout => f.write_str("the container runtime daemon did not answer in time"),
-            Self::HttpStatus(status) => write!(
+            Self::Timeout {
+                endpoint: Some(endpoint),
+            } => write!(
+                f,
+                "the container runtime daemon at {endpoint} did not answer in time"
+            ),
+            Self::Timeout { endpoint: None } => {
+                f.write_str("the container runtime daemon did not answer in time")
+            }
+            Self::HttpStatus { status } => write!(
                 f,
                 "the container runtime daemon answered with HTTP status {status}"
             ),
-            Self::InvalidResponse(_) => {
+            Self::InvalidResponse { .. } => {
                 f.write_str("the container runtime daemon sent an invalid response")
             }
-            Self::Io(_) => f.write_str("I/O error talking to the container runtime daemon"),
+            Self::Io {
+                endpoint: Some(endpoint),
+                ..
+            } => write!(
+                f,
+                "I/O error talking to the container runtime daemon at {endpoint}"
+            ),
+            Self::Io { endpoint: None, .. } => {
+                f.write_str("I/O error talking to the container runtime daemon")
+            }
         }
     }
 }
@@ -200,19 +243,19 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidResponse(source) => Some(source),
-            Self::Io(source) => Some(source),
+            Self::InvalidResponse { source } => Some(source),
+            Self::Io { source, .. } => Some(source),
             Self::DaemonNotFound
             | Self::PermissionDenied { .. }
-            | Self::Timeout
-            | Self::HttpStatus(_) => None,
+            | Self::Timeout { .. }
+            | Self::HttpStatus { .. } => None,
         }
     }
 }
 
 impl From<ParseError> for Error {
     fn from(error: ParseError) -> Self {
-        Self::InvalidResponse(error)
+        Self::InvalidResponse { source: error }
     }
 }
 
@@ -312,7 +355,7 @@ impl std::fmt::Display for Protocol {
 /// assert_eq!(info.compose_service.as_deref(), Some("db"));
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ContainerInfo {
     /// Full container ID (hex string) for API calls, empty when unavailable.
@@ -618,7 +661,7 @@ fn insert_test_container(
 
 /// Result of matching a socket against published container port bindings.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishedContainerMatch<'a> {
     /// Exactly one container binding matched the socket.
     Match(&'a ContainerInfo),
@@ -692,7 +735,7 @@ fn query_budget(timeout: Duration) -> Duration {
 ///     Err(error) => eprintln!("detection failed: {error}"),
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Client {
     home: Option<PathBuf>,
     timeout: Duration,
@@ -932,13 +975,14 @@ impl DetectionHandle {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 debug!("container runtime detection timed out");
-                Err(Error::Timeout)
+                Err(Error::Timeout { endpoint: None })
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 debug!("container runtime detection channel disconnected");
-                Err(Error::Io(std::io::Error::other(
-                    "the detection thread stopped without a result",
-                )))
+                Err(Error::Io {
+                    source: std::io::Error::other("the detection thread stopped without a result"),
+                    endpoint: None,
+                })
             }
         }
     }
@@ -994,7 +1038,7 @@ pub fn kill_container(id: &str) -> StopOutcome {
 
 /// Result of attempting to stop or kill a container via the daemon API.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum StopOutcome {
     /// Container was successfully stopped (HTTP 204).
@@ -1022,7 +1066,7 @@ impl StopOutcome {
     /// Whether the container is known to be stopped now: it was stopped or
     /// already was.
     #[must_use]
-    pub const fn is_stopped(self) -> bool {
+    pub const fn is_stopped(&self) -> bool {
         matches!(self, Self::Stopped | Self::AlreadyStopped)
     }
 }
@@ -1181,10 +1225,17 @@ impl DaemonEndpoint {
             ipc::FetchError::PermissionDenied => Error::PermissionDenied {
                 endpoint: self.to_string(),
             },
-            ipc::FetchError::Timeout => Error::Timeout,
-            ipc::FetchError::Status(status) => Error::HttpStatus(status),
-            ipc::FetchError::Malformed(reason) => Error::InvalidResponse(ParseError::http(reason)),
-            ipc::FetchError::Io(error) => Error::Io(error),
+            ipc::FetchError::Timeout => Error::Timeout {
+                endpoint: Some(self.to_string()),
+            },
+            ipc::FetchError::Status(status) => Error::HttpStatus { status },
+            ipc::FetchError::Malformed(reason) => Error::InvalidResponse {
+                source: ParseError::http(reason),
+            },
+            ipc::FetchError::Io(source) => Error::Io {
+                source,
+                endpoint: Some(self.to_string()),
+            },
         }
     }
 
@@ -1343,16 +1394,21 @@ fn prioritized_targets<P>(
 /// `targets` must be in priority order. Each response is tagged with its
 /// target index, so the result does not depend on arrival order. When no
 /// target produced a body, the most informative failure is returned; a
-/// target still running at the deadline counts as [`Error::Timeout`].
+/// target still running at the deadline counts as [`Error::Timeout`] naming
+/// the first such target.
 fn collect_daemon_bodies<P, F>(
     targets: Vec<(bool, P)>,
     fetch: F,
     deadline: Instant,
 ) -> Result<Vec<String>, Error>
 where
-    P: Send + 'static,
+    P: std::fmt::Display + Send + 'static,
     F: Fn(&P, Instant) -> Result<String, Error> + Send + Sync + 'static,
 {
+    let mut unfinished: Vec<Option<String>> = targets
+        .iter()
+        .map(|(_, target)| Some(target.to_string()))
+        .collect();
     let fan_out = ipc::fetch_all(
         targets.into_iter().enumerate(),
         move |(priority, (from_docker_host, target))| {
@@ -1364,6 +1420,9 @@ where
     let mut responses = Vec::new();
     let mut failures = Vec::new();
     for (priority, from_docker_host, result) in fan_out.results {
+        if let Some(name) = unfinished.get_mut(priority) {
+            *name = None;
+        }
         match result {
             Ok(body) => responses.push((priority, from_docker_host, body)),
             Err(error) => failures.push((priority, error)),
@@ -1372,7 +1431,9 @@ where
 
     if responses.is_empty() {
         failures.sort_by_key(|(priority, _)| *priority);
-        let timed_out = (fan_out.unfinished > 0).then_some(Error::Timeout);
+        let timed_out = (fan_out.unfinished > 0).then(|| Error::Timeout {
+            endpoint: unfinished.into_iter().flatten().next(),
+        });
         return Err(most_informative(
             failures
                 .into_iter()
@@ -2288,6 +2349,17 @@ mod tests {
     }
 
     #[test]
+    fn stop_outcome_is_checked_by_reference() {
+        let outcome = StopOutcome::Rejected { status: 500 };
+        assert!(!outcome.is_stopped());
+        assert_eq!(
+            outcome,
+            StopOutcome::Rejected { status: 500 },
+            "is_stopped borrows, so the outcome stays usable"
+        );
+    }
+
+    #[test]
     fn detection_handle_times_out_at_its_deadline() {
         let (_tx, rx) = std::sync::mpsc::channel();
         let handle = DetectionHandle {
@@ -2295,7 +2367,10 @@ mod tests {
             deadline: Instant::now() + Duration::from_millis(50),
         };
         let started = Instant::now();
-        assert!(matches!(handle.wait_result(), Err(Error::Timeout)));
+        assert!(matches!(
+            handle.wait_result(),
+            Err(Error::Timeout { endpoint: None })
+        ));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the handle stops waiting at the deadline"
@@ -2429,6 +2504,17 @@ mod tests {
         Hung,
     }
 
+    impl std::fmt::Display for FakeTarget {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Tcp(addr) => write!(f, "tcp://{addr}"),
+                Self::Local(_) => f.write_str("local"),
+                Self::Fail(_) => f.write_str("failing"),
+                Self::Hung => f.write_str("hung"),
+            }
+        }
+    }
+
     fn fetch_fake(target: &FakeTarget, deadline: Instant) -> Result<String, Error> {
         match target {
             FakeTarget::Tcp(addr) => DaemonEndpoint::Tcp(addr.clone()).fetch_json(deadline),
@@ -2436,7 +2522,7 @@ mod tests {
             FakeTarget::Fail(error) => Err(error()),
             FakeTarget::Hung => {
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                Err(Error::Timeout)
+                Err(Error::Timeout { endpoint: None })
             }
         }
     }
@@ -2499,7 +2585,10 @@ mod tests {
             Instant::now() + std::time::Duration::from_millis(200),
         )
         .expect_err("no endpoint answered in time");
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
+        assert!(
+            matches!(&error, Error::Timeout { endpoint: Some(endpoint) } if endpoint == "hung"),
+            "the endpoint still answering at the deadline is named, got {error:?}"
+        );
     }
 
     #[test]
@@ -2520,13 +2609,13 @@ mod tests {
     fn most_informative_prefers_answers_and_keeps_priority_on_ties() {
         let error = most_informative([
             Error::DaemonNotFound,
-            Error::Timeout,
-            Error::HttpStatus(500),
+            Error::Timeout { endpoint: None },
+            Error::HttpStatus { status: 500 },
             permission_denied(),
-            Error::HttpStatus(503),
+            Error::HttpStatus { status: 503 },
         ]);
         assert!(
-            matches!(error, Error::HttpStatus(500)),
+            matches!(error, Error::HttpStatus { status: 500 }),
             "a daemon that answered beats one that refused, and the first answer wins a tie, got {error:?}"
         );
         assert!(matches!(
@@ -2544,8 +2633,19 @@ mod tests {
             "permission denied connecting to the container runtime at /var/run/docker.sock"
         );
         assert_eq!(
-            Error::HttpStatus(500).to_string(),
+            Error::HttpStatus { status: 500 }.to_string(),
             "the container runtime daemon answered with HTTP status 500"
+        );
+        assert_eq!(
+            Error::Timeout {
+                endpoint: Some("/run/podman/podman.sock".to_string())
+            }
+            .to_string(),
+            "the container runtime daemon at /run/podman/podman.sock did not answer in time"
+        );
+        assert_eq!(
+            Error::Timeout { endpoint: None }.to_string(),
+            "the container runtime daemon did not answer in time"
         );
 
         let json_error = api::parse_containers_json_strict("not json").expect_err("invalid JSON");
@@ -2560,12 +2660,17 @@ mod tests {
             error.source().is_some(),
             "an invalid response chains the parse error"
         );
-        assert!(
-            Error::Io(std::io::ErrorKind::ConnectionReset.into())
-                .source()
-                .is_some()
+        let io = Error::Io {
+            source: std::io::ErrorKind::ConnectionReset.into(),
+            endpoint: Some("tcp://127.0.0.1:2375".to_string()),
+        };
+        assert!(io.source().is_some(), "an I/O error chains its source");
+        assert_eq!(
+            io.to_string(),
+            "I/O error talking to the container runtime daemon at tcp://127.0.0.1:2375",
+            "the message names the endpoint but not the source"
         );
-        assert!(Error::Timeout.source().is_none());
+        assert!(Error::Timeout { endpoint: None }.source().is_none());
     }
 
     #[test]
@@ -2578,7 +2683,19 @@ mod tests {
         );
         assert!(matches!(
             endpoint.error(ipc::FetchError::Malformed("bad")),
-            Error::InvalidResponse(_)
+            Error::InvalidResponse { .. }
+        ));
+        assert!(matches!(
+            endpoint.error(ipc::FetchError::Timeout),
+            Error::Timeout { endpoint: Some(name) } if name == "tcp://127.0.0.1:2375"
+        ));
+        assert!(matches!(
+            endpoint.error(ipc::FetchError::Io(std::io::ErrorKind::BrokenPipe.into())),
+            Error::Io { endpoint: Some(name), .. } if name == "tcp://127.0.0.1:2375"
+        ));
+        assert!(matches!(
+            endpoint.error(ipc::FetchError::Status(503)),
+            Error::HttpStatus { status: 503 }
         ));
     }
 

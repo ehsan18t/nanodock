@@ -13,7 +13,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - `Client` holds the daemon settings and runs detection and stop requests. `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, `Client::stop`, and `Client::kill` do what the free functions do; `detect_containers`, `start_detection`, `stop_container`, and the new `kill_container` are shorthands for `Client::new()`. The detection timeout (3 seconds by default) is configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
-- `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout`, `HttpStatus(u16)`, `InvalidResponse(ParseError)`, and `Io(std::io::Error)`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
+- `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout { endpoint }`, `HttpStatus { status }`, `InvalidResponse { source }` (a `ParseError`), and `Io { source, endpoint }` (a `std::io::Error`). `Timeout` and `Io` name the endpoint when it is known, as an `Option<String>`. Every variant that carries data is a `#[non_exhaustive]` struct variant, so later releases can add fields; match it with `..`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
 - `DetectionHandle::wait_result` reports why background detection produced no containers.
 - `ProxyFallback` (`Allow` or `Deny`) says whether `ContainerPortMap::lookup` may match a proxy process on port and protocol alone.
 - `PublishedContainerMatch::container` returns the matched container, if any.
@@ -29,13 +29,15 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 
 - **Breaking:** `ContainerInfo` is `#[non_exhaustive]`. Its fields stay public for reading, but code outside the crate can no longer build it with a struct literal; use `ContainerInfo::new`.
 - **Breaking:** `ContainerPortMap` is a struct instead of a `HashMap` type alias. It offers `new`, `len`, `is_empty`, `get(host_ip, port, proto)`, `insert(host_ip, port, proto, info)`, `iter`, `lookup`, `Default`, `FromIterator`, and `Extend`, and `&ContainerPortMap` iterates as `((host_ip, port, proto), &ContainerInfo)`. Every binding of one container shares a single `Arc<ContainerInfo>`, so a container that publishes a large port range is no longer cloned once per port.
-- **Breaking:** `Error::InvalidJson(serde_json::Error)` is replaced by `Error::InvalidResponse(ParseError)`, and `From<serde_json::Error> for Error` is removed. `ParseError` is opaque, so no `serde_json` type is part of the public API any more.
+- **Breaking:** `Error::InvalidJson(serde_json::Error)` is replaced by `Error::InvalidResponse { source: ParseError }`, and `From<serde_json::Error> for Error` is removed. `ParseError` is opaque, so no `serde_json` type is part of the public API any more.
 - **Breaking:** `parse_containers_json_strict` returns `Result<ContainerPortMap, ParseError>` instead of `Result<_, serde_json::Error>`.
 - **Breaking:** `Error::DaemonNotFound` now means that no daemon listens on any known endpoint. Failures that were reported as `DaemonNotFound` before (permission denied, timeout, an error status, a malformed reply) have their own variants.
 - **Breaking:** `StopOutcome::Failed` is split into `StopOutcome::Unreachable` (no daemon could be contacted, so the container was not touched), `StopOutcome::NoResponse` (a daemon received the request but gave no usable reply, so the container may or may not be stopping), and `StopOutcome::Rejected { status }` (the daemon answered with an unexpected HTTP status). The stop semantics are unchanged: the ping preflight, the rule that no second daemon is tried once one may have received the request, and the rule that any reply from the `DOCKER_HOST` daemon ends the search all still apply.
 - **Breaking:** the `Serialize` and `Deserialize` derives on `ContainerInfo`, `Protocol`, and `StopOutcome` are behind the `serde` feature, which is off by default. Enable it to keep serializing these types. `StopOutcome` now also derives `Deserialize` under that feature.
 - **Breaking:** `detect_containers`, `start_detection`, and `stop_container` no longer take a `home: Option<PathBuf>` argument; they use `Client::new()`, which reads the home directory from the environment. Passing `None` used to skip every per-user socket (Docker Desktop on macOS, Colima, OrbStack, Lima, Rancher Desktop, Podman machine) without any sign. Use `Client::new().home(home)` to search a specific home directory.
 - **Breaking:** stopping and killing are separate calls instead of one call with a `force: bool` argument. `stop_container(id)` and `Client::stop(id)` stop the container gracefully (`POST /containers/{id}/stop?t=10`), and `kill_container(id)` and `Client::kill(id)` kill it at once (`POST /containers/{id}/kill`). Both keep the same daemon selection and fail-closed rules.
+- **Breaking:** `StopOutcome` no longer implements `Copy`, so a later variant can carry data that is not `Copy`. Clone it where a copy was relied on; `StopOutcome::is_stopped` takes `&self`.
+- **Breaking:** `ContainerInfo` and `PublishedContainerMatch` no longer implement `Hash`, so `ContainerInfo` can gain fields that cannot be hashed (such as a label map) in a minor release. Key a set or map on `info.id` instead of the whole `ContainerInfo`.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
 - The background detection wait window is measured from the moment detection started rather than from the call that waits, so it never ends later than the detection timeout after `start_detection`.
 
@@ -121,12 +123,14 @@ StopOutcome::Rejected { status } => println!("the daemon answered HTTP {status}"
 
 Matching detection errors:
 
-```rust
+```rust,ignore
 // 0.1
 Err(Error::InvalidJson(source)) => eprintln!("bad JSON: {source}"),
-// 0.2
-Err(Error::InvalidResponse(source)) => eprintln!("bad reply: {source}"),
-Err(Error::PermissionDenied { endpoint }) => eprintln!("no access to {endpoint}"),
+// 0.2: data-carrying variants are non-exhaustive struct variants, matched with `..`
+Err(Error::InvalidResponse { source, .. }) => eprintln!("bad reply: {source}"),
+Err(Error::PermissionDenied { endpoint, .. }) => eprintln!("no access to {endpoint}"),
+Err(Error::HttpStatus { status, .. }) => eprintln!("the daemon answered HTTP {status}"),
+Err(Error::Timeout { endpoint, .. }) => eprintln!("no answer in time from {endpoint:?}"),
 ```
 
 `parse_containers_json_strict` now fails with `nanodock::ParseError`; code that named `serde_json::Error` should name `ParseError` or use `impl std::error::Error`.

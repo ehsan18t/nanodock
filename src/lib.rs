@@ -28,7 +28,9 @@
 //! - `api` - JSON response parsing and container name resolution.
 //! - `http` - Minimal HTTP/1.0 response parser (headers via `httparse`).
 //! - `ipc` - OS-specific transport (Unix socket, Windows named pipe, TCP).
-//! - `podman` - Rootless Podman resolver via overlay metadata (Linux only).
+//! - `podman` - Rootless Podman resolver via overlay metadata (lookup runs on
+//!   Linux only).
+//! - `proxy` - Recognition of container runtime port-proxy processes.
 //!
 //! ## Quick start
 //!
@@ -85,6 +87,7 @@ mod api;
 mod http;
 mod ipc;
 mod podman;
+mod proxy;
 
 // Compiles the README examples as doctests so they cannot drift from the API.
 #[cfg(doctest)]
@@ -108,6 +111,7 @@ pub use api::parse_containers_json_strict;
 pub use api::short_container_id;
 pub use podman::is_podman_rootlessport_process;
 pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
+pub use proxy::is_container_proxy_process;
 
 // ── Error type ───────────────────────────────────────────────────────
 

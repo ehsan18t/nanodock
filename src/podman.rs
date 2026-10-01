@@ -94,6 +94,10 @@ pub fn lookup_rootless_podman_container(
 }
 
 /// Check whether a process name matches the Podman rootless port-forwarder.
+///
+/// Matches `rootlessport` only (ASCII case-insensitive), which is the process
+/// [`lookup_rootless_podman_container`] can resolve. To recognize every
+/// container runtime port proxy, use [`crate::is_container_proxy_process`].
 #[must_use]
 pub const fn is_podman_rootlessport_process(process_name: &str) -> bool {
     process_name.eq_ignore_ascii_case("rootlessport")

@@ -268,6 +268,9 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `parse_containers_json(body)`                     | Lenient parse of a raw `/containers/json` response         |
 | `parse_containers_json_strict(body)`              | Strict parse that fails with `ParseError` on invalid JSON  |
 | `short_container_id(id)`                          | The 12-character short form of a container ID              |
+| `is_container_proxy_process(name)`                | Whether a process is a container runtime port proxy        |
+
+`is_container_proxy_process` recognizes the host-side helpers that listen on a published port on behalf of a container, so a port scanner can attribute the port to the container instead of the helper: `docker-proxy`, `rootlesskit`, `rootlessport`, `rootlessport-child`, `slirp4netns`, `pasta`, `pasta.avx2`, `com.docker.backend`, `com.docker.vpnkit`, `vpnkit`, `wslrelay`, `gvproxy`, and `limactl`. Matching is ASCII case-insensitive, ignores a trailing `.exe`, and accepts the 15-byte names Linux truncates longer process names to (for example `rootlessport-ch`). Generic forwarders such as `ssh` and `socat` are not recognized.
 
 ### Cargo Features
 
@@ -293,7 +296,8 @@ src/
 ├── api.rs      - JSON response parsing, container name resolution
 ├── http.rs     - Minimal HTTP/1.0 response parser (via httparse)
 ├── ipc.rs      - OS-specific transport (Unix socket, named pipe, TCP)
-└── podman.rs   - Rootless Podman resolver via overlay metadata
+├── podman.rs   - Rootless Podman resolver via overlay metadata
+└── proxy.rs    - Container runtime port-proxy process recognition
 ```
 
 ### Module Boundaries
@@ -307,6 +311,7 @@ src/
 - **`ipc.rs`** owns OS-specific transport code. Unix sockets, Windows named
   pipes, TCP connections, and `DOCKER_HOST` parsing all live here.
 - **`podman.rs`** owns rootless Podman resolution. It reads overlay storage metadata and OCI runtime configs to match network namespace paths to container names. Its public items compile on every platform; the lookup only runs on Linux.
+- **`proxy.rs`** owns the list of container runtime port-proxy process names behind `is_container_proxy_process`.
 
 ## Building
 

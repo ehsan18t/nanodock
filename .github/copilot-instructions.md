@@ -155,6 +155,7 @@ src/
   http.rs     -- Minimal HTTP/1.0 response parser (via httparse)
   ipc.rs      -- OS-specific transport (Unix socket, named pipe, TCP)
   podman.rs   -- Rootless Podman resolver via overlay metadata (lookup runs on Linux only)
+  proxy.rs    -- Container runtime port-proxy process recognition
 ```
 
 - **Do not create new modules** without explicit human approval.
@@ -167,6 +168,8 @@ src/
   management lives here.
 - **`podman.rs`** owns rootless Podman resolution via overlay filesystem
   inspection. Its public items compile everywhere; the lookup runs on Linux only.
+- **`proxy.rs`** owns the list of container runtime port-proxy process names
+  (`is_container_proxy_process`).
 
 ### 4.1 - Module Boundary Enforcement
 
@@ -178,6 +181,7 @@ When adding new functionality, respect existing module boundaries:
 | Handle HTTP framing/chunking      | `http.rs`      |
 | Connect to sockets/pipes/TCP      | `ipc.rs`       |
 | Resolve rootless Podman           | `podman.rs`    |
+| Recognize runtime proxy processes | `proxy.rs`     |
 | Expose public API or orchestrate  | `lib.rs`       |
 
 If new functionality does not clearly fit any module, discuss with the human

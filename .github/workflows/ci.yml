@@ -10,6 +10,9 @@
 #   6. cargo doc                    -> documentation + doc-comment format valid
 #   7. cargo deny check             -> no vulnerable/banned dependencies
 #
+# MSRV (Linux):
+#   - cargo check on Rust 1.89, the rust-version declared in Cargo.toml
+#
 # Linux benchmark execution:
 #   - gungraun instruction-count regressions vs PR merge-base
 
@@ -91,6 +94,33 @@ jobs:
             -D rustdoc::invalid_rust_codeblocks
             -D rustdoc::private_intra_doc_links
             -D rustdoc::unescaped_backticks
+
+  # Minimum supported Rust version: proves the `rust-version` declared in
+  # Cargo.toml still compiles every target (lib, tests, benches). Lints and
+  # warnings are gated on stable by the quality gate, so RUSTFLAGS is cleared
+  # here to keep newer-compiler-only lint names from failing an older rustc.
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # 1.94.1
+        with:
+          toolchain: "1.89"
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          key: msrv
+
+      - name: "MSRV: cargo check --all-targets"
+        run: cargo check --locked --all-targets
 
   # Linux-only instruction-count benchmarks with gungraun.
   #

@@ -70,6 +70,8 @@ All of the following must pass before merging:
 CI runs on every push to `main` **and** on every pull request targeting `main`,
 so cross-platform issues (Linux + Windows + macOS matrix) are caught before a PR is merged.
 
+A separate MSRV job runs `cargo check --locked --all-targets` on Rust 1.89, the `rust-version` declared in `Cargo.toml`. Development and the lint gates use the latest stable toolchain, but code must keep compiling on 1.89; raising the MSRV is a deliberate change that updates `rust-version`, this job, and the README together.
+
 Workflow dependencies in `.github/workflows/` are pinned to full commit SHAs.
 When updating an action, keep the trailing version comment (for example `# v6`)
 so reviewers can see the intended upstream release at a glance.

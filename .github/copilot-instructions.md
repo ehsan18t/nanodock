@@ -14,7 +14,7 @@
 | Type       | Library crate (published on crates.io)         |
 | Platform   | Cross-platform (Linux x86-64, Windows x86-64)  |
 | License    | MIT                                            |
-| Min Rust   | latest stable (currently 1.93+)                |
+| Min Rust   | 1.89 (`rust-version`, enforced by CI MSRV job) |
 | Repository | `https://github.com/ehsan18t/nanodock`         |
 
 ### 1.1 - Mission
@@ -276,8 +276,7 @@ Good examples:
 
 ## 11 - CI Pipeline
 
-CI runs on pushes to `main` and pull requests targeting `main`. Three primary
-jobs:
+CI runs on pushes to `main` and pull requests targeting `main`. Primary jobs:
 
 1. **quality-gate** (Linux + Windows + macOS matrix) - fmt, clippy,
    `cargo test --locked`, build, cargo doc.
@@ -285,6 +284,7 @@ jobs:
    counts against the PR `merge-base`. Enforces a strict
    `--callgrind-limits='ir=1.0%'` ceiling.
 3. **audit** - `cargo deny check`.
+4. **msrv** (Linux) - `cargo check --locked --all-targets` on Rust 1.89, the `rust-version` declared in `Cargo.toml`.
 
 All gates must pass before merge. See `.github/workflows/ci.yml`.
 

@@ -49,6 +49,7 @@ mod podman;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -530,35 +531,38 @@ fn send_stop_request_platform(endpoint: &str, _home: Option<PathBuf>) -> Option<
 ///
 /// Shared across Unix and Windows since the TCP transport is
 /// platform-agnostic.
-fn query_docker_host_tcp_body() -> Option<String> {
+fn query_docker_host_tcp_body(deadline: Instant) -> Option<String> {
     let addr = ipc::docker_host_tcp_addr()?;
-    ipc::fetch_tcp_json(&addr)
+    ipc::fetch_tcp_json(&addr, deadline)
 }
 
 /// If `DOCKER_HOST` is set to a `tcp://` URL, query it and return the map.
 ///
 /// Shared across Unix and Windows since the TCP transport is platform-agnostic.
-fn query_docker_host_tcp() -> Option<ContainerPortMap> {
-    query_docker_host_tcp_body().map(|body| api::parse_containers_json(&body))
+fn query_docker_host_tcp(deadline: Instant) -> Option<ContainerPortMap> {
+    query_docker_host_tcp_body(deadline).map(|body| api::parse_containers_json(&body))
 }
 
 #[cfg(unix)]
 fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
     use std::path::Path;
 
-    if let Some(body) = query_docker_host_tcp_body() {
+    let deadline = ipc::query_deadline();
+    if let Some(body) = query_docker_host_tcp_body(deadline) {
         return Some(body);
     }
 
     if let Some(path) = ipc::docker_host_unix_path() {
-        return ipc::fetch_unix_socket_json(Path::new(&path));
+        return ipc::fetch_unix_socket_json(Path::new(&path), deadline);
     }
 
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
-    let responses = ipc::fetch_all_successes(ipc::unix_socket_paths(uid, home), |path| {
-        ipc::fetch_unix_socket_json(&path)
-    });
+    let responses = ipc::fetch_all_successes(
+        ipc::unix_socket_paths(uid, home),
+        move |path| ipc::fetch_unix_socket_json(&path, deadline),
+        deadline,
+    );
 
     merge_daemon_response_bodies(responses)
 }
@@ -567,21 +571,24 @@ fn query_daemon_body(home: Option<PathBuf>) -> Option<String> {
 fn query_daemon(home: Option<PathBuf>) -> Option<ContainerPortMap> {
     use std::path::Path;
 
-    if let Some(map) = query_docker_host_tcp() {
+    let deadline = ipc::query_deadline();
+    if let Some(map) = query_docker_host_tcp(deadline) {
         return Some(map);
     }
 
     // Honour DOCKER_HOST when it points at a Unix socket (unix://).
     if let Some(path) = ipc::docker_host_unix_path() {
-        return ipc::fetch_unix_socket_json(Path::new(&path))
+        return ipc::fetch_unix_socket_json(Path::new(&path), deadline)
             .map(|body| api::parse_containers_json(&body));
     }
 
     // Safety: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
-    let responses = ipc::fetch_all_successes(ipc::unix_socket_paths(uid, home), |path| {
-        ipc::fetch_unix_socket_json(&path)
-    });
+    let responses = ipc::fetch_all_successes(
+        ipc::unix_socket_paths(uid, home),
+        move |path| ipc::fetch_unix_socket_json(&path, deadline),
+        deadline,
+    );
 
     merge_daemon_responses(responses)
 }
@@ -594,11 +601,10 @@ const DEFAULT_PIPE_PATHS: &[&str] = &[
 
 #[cfg(windows)]
 fn query_daemon_body(_home: Option<PathBuf>) -> Option<String> {
-    if let Some(body) = query_docker_host_tcp_body() {
+    let deadline = ipc::query_deadline();
+    if let Some(body) = query_docker_host_tcp_body(deadline) {
         return Some(body);
     }
-
-    let deadline = std::time::Instant::now() + ipc::DAEMON_TIMEOUT;
 
     if let Some(path) = ipc::docker_host_npipe_path()
         && let Some(body) = ipc::fetch_named_pipe_json(&path, deadline)
@@ -613,11 +619,10 @@ fn query_daemon_body(_home: Option<PathBuf>) -> Option<String> {
 
 #[cfg(windows)]
 fn query_daemon(_home: Option<PathBuf>) -> Option<ContainerPortMap> {
-    if let Some(map) = query_docker_host_tcp() {
+    let deadline = ipc::query_deadline();
+    if let Some(map) = query_docker_host_tcp(deadline) {
         return Some(map);
     }
-
-    let deadline = std::time::Instant::now() + ipc::DAEMON_TIMEOUT;
 
     // Honour DOCKER_HOST when it points at a named pipe (npipe://).
     if let Some(path) = ipc::docker_host_npipe_path()

@@ -12,34 +12,21 @@
 
 ## Features
 
-- **Container detection** - Queries Docker and Podman daemons to discover
-  running containers and their published port bindings.
-- **Port-to-container mapping** - Resolves which container owns a given host
-  `(ip, port, protocol)` tuple, with wildcard and proxy-fallback matching.
-- **Compose awareness** - Reports the Docker Compose (or `podman-compose`)
-  project and service of each container from its labels.
-- **Container lifecycle control** - Stop or kill containers by ID through the
-  daemon API (graceful SIGTERM or immediate SIGKILL), with an outcome that
-  tells "unreachable", "no reply", and "rejected" apart.
-- **Actionable errors** - Detection failures say what happened: no daemon,
-  permission denied (with the socket path), timeout, an HTTP error status, or
-  an invalid reply.
-- **Multi-transport support** - Connects via Unix domain sockets, Windows named
-  pipes, or TCP (`DOCKER_HOST`), with automatic discovery of socket paths.
-- **Rootless Podman support** - Resolves rootless Podman containers on Linux by
-  reading overlay storage metadata and matching network namespace paths.
-- **Background detection** - Spawns detection on a background thread so callers
-  can do other work (socket enumeration, process lookup) concurrently.
-- **Configurable** - A `Client` sets the detection timeout, the home directory,
-  and the `DOCKER_HOST` override without touching the environment.
+- **Container detection** - Queries Docker and Podman daemons to discover running containers and their published port bindings.
+- **Port-to-container mapping** - Resolves which container owns a given host `(ip, port, protocol)` tuple, with wildcard and proxy-fallback matching.
+- **Compose awareness** - Reports the Docker Compose (or `podman-compose`) project and service of each container from its labels.
+- **Container lifecycle control** - Stop or kill containers by ID through the daemon API (graceful SIGTERM or immediate SIGKILL), with an outcome that tells "unreachable", "no reply", and "rejected" apart.
+- **Actionable errors** - Detection failures say what happened: no daemon, permission denied (with the socket path), timeout, an HTTP error status, or an invalid reply.
+- **Multi-transport support** - Connects via Unix domain sockets, Windows named pipes, or TCP (`DOCKER_HOST`), with automatic discovery of socket paths.
+- **Rootless Podman support** - Resolves rootless Podman containers on Linux by reading overlay storage metadata and matching network namespace paths.
+- **Background detection** - Spawns detection on a background thread so callers can do other work (socket enumeration, process lookup) concurrently.
+- **Configurable** - A `Client` sets the detection timeout, the home directory, and the `DOCKER_HOST` override without touching the environment.
 - **Minimal dependencies** - Only `serde`, `serde_json`, `httparse`, and `log` at runtime, plus `libc` on Unix. No async runtime, no `tokio`, no `hyper`.
 - **Cross-platform** - Tested in CI on Linux (x86-64) and Windows (x86-64). macOS and other Unix targets build through the same `cfg(unix)` code path but are not tested in CI.
 
 ## Why nanodock?
 
-Most Rust Docker libraries (`bollard`, `docker-api`) are full API clients that
-require an async runtime and pull in 30-50+ transitive dependencies. nanodock
-takes the opposite approach: synchronous, minimal, and focused.
+Most Rust Docker libraries (`bollard`, `docker-api`) are full API clients that require an async runtime and pull in 30-50+ transitive dependencies. nanodock takes the opposite approach: synchronous, minimal, and focused.
 
 | Crate        | Async | Runtime Deps             | Scope                         |
 | ------------ | ----- | ------------------------ | ----------------------------- |
@@ -47,9 +34,7 @@ takes the opposite approach: synchronous, minimal, and focused.
 | `docker-api` | Yes   | ~30+                     | Full Docker API               |
 | **nanodock** | No    | **4** (+ `libc` on Unix) | Detection + Ports + Lifecycle |
 
-Use nanodock when you need container awareness (detection, port mapping,
-lifecycle control) without pulling in an async runtime or a full Docker SDK.
-Ideal for CLI tools, system utilities, and monitoring agents.
+Use nanodock when you need container awareness (detection, port mapping, lifecycle control) without pulling in an async runtime or a full Docker SDK. Ideal for CLI tools, system utilities, and monitoring agents.
 
 ## Quick Start
 
@@ -191,8 +176,7 @@ fn main() {
 
 ## How It Works
 
-nanodock communicates directly with the Docker/Podman daemon using the
-`/containers/json` REST API endpoint over local transports:
+nanodock communicates directly with the Docker/Podman daemon using the `/containers/json` REST API endpoint over local transports:
 
 ```text
 ┌─────────────┐     HTTP/1.0 GET /containers/json
@@ -211,11 +195,7 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 1. **`DOCKER_HOST` environment variable** (or `Client::docker_host`) - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. Stop and kill requests try the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop or kill to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
 2. **Platform-native sockets** - On Linux and macOS, the well-known Unix socket paths below are checked (rootful and rootless Docker, Podman, Docker Desktop, Colima, OrbStack, Rancher Desktop, Lima, and Podman machine). Paths that do not exist are skipped before any connection is attempted, and paths that resolve to the same file (for example `/var/run/docker.sock` symlinked to another runtime's socket) are queried once, at the first position. On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged; when two daemons report the same port, the one earlier in this list wins.
-3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless
-   Podman, nanodock reads the overlay storage metadata to resolve container
-   names from network namespace paths. This handles the case where
-   `rootlessport` is the process holding the socket instead of the container
-   itself.
+3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless Podman, nanodock reads the overlay storage metadata to resolve container names from network namespace paths. This handles the case where `rootlessport` is the process holding the socket instead of the container itself.
 
 ### Supported Daemon Paths
 
@@ -322,14 +302,10 @@ src/
 
 ### Module Boundaries
 
-- **`lib.rs`** owns the public API surface, detection orchestration, and
-  port-to-container matching logic. All public types are defined here.
-- **`api.rs`** owns JSON response parsing. It converts raw daemon responses
-  into `ContainerPortMap` entries.
-- **`http.rs`** owns HTTP protocol handling. It formats requests and parses
-  responses using `httparse`. No Docker-specific logic lives here.
-- **`ipc.rs`** owns OS-specific transport code. Unix sockets, Windows named
-  pipes, TCP connections, and `DOCKER_HOST` parsing all live here.
+- **`lib.rs`** owns the public API surface, detection orchestration, and port-to-container matching logic. All public types are defined here.
+- **`api.rs`** owns JSON response parsing. It converts raw daemon responses into `ContainerPortMap` entries.
+- **`http.rs`** owns HTTP protocol handling. It formats requests and parses responses using `httparse`. No Docker-specific logic lives here.
+- **`ipc.rs`** owns OS-specific transport code. Unix sockets, Windows named pipes, TCP connections, and `DOCKER_HOST` parsing all live here.
 - **`podman.rs`** owns rootless Podman resolution. It reads overlay storage metadata and OCI runtime configs to match network namespace paths to container names. Its public items compile on every platform; the lookup only runs on Linux.
 - **`proxy.rs`** owns the list of container runtime port-proxy process names behind `is_container_proxy_process`.
 
@@ -378,9 +354,7 @@ All of the following must pass before merging:
 
 ## Instruction Benchmarks
 
-nanodock ships deterministic instruction-count benchmarks via
-[Gungraun](https://crates.io/crates/gungraun) (requires Linux + Valgrind).
-See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for setup and usage details.
+nanodock ships deterministic instruction-count benchmarks via [Gungraun](https://crates.io/crates/gungraun) (requires Linux + Valgrind). See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for setup and usage details.
 
 ### Git Hooks
 
@@ -416,8 +390,7 @@ No async runtime. No TLS. No network client libraries.
 
 ## Contributing
 
-See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for development setup, coding
-standards, commit message format, and the full quality gate reference.
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for development setup, coding standards, commit message format, and the full quality gate reference.
 
 ## License
 

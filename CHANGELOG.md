@@ -10,7 +10,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 
 ### Added
 
-- `Client` holds the daemon settings and runs detection and stop requests. `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, `Client::stop`, and `Client::kill` do what the free functions do; `detect_containers`, `start_detection`, `stop_container`, and the new `kill_container` are shorthands for `Client::new()`. The detection timeout (3 seconds by default) is configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
+- `Client` holds the daemon settings and runs detection, stop, and kill requests. `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, `Client::stop`, and `Client::kill` do what the free functions do; `detect_containers`, `start_detection`, `stop_container`, and the new `kill_container` are shorthands for `Client::new()`. The detection timeout (3 seconds by default) is configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project. A label value that is not a string (a number, boolean, `null`, array, or object) is ignored instead of making the container fail to parse, so lenient detection never drops a container over its labels.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
 - `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout { endpoint }`, `HttpStatus { status }`, `InvalidResponse { source }` (a `ParseError`), and `Io { source, endpoint }` (a `std::io::Error`). `Timeout` and `Io` name the endpoint when it is known, as an `Option<String>`. Every variant that carries data is a `#[non_exhaustive]` struct variant, so later releases can add fields; match it with `..`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
@@ -19,7 +19,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - `PublishedContainerMatch::container` returns the matched container, if any, and `PublishedContainerMatch::container_arc` returns its shared `Arc<ContainerInfo>`, so a caller can keep the container with a reference count increment instead of cloning it.
 - `StopOutcome::is_stopped` tells whether the container is known to be stopped.
 - An optional `serde` feature derives `Serialize` and `Deserialize` for `ContainerInfo`, `Protocol`, `StopOutcome`, and `ProxyFallback`. docs.rs builds the documentation with every feature enabled.
-- Unix socket discovery now also checks `$XDG_RUNTIME_DIR/docker.sock` and `$XDG_RUNTIME_DIR/podman/podman.sock` (ahead of the hardcoded `/run/user/{uid}` paths), Colima (`~/.colima/default/docker.sock`, `~/.colima/docker.sock`), OrbStack (`~/.orbstack/run/docker.sock`), Rancher Desktop (`~/.rd/docker.sock`), Lima (`~/.lima/default/sock/docker.sock`, `~/.lima/docker/sock/docker.sock`), and Podman machine on macOS (`~/.local/share/containers/podman/machine/podman.sock`, `.../machine/qemu/podman.sock`, `.../machine/podman-machine-default/podman.sock`, and on macOS only `$TMPDIR/podman/podman-machine-default-api.sock`). Existing paths keep their relative priority; see the README for the full order. `$TMPDIR` is not searched outside macOS, because on Linux it is usually the shared `/tmp`, where another local user could plant a socket.
+- Unix socket discovery now also checks `$XDG_RUNTIME_DIR/docker.sock` and `$XDG_RUNTIME_DIR/podman/podman.sock` (ahead of the hardcoded `/run/user/{uid}` paths), Colima (`~/.colima/default/docker.sock`, `~/.colima/docker.sock`), OrbStack (`~/.orbstack/run/docker.sock`), Rancher Desktop (`~/.rd/docker.sock`), Lima (`~/.lima/default/sock/docker.sock`, `~/.lima/docker/sock/docker.sock`), and Podman machine on macOS (`~/.local/share/containers/podman/machine/podman.sock`, `.../machine/qemu/podman.sock`, `.../machine/podman-machine-default/podman.sock`, `$TMPDIR/podman/podman-machine-default-api.sock`). Existing paths keep their relative priority; see the README for the full order. `$TMPDIR` is searched on macOS only, where it is a private per-user directory; on Linux it is usually the shared `/tmp`, where another local user could plant a socket.
 - Default Unix socket paths that do not exist are now skipped before any worker thread is spawned, and paths that resolve to the same file (for example `/var/run/docker.sock` symlinked to Docker Desktop's, OrbStack's, or Podman's socket) are queried once, at the first position. `DOCKER_HOST=unix://` still replaces the defaults and is not filtered.
 - **Security:** a default Unix socket whose file is owned by neither the current user nor root is skipped, so a socket another local user planted at a well-known path can neither add containers to detection nor receive a stop request. An explicit `DOCKER_HOST=unix://` path is not checked.
 - `is_container_proxy_process(name)` recognizes container runtime port-proxy processes (`docker-proxy`, `rootlesskit`, `rootlessport`, `rootlessport-child`, `slirp4netns`, `pasta`, `pasta.avx2`, `com.docker.backend`, `com.docker.vpnkit`, `vpnkit`, `wslrelay`, `gvproxy`, `limactl`), ignoring ASCII case and a trailing `.exe` and accepting names truncated to 15 bytes by Linux or to 16 bytes by macOS (such as `com.docker.backe`). A truncated name matches only when it is exactly 15 or 16 bytes long and is the start of a longer known name. Callers no longer need to keep their own list.
@@ -51,7 +51,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 
 Waiting for background detection:
 
-```rust
+```rust,ignore
 // 0.1
 let port_map = nanodock::await_detection(handle);
 // 0.2
@@ -60,7 +60,7 @@ let port_map = handle.wait();
 
 Matching a socket against the published ports:
 
-```rust
+```rust,ignore
 // 0.1
 let found = nanodock::lookup_published_container(&port_map, socket, proto, is_proxy);
 // 0.2
@@ -71,7 +71,7 @@ let found = port_map.lookup(socket.ip(), socket.port(), proto, fallback);
 
 Building container metadata:
 
-```rust
+```rust,ignore
 // 0.1
 let info = ContainerInfo { id: id.to_string(), name: name.to_string(), image: image.to_string() };
 // 0.2
@@ -80,7 +80,7 @@ let info = ContainerInfo::new(id, name, image);
 
 Using `ContainerPortMap`, which is no longer a `HashMap`:
 
-```rust
+```rust,ignore
 // 0.1
 let mut map: ContainerPortMap = HashMap::new();
 map.insert((host_ip, port, proto), info);
@@ -113,7 +113,7 @@ let outcome = if force { client.kill(id) } else { client.stop(id) };
 
 Handling a stop that did not succeed:
 
-```rust
+```rust,ignore
 // 0.1
 StopOutcome::Failed => println!("stop failed or its result is unknown"),
 // 0.2
@@ -147,6 +147,17 @@ let owned: Option<ContainerInfo> = found.container().cloned();
 let shared: Option<Arc<ContainerInfo>> = found.container_arc().cloned();
 ```
 
+`ContainerInfo` no longer implements `Hash`, and `StopOutcome` no longer implements `Copy`:
+
+```rust,ignore
+// 0.1
+let seen: HashSet<ContainerInfo> = containers.cloned().collect();
+let again = outcome; // StopOutcome was Copy
+// 0.2: key on the container ID, and clone or borrow the outcome
+let seen: HashSet<String> = containers.map(|info| info.id.clone()).collect();
+let again = outcome.clone();
+```
+
 `parse_containers_json_strict` now fails with `nanodock::ParseError`; code that named `serde_json::Error` should name `ParseError` or use `impl std::error::Error`.
 
 Serializing `ContainerInfo`, `Protocol`, or `StopOutcome`:
@@ -160,7 +171,7 @@ nanodock = { version = "0.2", features = ["serde"] }
 
 Calling the free functions, which no longer take a home directory:
 
-```rust
+```rust,ignore
 // 0.1
 let port_map = nanodock::detect_containers(home)?;
 let handle = nanodock::start_detection(home);

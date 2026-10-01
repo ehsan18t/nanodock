@@ -56,10 +56,13 @@ library crate, or is it a leftover from the embedded-in-portlens era?"
    neighbouring comment explaining _why_.
 2. **Layered Error Handling:**
    - **Best-effort path** (`start_detection` / `DetectionHandle::wait`): Returns
-     `Option`. Designed for enrichment use cases where the daemon being down
-     is not an error.
-   - **Strict path** (`detect_containers`): Returns `Result<_, Error>`.
-     Designed for consumers who need to distinguish failure modes.
+     an empty `ContainerPortMap` on failure. Designed for enrichment use cases
+     where the daemon being down is not an error. `DetectionHandle::wait_result`
+     keeps the `Error` for callers that want to explain an empty map.
+   - **Strict path** (`Client::detect` / `detect_containers`): Returns
+     `Result<_, Error>`. `Error` says what happened (no daemon, permission
+     denied, timeout, HTTP status, invalid response, I/O); when every endpoint
+     fails, the most informative failure wins.
    - **Internal logic:** Never use `unwrap()` or `expect()` in non-test code.
 3. **Synchronous by Design:** Do **not** introduce `async/await`. The library
    queries local IPC sockets (Unix, Named Pipes) where latency is sub-millisecond.
@@ -98,10 +101,15 @@ and tuned for nanodock's library-crate positioning.
   types consumers are likely to persist or transmit.
 - **Enums must be `#[non_exhaustive]`** when they may gain variants in
   future minor releases (C-SEALED). This includes `Error`, `StopOutcome`,
-  `PublishedContainerMatch`, and `Protocol`.
-- **Struct fields are currently public** (`ContainerInfo`). This is acceptable
-  during the `0.x` series. Before `1.0`, evaluate sealing fields behind
-  accessor methods (C-STRUCT-PRIVATE) for future-proofing.
+  `PublishedContainerMatch`, `ProxyFallback`, and `Protocol`.
+- **`ContainerInfo` is `#[non_exhaustive]`** with public fields for reading.
+  External code builds it with `ContainerInfo::new` and the `with_*` methods,
+  so new fields are a minor change. Keep that pattern for new public structs.
+- **No third-party types in the public API.** `ParseError` wraps the
+  `serde_json` error opaquely; keep dependency types out of public
+  signatures so dependencies can change without a breaking release.
+- **Serde derives are behind the `serde` feature** (off by default): use
+  `#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]`.
 - **Display implementations** on all user-facing types: `Protocol`,
   `StopOutcome`, `Error` (already done), `ContainerInfo`.
 - **`std::error::Error`** must be implemented on `Error` with proper
@@ -113,15 +121,16 @@ and tuned for nanodock's library-crate positioning.
   over `&Path` for path parameters in public APIs.
 - **Return owned data from constructors** (C-CALLER-CONTROL): let the caller
   decide whether to `Arc`/`Rc` the result.
-- **The `home` parameter**: Several functions accept `home: Option<PathBuf>` for
-  Unix socket path discovery. This is the correct lightweight pattern for this
-  crate. Do NOT over-engineer a builder/config struct for this. If future
-  configuration needs arise (e.g., custom timeout, custom socket paths), then
-  introduce a builder.
-- **Timeouts**: The default 3-second daemon timeout is appropriate for
-  interactive CLI consumers. If a consumer needs a different timeout, they
-  should use `detect_containers` on their own thread with their own deadline.
-  Do NOT add timeout parameters to every function.
+- **Configuration lives on `Client`**: home directory, detection timeout, and
+  `DOCKER_HOST` override, each a chainable setter. The free functions
+  (`detect_containers`, `start_detection`, `stop_container`) are thin
+  shorthands over a default client with a `home` argument. New settings go on
+  `Client`; do NOT add parameters to the free functions.
+- **Timeouts**: The default 3-second detection timeout suits interactive CLI
+  consumers and is configurable with `Client::timeout`. The internal query
+  budget is derived from it (`query_budget`) and must stay strictly shorter so
+  the detection thread always delivers before the handle stops waiting. Stop
+  requests use their own fixed timeout sized for the 10 second grace period.
 
 ### 3.3 - Semantic Versioning
 
@@ -180,7 +189,7 @@ operator before creating a new module.
 
 | Crate        | Type | Purpose                                         |
 | ------------ | ---- | ----------------------------------------------- |
-| `serde`      | Prod | Container metadata serialization                |
+| `serde`      | Prod | JSON parsing; public derives behind `serde` feature |
 | `serde_json` | Prod | JSON response parsing from daemon API           |
 | `httparse`   | Prod | HTTP/1.x response header and chunk-size parsing |
 | `log`        | Prod | Logging facade for debug diagnostics            |
@@ -349,9 +358,7 @@ approval, but be aware of them when making design decisions:
 - **Trait implementations audit**: Ensure all public types satisfy the Rust API
   Guidelines C-COMMON-TRAITS checklist before 1.0.
 - **`#[non_exhaustive]` sweep**: Add to all public enums before 1.0.
-- **CHANGELOG.md**: Introduce before the first non-0.1.x release.
 - **Cargo.toml metadata**: Add `homepage` and `documentation` fields.
-- **Error type enrichment**: Consider finer-grained error variants (transport
-  failure, permission denied, timeout) if consumer feedback warrants it.
-- **`ContainerInfo` field sealing**: Evaluate private fields with accessor
-  methods before 1.0 for future-proofing (C-STRUCT-PRIVATE).
+- **`ContainerInfo` field sealing**: The struct is `#[non_exhaustive]`; before
+  1.0, decide whether the public fields should become accessor methods
+  (C-STRUCT-PRIVATE).

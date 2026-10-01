@@ -16,14 +16,22 @@
   running containers and their published port bindings.
 - **Port-to-container mapping** - Resolves which container owns a given host
   `(ip, port, protocol)` tuple, with wildcard and proxy-fallback matching.
+- **Compose awareness** - Reports the Docker Compose (or `podman-compose`)
+  project and service of each container from its labels.
 - **Container lifecycle control** - Stop or kill containers by ID through the
-  daemon API (graceful SIGTERM or immediate SIGKILL).
+  daemon API (graceful SIGTERM or immediate SIGKILL), with an outcome that
+  tells "unreachable", "no reply", and "rejected" apart.
+- **Actionable errors** - Detection failures say what happened: no daemon,
+  permission denied (with the socket path), timeout, an HTTP error status, or
+  an invalid reply.
 - **Multi-transport support** - Connects via Unix domain sockets, Windows named
   pipes, or TCP (`DOCKER_HOST`), with automatic discovery of socket paths.
 - **Rootless Podman support** - Resolves rootless Podman containers on Linux by
   reading overlay storage metadata and matching network namespace paths.
 - **Background detection** - Spawns detection on a background thread so callers
   can do other work (socket enumeration, process lookup) concurrently.
+- **Configurable** - A `Client` sets the detection timeout, the home directory,
+  and the `DOCKER_HOST` override without touching the environment.
 - **Minimal dependencies** - Only `serde`, `serde_json`, `httparse`, and `log` at runtime, plus `libc` on Unix. No async runtime, no `tokio`, no `hyper`.
 - **Cross-platform** - Tested in CI on Linux (x86-64) and Windows (x86-64). macOS and other Unix targets build through the same `cfg(unix)` code path but are not tested in CI.
 
@@ -69,38 +77,64 @@ Two detection paths are available:
 use nanodock::start_detection;
 
 fn main() {
-    // Spawn background detection (queries Docker/Podman daemon).
+    // Spawn background detection (queries the Docker/Podman daemons).
     let handle = start_detection(None);
 
     // ... do other work while detection runs ...
 
-    // Collect results (blocks up to 3 seconds after the start).
+    // Collect the results (waits at most 3 seconds after the start).
     let port_map = handle.wait();
 
     for ((ip, port, proto), info) in &port_map {
+        let host = ip.map_or_else(|| "*".to_string(), |ip| ip.to_string());
         println!(
-            "{proto} port {port} -> container '{}' (image: {})",
+            "{proto} {host}:{port} -> container '{}' (image: {})",
             info.name, info.image
         );
     }
 }
 ```
 
+Use `handle.wait_result()` instead of `handle.wait()` to learn why the map is empty.
+
 **Strict path** (synchronous, returns errors):
 
 ```rust,no_run
-use nanodock::detect_containers;
+use nanodock::{detect_containers, Error};
 
 fn main() {
     match detect_containers(None) {
         Ok(port_map) => {
-            for ((ip, port, proto), info) in &port_map {
-                println!(
-                    "{proto} port {port} -> container '{}' (image: {})",
-                    info.name, info.image
-                );
+            for ((_, port, proto), info) in &port_map {
+                let project = info.compose_project.as_deref().unwrap_or("-");
+                println!("{proto} port {port} -> '{}' (compose project: {project})", info.name);
             }
         }
+        Err(Error::PermissionDenied { endpoint }) => {
+            eprintln!("no permission to use {endpoint}; is this user in the docker group?");
+        }
+        Err(Error::DaemonNotFound) => eprintln!("no Docker or Podman daemon is running"),
+        Err(e) => eprintln!("detection failed: {e}"),
+    }
+}
+```
+
+### Configure the client
+
+`Client` holds the settings the free functions take from the environment: the home directory (used on Unix to find per-user sockets), the detection timeout (3 seconds by default), and the `DOCKER_HOST` override.
+
+```rust,no_run
+use std::time::Duration;
+use nanodock::Client;
+
+fn main() {
+    let client = Client::new()
+        .timeout(Duration::from_secs(1))
+        // Ignore DOCKER_HOST and query only the default sockets or pipes.
+        .docker_host(None);
+
+    match client.detect() {
+        Ok(port_map) => println!("{} published ports", port_map.len()),
         Err(e) => eprintln!("detection failed: {e}"),
     }
 }
@@ -116,6 +150,8 @@ fn main() {
     let port_map = start_detection(None).wait();
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    // `ProxyFallback::Allow` is for proxy processes such as docker-proxy,
+    // whose socket address may differ from the published host IP.
     match port_map.lookup(ip, 5432, Protocol::Tcp, ProxyFallback::Deny) {
         PublishedContainerMatch::Match(info) => {
             println!("Port 5432 belongs to '{}' ({})", info.name, info.image);
@@ -156,7 +192,7 @@ fn main() {
 nanodock communicates directly with the Docker/Podman daemon using the
 `/containers/json` REST API endpoint over local transports:
 
-```
+```text
 ┌─────────────┐     HTTP/1.0 GET /containers/json
 │  nanodock   │ ──────────────────────────────────────┐
 │ (your app)  │                                       │
@@ -171,7 +207,7 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Transport Discovery Order
 
-1. **`DOCKER_HOST` environment variable** - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
+1. **`DOCKER_HOST` environment variable** (or `Client::docker_host`) - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
 2. **Platform-native sockets** - On Linux, well-known Unix socket paths are probed (rootful Docker, rootless Docker, Podman). On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged.
 3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless
    Podman, nanodock reads the overlay storage metadata to resolve container
@@ -199,31 +235,45 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 ### Core Types
 
-| Type                      | Description                                               |
-| ------------------------- | --------------------------------------------------------- |
-| `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, and `stop` |
-| `Protocol`                | Network protocol enum (`Tcp`, `Udp`)                      |
-| `ContainerInfo`           | Container metadata (id, name, image, Compose project and service) |
-| `ContainerPortMap`        | Map from `(ip, port, protocol)` to a shared `ContainerInfo`, with `get`, `iter`, and `lookup` |
-| `ProxyFallback`           | Whether `ContainerPortMap::lookup` may match on port and protocol alone |
-| `PublishedContainerMatch` | Result of looking up a socket in the port map             |
-| `StopOutcome`             | Result of a stop/kill request                             |
-| `DetectionHandle`         | Handle for in-progress background detection               |
-| `Error`                   | Why strict-path detection failed (daemon not found, permission denied, timeout, HTTP status, invalid response, I/O) |
-| `ParseError`              | Opaque error for a reply that is not valid HTTP or container-list JSON |
+| Type                      | Description                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, `stop` |
+| `ContainerInfo`           | Container metadata: id, name, image, Compose project and service                    |
+| `ContainerPortMap`        | Map from `(host_ip, port, protocol)` to a shared `ContainerInfo`                    |
+| `PortMapIter`             | Iterator over the bindings of a `ContainerPortMap`                                  |
+| `ProxyFallback`           | Whether a lookup may match a proxy process on port and protocol alone               |
+| `PublishedContainerMatch` | Result of looking up a socket address in the port map                               |
+| `DetectionHandle`         | Handle for an in-progress background detection                                      |
+| `StopOutcome`             | Result of a stop or kill request                                                    |
+| `Error`                   | Why detection failed                                                                |
+| `ParseError`              | Opaque error for a reply that is not valid HTTP or container-list JSON              |
+| `Protocol`                | Network protocol (`Tcp`, `Udp`)                                                     |
 
-### Core Functions
+### Core Functions and Methods
 
-| Function                          | Description                                         |
-| --------------------------------- | --------------------------------------------------- |
-| `detect_containers(home)`         | Synchronous detection, returns `Result<Map, Error>` |
-| `start_detection(home)`           | Spawn background daemon query, returns handle       |
-| `DetectionHandle::wait()`         | Block for results (3s timeout), returns map         |
-| `DetectionHandle::wait_result()`  | Same, but returns `Result` with the failure reason  |
-| `ContainerPortMap::lookup()`      | Match a socket address against the port map         |
-| `stop_container(id, force, home)` | Stop or kill a container by ID                      |
-| `parse_containers_json(body)`     | Parse raw `/containers/json` response               |
-| `parse_containers_json_strict()`  | Strict parse that returns `Result` on invalid JSON  |
+| Item                                              | Description                                                |
+| ------------------------------------------------- | ---------------------------------------------------------- |
+| `Client::new()`                                   | Client configured from `DOCKER_HOST` and the home directory |
+| `.home(home)`, `.timeout(t)`, `.docker_host(h)`   | Chainable settings                                         |
+| `Client::detect()`                                | Synchronous detection, returns `Result<ContainerPortMap, Error>` |
+| `Client::start_detection()`                       | Spawn a background detection, returns a `DetectionHandle`  |
+| `Client::stop(id, force)`                         | Stop or kill a container by ID or name                     |
+| `DetectionHandle::wait()`                         | Wait for the result (empty map on failure or timeout)      |
+| `DetectionHandle::wait_result()`                  | Wait for the result, keeping the `Error`                   |
+| `ContainerPortMap::lookup(ip, port, proto, fallback)` | Match a socket address against the published ports     |
+| `ContainerPortMap::get(host_ip, port, proto)`     | Exact binding lookup                                       |
+| `detect_containers(home)`                         | Shorthand for `Client::new().home(home).detect()`          |
+| `start_detection(home)`                           | Shorthand for `Client::new().home(home).start_detection()` |
+| `stop_container(id, force, home)`                 | Shorthand for `Client::new().home(home).stop(id, force)`   |
+| `parse_containers_json(body)`                     | Lenient parse of a raw `/containers/json` response         |
+| `parse_containers_json_strict(body)`              | Strict parse that fails with `ParseError` on invalid JSON  |
+| `short_container_id(id)`                          | The 12-character short form of a container ID              |
+
+### Cargo Features
+
+| Feature | Default | Description                                                                                    |
+| ------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `serde` | Off     | Derives `Serialize` and `Deserialize` for `ContainerInfo`, `Protocol`, `StopOutcome`, `ProxyFallback` |
 
 ### Linux-only Functions
 
@@ -235,7 +285,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 ## Architecture
 
-```
+```text
 src/
 ├── lib.rs      - Public API, detection orchestration, port matching
 ├── api.rs      - JSON response parsing, container name resolution
@@ -331,7 +381,7 @@ nanodock keeps its dependency tree intentionally small:
 
 | Crate        | Purpose                                |
 | ------------ | -------------------------------------- |
-| `serde`      | Container metadata serialization       |
+| `serde`      | JSON response parsing (and the optional `serde` derives) |
 | `serde_json` | JSON response parsing                  |
 | `httparse`   | HTTP/1.x response header parsing       |
 | `log`        | Debug diagnostics via log facade       |

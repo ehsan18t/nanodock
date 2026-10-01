@@ -4,6 +4,18 @@
 //! detection, port mapping, and lifecycle control. Runtime dependencies are
 //! `serde`, `serde_json`, `httparse`, and `log`, plus `libc` on Unix.
 //!
+//! ## Overview
+//!
+//! - [`Client`] holds the daemon settings (home directory, detection
+//!   timeout, `DOCKER_HOST` override) and runs detection and stop requests.
+//!   [`detect_containers`], [`start_detection`], and [`stop_container`] are
+//!   shorthands for a default client.
+//! - Detection returns a [`ContainerPortMap`] from published
+//!   `(host_ip, port, protocol)` bindings to [`ContainerInfo`].
+//!   [`ContainerPortMap::lookup`] finds the container behind a local socket.
+//! - Failures are reported as an [`Error`] that says what happened, and stop
+//!   requests as a [`StopOutcome`].
+//!
 //! ## Cargo features
 //!
 //! - `serde` (off by default): derives `Serialize` and `Deserialize` for
@@ -36,15 +48,36 @@
 //! ### Strict path (synchronous, returns errors)
 //!
 //! ```rust,no_run
-//! use nanodock::detect_containers;
+//! use std::time::Duration;
+//! use nanodock::{Client, Error};
 //!
-//! match detect_containers(None) {
+//! let client = Client::new().timeout(Duration::from_secs(2));
+//! match client.detect() {
 //!     Ok(port_map) => {
 //!         for ((ip, port, proto), info) in &port_map {
 //!             println!("{proto} port {port} -> {} ({})", info.name, info.image);
 //!         }
 //!     }
+//!     Err(Error::PermissionDenied { endpoint }) => {
+//!         eprintln!("no permission to use {endpoint}");
+//!     }
 //!     Err(e) => eprintln!("detection failed: {e}"),
+//! }
+//! ```
+//!
+//! ### Which container owns a socket?
+//!
+//! ```rust,no_run
+//! use std::net::{IpAddr, Ipv4Addr};
+//! use nanodock::{Protocol, ProxyFallback};
+//!
+//! let port_map = nanodock::start_detection(None).wait();
+//! let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+//! if let Some(info) = port_map
+//!     .lookup(ip, 5432, Protocol::Tcp, ProxyFallback::Deny)
+//!     .container()
+//! {
+//!     println!("port 5432 belongs to {info}");
 //! }
 //! ```
 
@@ -53,6 +86,11 @@ mod http;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod podman;
+
+// Compiles the README examples as doctests so they cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 use std::collections::HashMap;
 use std::net::IpAddr;

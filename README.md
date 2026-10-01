@@ -217,7 +217,7 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Supported Daemon Paths
 
-Unix sockets in priority order. `$XDG_RUNTIME_DIR` and `$TMPDIR` are used only when set to an absolute path, and a `$XDG_RUNTIME_DIR` entry equal to its `/run/user/{uid}` fallback is listed once.
+Unix sockets in priority order. `$XDG_RUNTIME_DIR` and `$TMPDIR` are used only when set to an absolute path, and a `$XDG_RUNTIME_DIR` entry equal to its `/run/user/{uid}` fallback is listed once. `$TMPDIR` is searched on macOS only, where it is a private per-user directory; on Linux it is usually the shared `/tmp`. A default socket whose file is owned by neither the current user nor root is skipped, so a socket another local user planted at one of these paths is never queried or sent a stop request. A `DOCKER_HOST=unix://` path is the user's explicit choice and is not checked.
 
 | Platform | Transport   | Path                                                                              | Runtime                                 |
 | -------- | ----------- | --------------------------------------------------------------------------------- | --------------------------------------- |
@@ -238,7 +238,7 @@ Unix sockets in priority order. `$XDG_RUNTIME_DIR` and `$TMPDIR` are used only w
 | Unix     | Unix socket | `$HOME/.local/share/containers/podman/machine/podman.sock`                        | Podman machine (macOS, Podman 4)        |
 | Unix     | Unix socket | `$HOME/.local/share/containers/podman/machine/qemu/podman.sock`                   | Podman machine (macOS, Podman 4)        |
 | Unix     | Unix socket | `$HOME/.local/share/containers/podman/machine/podman-machine-default/podman.sock` | Podman machine (macOS, Podman 4)        |
-| Unix     | Unix socket | `$TMPDIR/podman/podman-machine-default-api.sock`                                  | Podman machine (macOS, Podman 5)        |
+| macOS    | Unix socket | `$TMPDIR/podman/podman-machine-default-api.sock`                                  | Podman machine (macOS, Podman 5)        |
 | Windows  | Named pipe  | `\\.\pipe\docker_engine`                                                          | Docker Desktop                          |
 | Windows  | Named pipe  | `\\.\pipe\podman-machine-default`                                                 | Podman machine                          |
 | Both     | TCP         | `DOCKER_HOST=tcp://host:port`                                                     | Any                                     |

@@ -280,6 +280,10 @@ const HOME_SOCKET_PATHS: &[&str] = &[
 ];
 
 /// Podman machine API socket below `$TMPDIR` on macOS (Podman 5).
+///
+/// Only looked up on macOS (see [`podman_machine_tmpdir`]): there `$TMPDIR`
+/// is a per-user directory with mode 0700. On Linux it is usually the shared
+/// `/tmp`, where another local user could plant a socket at this path.
 #[cfg(any(unix, test))]
 const TMPDIR_SOCKET_PATH: &str = "podman/podman-machine-default-api.sock";
 
@@ -288,7 +292,8 @@ const TMPDIR_SOCKET_PATH: &str = "podman/podman-machine-default-api.sock";
 /// A pure function of its inputs so the order can be tested without touching
 /// the process environment. `xdg_runtime_dir` (where rootless Docker and
 /// Podman put their sockets) is tried before the hardcoded `/run/user/{uid}`
-/// fallback; when the two are the same directory it is listed once.
+/// fallback; when the two are the same directory it is listed once. `tmpdir`
+/// adds the Podman machine socket below it and must only be passed on macOS.
 #[cfg(any(unix, test))]
 fn unix_socket_candidates(
     uid: u32,
@@ -370,22 +375,80 @@ fn absolute_env_path(name: &str) -> Option<std::path::PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
+/// `$TMPDIR`, where Podman 5 puts its machine API socket on macOS.
+///
+/// macOS gives every user a private `$TMPDIR` (mode 0700), so a socket there
+/// was created by this user.
+#[cfg(target_os = "macos")]
+fn podman_machine_tmpdir() -> Option<std::path::PathBuf> {
+    absolute_env_path("TMPDIR")
+}
+
+/// Outside macOS `$TMPDIR` is not consulted: it is usually the shared `/tmp`,
+/// where any local user could create `podman/podman-machine-default-api.sock`.
+#[cfg(all(unix, not(target_os = "macos")))]
+const fn podman_machine_tmpdir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Whether a daemon socket whose file belongs to `owner` may be used by the
+/// user `uid`: only sockets owned by that user or by root are trusted.
+///
+/// Every default candidate is checked, so a socket another unprivileged user
+/// planted at a well-known path (in a shared or misconfigured directory) is
+/// never queried for containers and never receives a stop request.
+#[cfg(any(unix, test))]
+const fn is_trusted_socket_owner(owner: u32, uid: u32) -> bool {
+    owner == uid || owner == 0
+}
+
+/// Whether the socket at `path` (after following symlinks) is owned by `uid`
+/// or by root; see [`is_trusted_socket_owner`].
+#[cfg(unix)]
+fn is_owned_by_trusted_user(path: &std::path::Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) if is_trusted_socket_owner(metadata.uid(), uid) => true,
+        Ok(metadata) => {
+            debug!(
+                "skipping socket owned by another user: path={} owner_uid={}",
+                path.display(),
+                metadata.uid()
+            );
+            false
+        }
+        Err(error) => {
+            debug!(
+                "skipping unusable socket candidate: path={} error={error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 /// The default Unix daemon sockets that exist for this user, in priority
 /// order, each real socket listed once.
 ///
-/// Reads `XDG_RUNTIME_DIR` and `TMPDIR` from the environment; see
+/// Reads `XDG_RUNTIME_DIR` (and `TMPDIR` on macOS) from the environment; see
 /// [`unix_socket_candidates`] for the order and [`existing_unique_sockets`]
-/// for the filtering.
+/// for the filtering. A socket that is not owned by `uid` or by root is
+/// skipped (see [`is_trusted_socket_owner`]). A `DOCKER_HOST=unix://` path
+/// is the user's explicit choice and is not checked.
 #[cfg(unix)]
 pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     let xdg_runtime_dir = absolute_env_path("XDG_RUNTIME_DIR");
-    let tmpdir = absolute_env_path("TMPDIR");
+    let tmpdir = podman_machine_tmpdir();
     existing_unique_sockets(unix_socket_candidates(
         uid,
         home,
         xdg_runtime_dir.as_deref(),
         tmpdir.as_deref(),
     ))
+    .into_iter()
+    .filter(|path| is_owned_by_trusted_user(path, uid))
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +478,7 @@ pub fn fetch_unix_socket_json(
 /// queues the connection or refuses it. The one blocking case (Linux, listener
 /// backlog full) cannot be bounded with std alone because `SO_SNDTIMEO` would
 /// have to be set before connecting. Callers still stay bounded: detection
-/// workers are detached at the deadline by [`fetch_all_successes`], and all
+/// workers are detached at the deadline by [`fetch_all`], and all
 /// I/O after the connect runs under [`DeadlineStream`].
 #[cfg(unix)]
 fn connect_unix_stream(
@@ -1331,6 +1394,58 @@ mod tests {
             kept,
             vec![docker],
             "docker.sock symlinked to podman.sock is one daemon, and a dangling link is skipped"
+        );
+    }
+
+    #[test]
+    fn only_the_user_and_root_own_trusted_sockets() {
+        assert!(is_trusted_socket_owner(1000, 1000), "the user's own socket");
+        assert!(
+            is_trusted_socket_owner(0, 1000),
+            "a root-owned system socket"
+        );
+        assert!(
+            !is_trusted_socket_owner(1001, 1000),
+            "a socket another user planted must be skipped"
+        );
+        assert!(is_trusted_socket_owner(0, 0), "root trusts its own sockets");
+        assert!(
+            !is_trusted_socket_owner(1000, 0),
+            "root does not trust an unprivileged user's socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_owner_check_reads_the_file_owner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("docker.sock");
+        std::fs::write(&socket, b"").expect("create socket file");
+        // Safety: getuid() is a simple syscall with no preconditions.
+        let uid = unsafe { libc::getuid() };
+
+        assert!(
+            is_owned_by_trusted_user(&socket, uid),
+            "a socket the current user created is used"
+        );
+        if uid != 0 {
+            assert!(
+                !is_owned_by_trusted_user(&socket, uid + 1),
+                "a socket owned by neither the user nor root is skipped"
+            );
+        }
+        assert!(
+            !is_owned_by_trusted_user(&dir.path().join("missing.sock"), uid),
+            "a missing socket is skipped"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn tmpdir_is_not_searched_outside_macos() {
+        assert!(
+            podman_machine_tmpdir().is_none(),
+            "a shared /tmp must never contribute a socket candidate"
         );
     }
 

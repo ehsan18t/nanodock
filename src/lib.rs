@@ -387,7 +387,7 @@ impl std::fmt::Display for StopOutcome {
 ///
 /// The `id` parameter can be a container ID (hex) or a container name.
 /// Characters that would corrupt the HTTP request path (`/`, `?`, `#`,
-/// control characters, spaces) are rejected early with
+/// `%`, control characters, spaces) are rejected early with
 /// [`StopOutcome::NotFound`].
 ///
 /// The `home` parameter provides the user's home directory path, used
@@ -430,7 +430,7 @@ fn stop_endpoint(id: &str, force: bool) -> String {
     };
     debug!(
         "attempting container stop: id={} force={force} endpoint={endpoint}",
-        &id[..id.len().min(12)]
+        short_container_id(id)
     );
     endpoint
 }
@@ -439,12 +439,13 @@ fn stop_endpoint(id: &str, force: bool) -> String {
 ///
 /// Docker accepts both hex IDs and container names (alphanumeric, hyphens,
 /// underscores, dots). This function rejects only characters that could
-/// cause path traversal or HTTP header injection.
+/// cause path traversal or HTTP header injection: `/`, `?`, `#`, `%`,
+/// spaces, and every control character.
 fn is_safe_container_id(id: &str) -> bool {
     !id.is_empty()
         && !id
-            .bytes()
-            .any(|b| matches!(b, b'/' | b'?' | b'#' | b'%' | b'\r' | b'\n' | b' '))
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '?' | '#' | '%' | ' '))
 }
 
 /// Map the combined result of a stop request to `StopOutcome`.
@@ -1067,7 +1068,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_id_rejects_every_control_character() {
+        for id in [
+            "abc\tdef",
+            "abc\0",
+            "abc\u{7f}",
+            "abc\u{85}",
+            "abc\u{1b}[0m",
+        ] {
+            assert!(
+                !is_safe_container_id(id),
+                "control character in {id:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_id_accepts_non_ascii_name() {
+        assert!(
+            is_safe_container_id("caf\u{e9}-container"),
+            "non-ASCII printable characters do not corrupt the request line"
+        );
+    }
+
     // ── stop_endpoint ────────────────────────────────────────────────
+
+    /// Logger that enables every level, so `debug!` arguments are evaluated.
+    struct EnabledLogger;
+
+    impl log::Log for EnabledLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, _record: &log::Record<'_>) {}
+
+        fn flush(&self) {}
+    }
+
+    static ENABLED_LOGGER: EnabledLogger = EnabledLogger;
 
     #[test]
     fn stop_endpoint_sends_explicit_grace_period() {
@@ -1080,6 +1120,23 @@ mod tests {
             stop_endpoint("abc123", true),
             "/containers/abc123/kill",
             "kill takes no grace period"
+        );
+    }
+
+    #[test]
+    fn stop_endpoint_handles_multibyte_id_with_debug_logging() {
+        // Another test may already have installed a logger; either way the
+        // max level below makes `debug!` evaluate its arguments.
+        drop(log::set_logger(&ENABLED_LOGGER));
+        log::set_max_level(log::LevelFilter::Debug);
+
+        // Byte 12 falls inside the two-byte 'e9' character.
+        let id = "aaaaaaaaaaa\u{e9}bc";
+        assert!(is_safe_container_id(id), "non-ASCII ids pass validation");
+        assert_eq!(
+            stop_endpoint(id, false),
+            format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS),
+            "a multi-byte id must not panic when logged"
         );
     }
 

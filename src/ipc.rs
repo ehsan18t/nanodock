@@ -1523,8 +1523,8 @@ mod tests {
 
         assert_eq!(
             crate::stop_outcome(attempt, false),
-            crate::StopOutcome::Failed,
-            "an unanswered stop is a failure"
+            crate::StopOutcome::NoResponse,
+            "an unanswered stop has an unknown result"
         );
         assert!(any_post(&first_requests), "the first daemon got the stop");
         assert!(

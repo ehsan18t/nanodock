@@ -708,21 +708,43 @@ pub enum StopOutcome {
     Stopped,
     /// Container was already stopped (HTTP 304 for stop, 409 for kill).
     AlreadyStopped,
-    /// Container was not found (HTTP 404).
+    /// Container was not found (HTTP 404), or the id contains characters
+    /// that cannot name a container.
     NotFound,
-    /// No daemon could be reached, the daemon returned an unexpected status,
-    /// or it received the request but gave no usable reply (the
-    /// container may or may not have been stopped).
-    Failed,
+    /// No daemon could be contacted, so no daemon received the request and
+    /// the container was not touched.
+    Unreachable,
+    /// A daemon received the request but gave no usable reply: the
+    /// connection closed, the request timed out, or the reply was partial
+    /// or malformed. The container may or may not be stopping.
+    NoResponse,
+    /// The daemon answered with an unexpected HTTP status, such as 500.
+    Rejected {
+        /// The HTTP status code of the reply.
+        status: u16,
+    },
+}
+
+impl StopOutcome {
+    /// Whether the container is known to be stopped now: it was stopped or
+    /// already was.
+    #[must_use]
+    pub const fn is_stopped(self) -> bool {
+        matches!(self, Self::Stopped | Self::AlreadyStopped)
+    }
 }
 
 impl std::fmt::Display for StopOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Stopped => write!(f, "stopped"),
-            Self::AlreadyStopped => write!(f, "already stopped"),
-            Self::NotFound => write!(f, "not found"),
-            Self::Failed => write!(f, "failed"),
+            Self::Stopped => f.write_str("stopped"),
+            Self::AlreadyStopped => f.write_str("already stopped"),
+            Self::NotFound => f.write_str("not found"),
+            Self::Unreachable => f.write_str("no container runtime daemon could be reached"),
+            Self::NoResponse => f.write_str("the daemon gave no reply, the result is unknown"),
+            Self::Rejected { status } => {
+                write!(f, "rejected by the daemon with HTTP status {status}")
+            }
         }
     }
 }
@@ -752,9 +774,11 @@ impl std::fmt::Display for StopOutcome {
 /// result. A "not found" from a default daemon moves on to the next one,
 /// and the first other reply is the result. Once a daemon has received the
 /// stop request, a closed or reset connection, a timeout, or a partial or
-/// malformed reply ends the search with [`StopOutcome::Failed`], even when
-/// an earlier daemon answered "not found": that daemon may still be
-/// stopping the container, so no other daemon is tried.
+/// malformed reply ends the search with [`StopOutcome::NoResponse`], even
+/// when an earlier daemon answered "not found": that daemon may still be
+/// stopping the container, so no other daemon is tried. When no daemon could
+/// be contacted at all the result is [`StopOutcome::Unreachable`], and an
+/// unexpected HTTP status is [`StopOutcome::Rejected`].
 #[must_use]
 pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutcome {
     if !is_safe_container_id(id) {
@@ -798,19 +822,19 @@ fn is_safe_container_id(id: &str) -> bool {
 
 /// Map the combined result of a stop request to `StopOutcome`.
 ///
-/// Both "no daemon reachable" and "a daemon received the request but gave
-/// no usable reply" are failures: in the second case the container may or
-/// may not have been stopped, so it must not be reported as not found.
+/// "A daemon received the request but gave no usable reply" is
+/// [`StopOutcome::NoResponse`], never "not found": the container may or may
+/// not have been stopped.
 fn stop_outcome(attempt: ipc::StopAttempt, force: bool) -> StopOutcome {
     match attempt {
         ipc::StopAttempt::Status(status_code) => interpret_stop_status(status_code, force),
         ipc::StopAttempt::NoResponse => {
             debug!("container runtime daemon did not reply to stop request");
-            StopOutcome::Failed
+            StopOutcome::NoResponse
         }
         ipc::StopAttempt::Unreachable => {
             debug!("no transport could reach container runtime daemon for stop");
-            StopOutcome::Failed
+            StopOutcome::Unreachable
         }
     }
 }
@@ -824,9 +848,9 @@ fn interpret_stop_status(status_code: u16, force: bool) -> StopOutcome {
         // POST /containers/{id}/kill returns 409 when container is not running.
         409 if force => StopOutcome::AlreadyStopped,
         404 => StopOutcome::NotFound,
-        _ => {
-            debug!("unexpected status code from container stop endpoint: {status_code}");
-            StopOutcome::Failed
+        status => {
+            debug!("unexpected status code from container stop endpoint: {status}");
+            StopOutcome::Rejected { status }
         }
     }
 }
@@ -1442,11 +1466,11 @@ mod tests {
     }
 
     #[test]
-    fn interpret_stop_status_409_on_graceful_means_failed() {
+    fn interpret_stop_status_409_on_graceful_is_rejected() {
         assert_eq!(
             interpret_stop_status(409, false),
-            StopOutcome::Failed,
-            "409 on non-force is unexpected and should map to Failed"
+            StopOutcome::Rejected { status: 409 },
+            "409 on non-force is unexpected and should be reported with its status"
         );
     }
 
@@ -1460,11 +1484,23 @@ mod tests {
     }
 
     #[test]
-    fn interpret_stop_status_500_means_failed() {
+    fn interpret_stop_status_500_is_rejected() {
         assert_eq!(
             interpret_stop_status(500, false),
-            StopOutcome::Failed,
-            "server error should map to Failed"
+            StopOutcome::Rejected { status: 500 },
+            "a server error is reported with its status"
+        );
+    }
+
+    #[test]
+    fn stop_outcome_reports_whether_the_container_is_stopped() {
+        assert!(StopOutcome::Stopped.is_stopped());
+        assert!(StopOutcome::AlreadyStopped.is_stopped());
+        assert!(!StopOutcome::NoResponse.is_stopped());
+        assert!(!StopOutcome::Rejected { status: 500 }.is_stopped());
+        assert_eq!(
+            StopOutcome::Rejected { status: 500 }.to_string(),
+            "rejected by the daemon with HTTP status 500"
         );
     }
 
@@ -1693,8 +1729,8 @@ mod tests {
         );
         assert_eq!(
             stop_outcome(result, false),
-            StopOutcome::Failed,
-            "an unreachable daemon is a failure"
+            StopOutcome::Unreachable,
+            "no daemon received the request"
         );
     }
 
@@ -1721,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_after_404_then_silent_daemon_is_failed_not_not_found() {
+    fn stop_after_404_then_silent_daemon_is_no_response_not_not_found() {
         // One default daemon answers 404, then the next one receives the
         // request and never replies: the container may have been stopped.
         for force in [false, true] {
@@ -1731,7 +1767,7 @@ mod tests {
             );
             assert_eq!(
                 stop_outcome(attempt, force),
-                StopOutcome::Failed,
+                StopOutcome::NoResponse,
                 "a daemon that received the stop and went silent must not read as not found"
             );
         }

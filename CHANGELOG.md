@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
 - `PublishedContainerMatch::container` returns the matched container, if any.
+- `StopOutcome::is_stopped` tells whether the container is known to be stopped.
 - `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout`, `HttpStatus(u16)`, `InvalidResponse(ParseError)`, and `Io(std::io::Error)`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
 
 ### Changed
@@ -21,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `parse_containers_json_strict` returns `Result<ContainerPortMap, ParseError>` instead of `Result<_, serde_json::Error>`.
 - **Breaking:** `Error::DaemonNotFound` now means that no daemon listens on any known endpoint. Failures that were reported as `DaemonNotFound` before (permission denied, timeout, an error status, a malformed reply) now have their own variants.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
+- **Breaking:** `StopOutcome::Failed` is split into `StopOutcome::Unreachable` (no daemon could be contacted, so the container was not touched), `StopOutcome::NoResponse` (a daemon received the request but gave no usable reply, so the container may or may not be stopping), and `StopOutcome::Rejected { status }` (the daemon answered with an unexpected HTTP status). The stop semantics are unchanged: the ping preflight, the rule that no second daemon is tried once one may have received the request, and the rule that any reply from the `DOCKER_HOST` daemon ends the search all still apply.
 
 ### Removed
 

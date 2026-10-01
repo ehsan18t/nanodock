@@ -137,9 +137,10 @@ fn main() {
         StopOutcome::Stopped => println!("Container stopped"),
         StopOutcome::AlreadyStopped => println!("Container was already stopped"),
         StopOutcome::NotFound => println!("Container not found"),
-        // No daemon could be reached, the daemon returned an error, or it
-        // received the request but gave no usable reply.
-        StopOutcome::Failed => println!("Stop failed or its result is unknown"),
+        StopOutcome::Unreachable => println!("No daemon could be reached"),
+        // The daemon received the request but gave no usable reply.
+        StopOutcome::NoResponse => println!("The result of the stop is unknown"),
+        StopOutcome::Rejected { status } => println!("The daemon answered HTTP {status}"),
         _ => println!("Unexpected outcome"),
     }
 }
@@ -165,7 +166,7 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Transport Discovery Order
 
-1. **`DOCKER_HOST` environment variable** - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::Failed` and no other daemon is tried.
+1. **`DOCKER_HOST` environment variable** - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::NoResponse` and no other daemon is tried.
 2. **Platform-native sockets** - On Linux, well-known Unix socket paths are probed (rootful Docker, rootless Docker, Podman). On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged.
 3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless
    Podman, nanodock reads the overlay storage metadata to resolve container

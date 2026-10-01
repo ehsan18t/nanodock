@@ -78,7 +78,7 @@ use nanodock::start_detection;
 
 fn main() {
     // Spawn background detection (queries the Docker/Podman daemons).
-    let handle = start_detection(None);
+    let handle = start_detection();
 
     // ... do other work while detection runs ...
 
@@ -103,7 +103,7 @@ Use `handle.wait_result()` instead of `handle.wait()` to learn why the map is em
 use nanodock::{detect_containers, Error};
 
 fn main() {
-    match detect_containers(None) {
+    match detect_containers() {
         Ok(port_map) => {
             for ((_, port, proto), info) in &port_map {
                 let project = info.compose_project.as_deref().unwrap_or("-");
@@ -121,7 +121,7 @@ fn main() {
 
 ### Configure the client
 
-`Client` holds the settings the free functions take from the environment: the home directory (used on Unix to find per-user sockets), the detection timeout (3 seconds by default), and the `DOCKER_HOST` override.
+The free functions use `Client::new()`, which reads the `DOCKER_HOST` override and the home directory (used on Unix to find per-user sockets such as Docker Desktop's, Colima's, or OrbStack's) from the environment, with a 3 second detection timeout. Build a `Client` to change any of these settings.
 
 ```rust,no_run
 use std::time::Duration;
@@ -147,7 +147,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use nanodock::{start_detection, Protocol, ProxyFallback, PublishedContainerMatch};
 
 fn main() {
-    let port_map = start_detection(None).wait();
+    let port_map = start_detection().wait();
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     // `ProxyFallback::Allow` is for proxy processes such as docker-proxy,
@@ -174,7 +174,7 @@ use nanodock::{stop_container, StopOutcome};
 
 fn main() {
     let container_id = "abc123def456";
-    match stop_container(container_id, false, None) {
+    match stop_container(container_id, false) {
         StopOutcome::Stopped => println!("Container stopped"),
         StopOutcome::AlreadyStopped => println!("Container was already stopped"),
         StopOutcome::NotFound => println!("Container not found"),
@@ -276,9 +276,9 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `DetectionHandle::wait_result()`                  | Wait for the result, keeping the `Error`                   |
 | `ContainerPortMap::lookup(ip, port, proto, fallback)` | Match a socket address against the published ports     |
 | `ContainerPortMap::get(host_ip, port, proto)`     | Exact binding lookup                                       |
-| `detect_containers(home)`                         | Shorthand for `Client::new().home(home).detect()`          |
-| `start_detection(home)`                           | Shorthand for `Client::new().home(home).start_detection()` |
-| `stop_container(id, force, home)`                 | Shorthand for `Client::new().home(home).stop(id, force)`   |
+| `detect_containers()`                             | Shorthand for `Client::new().detect()`                     |
+| `start_detection()`                               | Shorthand for `Client::new().start_detection()`            |
+| `stop_container(id, force)`                       | Shorthand for `Client::new().stop(id, force)`              |
 | `parse_containers_json(body)`                     | Lenient parse of a raw `/containers/json` response         |
 | `parse_containers_json_strict(body)`              | Strict parse that fails with `ParseError` on invalid JSON  |
 | `short_container_id(id)`                          | The 12-character short form of a container ID              |

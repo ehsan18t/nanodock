@@ -39,7 +39,7 @@
 //! ```rust,no_run
 //! use nanodock::start_detection;
 //!
-//! let handle = start_detection(None);
+//! let handle = start_detection();
 //! // ... do other work while detection runs in the background ...
 //! let port_map = handle.wait();
 //! for ((ip, port, proto), info) in &port_map {
@@ -73,7 +73,7 @@
 //! use std::net::{IpAddr, Ipv4Addr};
 //! use nanodock::{Protocol, ProxyFallback};
 //!
-//! let port_map = nanodock::start_detection(None).wait();
+//! let port_map = nanodock::start_detection().wait();
 //! let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
 //! if let Some(info) = port_map
 //!     .lookup(ip, 5432, Protocol::Tcp, ProxyFallback::Deny)
@@ -887,7 +887,7 @@ impl DetectionHandle {
     /// [`DetectionHandle::wait_result`] to learn why the map is empty.
     ///
     /// ```no_run
-    /// let handle = nanodock::start_detection(None);
+    /// let handle = nanodock::start_detection();
     /// // ... do other work while detection runs ...
     /// let port_map = handle.wait();
     /// println!("{} published ports", port_map.len());
@@ -924,38 +924,39 @@ impl DetectionHandle {
 
 // ── Convenience functions ────────────────────────────────────────────
 
-/// Synchronously detect containers with a default [`Client`] whose home
-/// directory is `home`.
+/// Synchronously detect containers with a default [`Client`].
 ///
-/// Shorthand for `Client::new().home(home).detect()`; see
-/// [`Client::detect`]. The `home` directory is used on Unix to find
-/// per-user sockets such as Docker Desktop's.
+/// Shorthand for `Client::new().detect()`; see [`Client::detect`]. The
+/// default client reads `DOCKER_HOST` and the home directory from the
+/// environment, so the per-user sockets below the home directory (Docker
+/// Desktop on macOS, Colima, Lima, Rancher Desktop, Podman machine, and
+/// others) are found. Use [`Client::home`] to search a different home
+/// directory.
 ///
 /// # Errors
 ///
 /// See [`Client::detect`].
-pub fn detect_containers(home: Option<PathBuf>) -> Result<ContainerPortMap, Error> {
-    Client::new().home(home).detect()
+pub fn detect_containers() -> Result<ContainerPortMap, Error> {
+    Client::new().detect()
 }
 
-/// Start detection on a background thread with a default [`Client`] whose
-/// home directory is `home`.
+/// Start detection on a background thread with a default [`Client`].
 ///
-/// Shorthand for `Client::new().home(home).start_detection()`; see
-/// [`Client::start_detection`].
+/// Shorthand for `Client::new().start_detection()`; see
+/// [`Client::start_detection`] and, for the default settings,
+/// [`Client::new`].
 #[must_use]
-pub fn start_detection(home: Option<PathBuf>) -> DetectionHandle {
-    Client::new().home(home).start_detection()
+pub fn start_detection() -> DetectionHandle {
+    Client::new().start_detection()
 }
 
-/// Stop or kill a container with a default [`Client`] whose home directory
-/// is `home`.
+/// Stop or kill a container with a default [`Client`].
 ///
-/// Shorthand for `Client::new().home(home).stop(id, force)`; see
-/// [`Client::stop`].
+/// Shorthand for `Client::new().stop(id, force)`; see [`Client::stop`] and,
+/// for the default settings, [`Client::new`].
 #[must_use]
-pub fn stop_container(id: &str, force: bool, home: Option<PathBuf>) -> StopOutcome {
-    Client::new().home(home).stop(id, force)
+pub fn stop_container(id: &str, force: bool) -> StopOutcome {
+    Client::new().stop(id, force)
 }
 
 // ── Container stop / kill ────────────────────────────────────────────

@@ -1,7 +1,8 @@
 //! # `nanodock`
 //!
-//! Zero-dependency-light Docker/Podman daemon client for container
-//! detection, port mapping, and lifecycle control.
+//! Minimal-dependency, synchronous Docker/Podman daemon client for container
+//! detection, port mapping, and lifecycle control. Runtime dependencies are
+//! `serde`, `serde_json`, `httparse`, and `log`, plus `libc` on Unix.
 //!
 //! ## Module structure
 //!

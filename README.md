@@ -24,9 +24,8 @@
   reading overlay storage metadata and matching network namespace paths.
 - **Background detection** - Spawns detection on a background thread so callers
   can do other work (socket enumeration, process lookup) concurrently.
-- **Minimal dependencies** - Only `serde`, `serde_json`, `httparse`, and `log`
-  at runtime. No async runtime, no `tokio`, no `hyper`.
-- **Cross-platform** - Works on Linux (x86-64) and Windows (x86-64).
+- **Minimal dependencies** - Only `serde`, `serde_json`, `httparse`, and `log` at runtime, plus `libc` on Unix. No async runtime, no `tokio`, no `hyper`.
+- **Cross-platform** - Tested in CI on Linux (x86-64) and Windows (x86-64). macOS and other Unix targets build through the same `cfg(unix)` code path but are not tested in CI.
 
 ## Why nanodock?
 
@@ -34,11 +33,11 @@ Most Rust Docker libraries (`bollard`, `docker-api`) are full API clients that
 require an async runtime and pull in 30-50+ transitive dependencies. nanodock
 takes the opposite approach: synchronous, minimal, and focused.
 
-| Crate        | Async | Runtime Deps | Scope                         |
-| ------------ | ----- | ------------ | ----------------------------- |
-| `bollard`    | Yes   | ~50+         | Full Docker API               |
-| `docker-api` | Yes   | ~30+         | Full Docker API               |
-| **nanodock** | No    | **4**        | Detection + Ports + Lifecycle |
+| Crate        | Async | Runtime Deps             | Scope                         |
+| ------------ | ----- | ------------------------ | ----------------------------- |
+| `bollard`    | Yes   | ~50+                     | Full Docker API               |
+| `docker-api` | Yes   | ~30+                     | Full Docker API               |
+| **nanodock** | No    | **4** (+ `libc` on Unix) | Detection + Ports + Lifecycle |
 
 Use nanodock when you need container awareness (detection, port mapping,
 lifecycle control) without pulling in an async runtime or a full Docker SDK.
@@ -139,7 +138,9 @@ fn main() {
         StopOutcome::Stopped => println!("Container stopped"),
         StopOutcome::AlreadyStopped => println!("Container was already stopped"),
         StopOutcome::NotFound => println!("Container not found"),
-        StopOutcome::Failed => println!("Could not reach daemon"),
+        // No daemon could be reached, the daemon returned an error, or it
+        // received the request but gave no usable reply.
+        StopOutcome::Failed => println!("Stop failed or its result is unknown"),
         _ => println!("Unexpected outcome"),
     }
 }
@@ -165,11 +166,8 @@ nanodock communicates directly with the Docker/Podman daemon using the
 
 ### Transport Discovery Order
 
-1. **`DOCKER_HOST` environment variable** - If set, the specified transport
-   (tcp://, unix://, npipe://) is used first.
-2. **Platform-native sockets** - On Linux, well-known Unix socket paths are
-   probed (rootful Docker, rootless Docker, Podman). On Windows, named pipes
-   for Docker Desktop and Podman Machine are tried.
+1. **`DOCKER_HOST` environment variable** - If set, the specified daemon is preferred. A `tcp://` daemon is queried at the same time as the platform-native sockets and is used on its own when it answers, so a stale address cannot hide a local daemon. A `unix://` path replaces the default Unix sockets. An `npipe://` pipe is queried alongside the default pipes and is used on its own when it answers. `stop_container` tries the same daemons in the same order (`DOCKER_HOST` first). Before sending the stop to a daemon it checks that the daemon answers `GET /_ping` on a separate connection, and moves on to the next daemon when it cannot be reached or does not answer the ping (for example a forwarder whose backend is down). Any reply from the `DOCKER_HOST` daemon, including "not found", is final; a "not found" from a default daemon moves on to the next one. Once a daemon has received the stop request, no reply (a closed connection, a timeout, or a partial reply) is reported as `StopOutcome::Failed` and no other daemon is tried.
+2. **Platform-native sockets** - On Linux, well-known Unix socket paths are probed (rootful Docker, rootless Docker, Podman). On Windows, the named pipes for Docker Desktop and Podman Machine are queried. All endpoints are queried concurrently under one shared time budget, and the containers of every daemon that answers are merged.
 3. **Rootless Podman overlay** (Linux only) - For containers managed by rootless
    Podman, nanodock reads the overlay storage metadata to resolve container
    names from network namespace paths. This handles the case where
@@ -230,11 +228,11 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 ```
 src/
-├── lib.rs      — Public API, detection orchestration, port matching
-├── api.rs      — JSON response parsing, container name resolution
-├── http.rs     — Minimal HTTP/1.0 response parser (via httparse)
-├── ipc.rs      — OS-specific transport (Unix socket, named pipe, TCP)
-└── podman.rs   — Rootless Podman resolver via overlay metadata (Linux)
+├── lib.rs      - Public API, detection orchestration, port matching
+├── api.rs      - JSON response parsing, container name resolution
+├── http.rs     - Minimal HTTP/1.0 response parser (via httparse)
+├── ipc.rs      - OS-specific transport (Unix socket, named pipe, TCP)
+└── podman.rs   - Rootless Podman resolver via overlay metadata (Linux)
 ```
 
 ### Module Boundaries
@@ -316,8 +314,7 @@ bash scripts/install-hooks.sh
 
 ## Minimum Supported Rust Version
 
-nanodock requires the latest stable Rust toolchain (currently 1.93+) and uses
-edition 2024 features.
+nanodock requires Rust 1.89 or newer (declared as `rust-version` in `Cargo.toml`). It uses edition 2024, and its public `const fn` API relies on `str::eq_ignore_ascii_case` being usable in const context, which was stabilized in 1.89.
 
 ## Dependencies
 

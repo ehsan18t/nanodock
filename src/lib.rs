@@ -138,6 +138,23 @@ impl std::fmt::Display for Protocol {
 // ── Container types ──────────────────────────────────────────────────
 
 /// Metadata about a running container that has published ports.
+///
+/// The fields are public for reading. The struct is `#[non_exhaustive]`, so
+/// code outside this crate builds one with [`ContainerInfo::new`] and the
+/// `with_*` methods instead of a struct literal, which lets later releases
+/// add fields without a breaking change.
+///
+/// ```
+/// use nanodock::ContainerInfo;
+///
+/// let info = ContainerInfo::new("abc123", "shop-db-1", "postgres:16")
+///     .with_compose_project("shop")
+///     .with_compose_service("db");
+/// assert_eq!(info.name, "shop-db-1");
+/// assert_eq!(info.compose_project.as_deref(), Some("shop"));
+/// assert_eq!(info.compose_service.as_deref(), Some("db"));
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContainerInfo {
     /// Full container ID (hex string) for API calls, empty when unavailable.
@@ -146,6 +163,48 @@ pub struct ContainerInfo {
     pub name: String,
     /// Container image (e.g. "postgres:16").
     pub image: String,
+    /// Compose project the container belongs to, read from the
+    /// `com.docker.compose.project` label (or `io.podman.compose.project`
+    /// when only that one is set). `None` when the container was not
+    /// started by Docker Compose or `podman-compose`.
+    #[serde(default)]
+    pub compose_project: Option<String>,
+    /// Compose service name, read from the `com.docker.compose.service`
+    /// label. `None` when the label is absent.
+    #[serde(default)]
+    pub compose_service: Option<String>,
+}
+
+impl ContainerInfo {
+    /// Create container metadata with no Compose labels.
+    ///
+    /// `id` is the full container ID (empty when unknown), `name` the
+    /// container name without a leading `/`, and `image` the image
+    /// reference.
+    #[must_use]
+    pub fn new(id: impl Into<String>, name: impl Into<String>, image: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            image: image.into(),
+            compose_project: None,
+            compose_service: None,
+        }
+    }
+
+    /// Set the Compose project name.
+    #[must_use]
+    pub fn with_compose_project(mut self, project: impl Into<String>) -> Self {
+        self.compose_project = Some(project.into());
+        self
+    }
+
+    /// Set the Compose service name.
+    #[must_use]
+    pub fn with_compose_service(mut self, service: impl Into<String>) -> Self {
+        self.compose_service = Some(service.into());
+        self
+    }
 }
 
 impl std::fmt::Display for ContainerInfo {
@@ -163,11 +222,7 @@ pub type ContainerPortMap = HashMap<(Option<IpAddr>, u16, Protocol), ContainerIn
 
 #[cfg(test)]
 fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
-    ContainerInfo {
-        id: id.to_string(),
-        name: name.to_string(),
-        image: image.to_string(),
-    }
+    ContainerInfo::new(id, name, image)
 }
 
 #[cfg(test)]

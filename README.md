@@ -197,7 +197,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | Type                      | Description                                               |
 | ------------------------- | --------------------------------------------------------- |
 | `Protocol`                | Network protocol enum (`Tcp`, `Udp`)                      |
-| `ContainerInfo`           | Container metadata (id, name, image)                      |
+| `ContainerInfo`           | Container metadata (id, name, image, Compose project and service) |
 | `ContainerPortMap`        | HashMap mapping `(ip, port, protocol)` to `ContainerInfo` |
 | `PublishedContainerMatch` | Result of looking up a socket in the port map             |
 | `StopOutcome`             | Result of a stop/kill request                             |

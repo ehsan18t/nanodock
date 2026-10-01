@@ -170,11 +170,7 @@ fn podman_storage_container_info(container: &PodmanStorageContainer) -> Containe
         .and_then(|value| value.image_name)
         .unwrap_or_default();
 
-    ContainerInfo {
-        id: container.id.clone(),
-        name,
-        image,
-    }
+    ContainerInfo::new(container.id.clone(), name, image)
 }
 
 fn read_podman_network_namespace_path(config_path: &Path) -> Option<PathBuf> {
@@ -297,11 +293,11 @@ mod tests {
         let mut containers = HashMap::new();
         containers.insert(
             netns_path.clone(),
-            ContainerInfo {
-                id: "abc123".to_string(),
-                name: "ensurily-redis-dev".to_string(),
-                image: "docker.io/library/redis:7.2-alpine".to_string(),
-            },
+            ContainerInfo::new(
+                "abc123",
+                "ensurily-redis-dev",
+                "docker.io/library/redis:7.2-alpine",
+            ),
         );
 
         let container = match_container_by_netns_paths(&[netns_path], &containers).unwrap();
@@ -315,19 +311,11 @@ mod tests {
         let mut containers = HashMap::new();
         containers.insert(
             first_path.clone(),
-            ContainerInfo {
-                id: "aaa111".to_string(),
-                name: "postgres".to_string(),
-                image: "postgres:16".to_string(),
-            },
+            ContainerInfo::new("aaa111", "postgres", "postgres:16"),
         );
         containers.insert(
             second_path.clone(),
-            ContainerInfo {
-                id: "bbb222".to_string(),
-                name: "redis".to_string(),
-                image: "redis:7-alpine".to_string(),
-            },
+            ContainerInfo::new("bbb222", "redis", "redis:7-alpine"),
         );
 
         let container = match_container_by_netns_paths(&[first_path, second_path], &containers);

@@ -27,11 +27,11 @@ type LookupFixture = (ContainerPortMap, SocketAddr);
 
 #[must_use]
 fn container_info(index: u16) -> ContainerInfo {
-    ContainerInfo {
-        id: format!("{index:012x}"),
-        name: format!("container-{index}"),
-        image: format!("image:{index}"),
-    }
+    ContainerInfo::new(
+        format!("{index:012x}"),
+        format!("container-{index}"),
+        format!("image:{index}"),
+    )
 }
 
 fn insert_mapping(

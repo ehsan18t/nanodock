@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer, Visitor};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 
 use crate::{ContainerInfo, ContainerPortMap, Protocol};
 
@@ -101,8 +101,83 @@ struct DockerContainer<'a> {
     names: Option<Vec<JsonStr<'a>>>,
     #[serde(rename = "Image", borrow)]
     image: Option<JsonStr<'a>>,
+    #[serde(rename = "Labels", borrow)]
+    labels: Option<ComposeLabels<'a>>,
     #[serde(rename = "Ports", borrow)]
     ports: Option<Vec<DockerPort<'a>>>,
+}
+
+/// Label Docker Compose (and `podman-compose`) sets to the project name.
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+/// Label Docker Compose (and `podman-compose`) sets to the service name.
+const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
+/// Project label `podman-compose` sets in addition to the Docker one.
+const PODMAN_COMPOSE_PROJECT_LABEL: &str = "io.podman.compose.project";
+
+/// The Compose labels of a container, picked out of its `Labels` object.
+///
+/// Only the labels nanodock reads are kept; every other label value is
+/// skipped without being decoded or copied.
+#[derive(Default)]
+struct ComposeLabels<'a> {
+    project: Option<JsonStr<'a>>,
+    service: Option<JsonStr<'a>>,
+    podman_project: Option<JsonStr<'a>>,
+}
+
+impl ComposeLabels<'_> {
+    /// The Compose project, preferring the Docker label over the Podman one.
+    fn project(&self) -> Option<String> {
+        non_empty_label(self.project.as_deref())
+            .or_else(|| non_empty_label(self.podman_project.as_deref()))
+    }
+
+    fn service(&self) -> Option<String> {
+        non_empty_label(self.service.as_deref())
+    }
+}
+
+fn non_empty_label(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for ComposeLabels<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ComposeLabelsVisitor)
+    }
+}
+
+struct ComposeLabelsVisitor;
+
+impl<'de> Visitor<'de> for ComposeLabelsVisitor {
+    type Value = ComposeLabels<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a map of container labels")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut labels = ComposeLabels::default();
+        while let Some(key) = map.next_key::<JsonStr<'de>>()? {
+            let slot = match &*key {
+                COMPOSE_PROJECT_LABEL => &mut labels.project,
+                COMPOSE_SERVICE_LABEL => &mut labels.service,
+                PODMAN_COMPOSE_PROJECT_LABEL => &mut labels.podman_project,
+                _ => {
+                    map.next_value::<de::IgnoredAny>()?;
+                    continue;
+                }
+            };
+            *slot = map.next_value::<Option<JsonStr<'de>>>()?;
+        }
+        Ok(labels)
+    }
 }
 
 /// Parse the JSON response from `GET /containers/json` into a port map.
@@ -153,7 +228,11 @@ fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'
         let id = container.id.as_deref().unwrap_or("").to_string();
         let name = container_display_name(container);
         let image = container.image.as_deref().unwrap_or("").to_string();
-        let info = ContainerInfo { id, name, image };
+        let mut info = ContainerInfo::new(id, name, image);
+        if let Some(labels) = &container.labels {
+            info.compose_project = labels.project();
+            info.compose_service = labels.service();
+        }
 
         let Some(ports) = &container.ports else {
             continue;
@@ -708,6 +787,87 @@ mod tests {
         let map = parse_containers_json(json);
         assert_eq!(map.len(), 1);
         assert_container_mapping(&map, None, 8080, Protocol::Tcp, "single", "app:latest");
+    }
+
+    #[test]
+    fn parse_compose_labels() {
+        let json = r#"[{
+            "Names": ["/shop-db-1"],
+            "Image": "postgres:16",
+            "Labels": {
+                "com.docker.compose.config-hash": "abc",
+                "com.docker.compose.project": "shop",
+                "com.docker.compose.service": "db",
+                "com.docker.compose.depends_on": {"nested": ["not", "a", "string"]}
+            },
+            "Ports": [{"PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+        let info = mapped_container(&map, None, 5432, Protocol::Tcp);
+        assert_eq!(info.compose_project.as_deref(), Some("shop"));
+        assert_eq!(info.compose_service.as_deref(), Some("db"));
+
+        let strict = parse_containers_json_strict(json).expect("labels are valid JSON");
+        assert_eq!(strict, map, "strict and lenient parsing agree on labels");
+    }
+
+    #[test]
+    fn parse_podman_compose_project_label_as_fallback() {
+        let json = r#"[{
+            "Names": ["shop_web_1"],
+            "Image": "nginx",
+            "Labels": {"io.podman.compose.project": "shop", "com.docker.compose.service": "web"},
+            "Ports": [{"host_ip": "", "host_port": 8080, "range": 1, "protocol": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+        let info = mapped_container(&map, None, 8080, Protocol::Tcp);
+        assert_eq!(
+            info.compose_project.as_deref(),
+            Some("shop"),
+            "podman-compose projects are recognised"
+        );
+        assert_eq!(info.compose_service.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn docker_compose_project_label_wins_over_podman_label() {
+        let json = r#"[{
+            "Names": ["/web"],
+            "Labels": {"io.podman.compose.project": "other", "com.docker.compose.project": "shop"},
+            "Ports": [{"PublicPort": 80, "Type": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+        assert_eq!(
+            mapped_container(&map, None, 80, Protocol::Tcp)
+                .compose_project
+                .as_deref(),
+            Some("shop")
+        );
+    }
+
+    #[test]
+    fn parse_escaped_and_missing_labels() {
+        let json = r#"[
+            {
+                "Names": ["/escaped"],
+                "Labels": {"com.docker.compose.project": "my\/proj\"ect", "com.docker.compose.service": ""},
+                "Ports": [{"PublicPort": 80, "Type": "tcp"}]
+            },
+            {
+                "Names": ["/plain"],
+                "Labels": null,
+                "Ports": [{"PublicPort": 81, "Type": "tcp"}]
+            }
+        ]"#;
+        let map = parse_containers_json_strict(json).expect("valid JSON");
+        let escaped = mapped_container(&map, None, 80, Protocol::Tcp);
+        assert_eq!(escaped.compose_project.as_deref(), Some("my/proj\"ect"));
+        assert_eq!(
+            escaped.compose_service, None,
+            "an empty label value reads as no label"
+        );
+        let plain = mapped_container(&map, None, 81, Protocol::Tcp);
+        assert_eq!(plain.compose_project, None, "null labels mean no project");
     }
 
     #[test]

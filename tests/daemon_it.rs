@@ -291,10 +291,16 @@ fn kill_running_container_by_id_stops_it() {
         StopOutcome::Stopped,
         "kill by full id {id}"
     );
-    assert!(
-        find_by_name(&detect(&client), &name).is_none(),
-        "a killed container publishes nothing"
-    );
+    // The daemon answers the kill once the signal is delivered; the container
+    // exits a moment later, so wait for it to leave the listing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while find_by_name(&detect(&client), &name).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a killed container publishes nothing within 5 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[test]

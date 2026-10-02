@@ -821,10 +821,15 @@ impl Client {
     /// environment variable.
     ///
     /// `tcp://host:port` is queried alongside the default local endpoints
-    /// and wins when it answers. `unix:///path` (Unix) replaces the default
-    /// sockets. `npipe:////./pipe/name` (Windows) is queried alongside the
-    /// default pipes and wins when it answers. `None`, or a value with
-    /// another scheme, uses only the default endpoints.
+    /// and wins when it answers; as in the Docker CLI, the port defaults to
+    /// 2375, an IPv6 address goes in brackets (`tcp://[::1]:2375`), and a
+    /// path after the address is ignored. `unix:///path` (Unix) replaces the
+    /// default sockets. `npipe:////./pipe/name` or
+    /// `npipe:////host/pipe/name` (Windows) is queried alongside the default
+    /// pipes and wins when it answers; an `npipe://` value that names no
+    /// pipe is ignored. Surrounding whitespace and the letter case of the
+    /// scheme do not matter. `None`, or a value with another scheme (such as
+    /// `ssh://`) or a malformed address, uses only the default endpoints.
     #[must_use]
     pub fn docker_host(mut self, docker_host: Option<String>) -> Self {
         self.docker_host = docker_host;

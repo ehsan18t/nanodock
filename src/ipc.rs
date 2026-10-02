@@ -155,34 +155,130 @@ impl<S: SocketTimeouts + Write> Write for DeadlineStream<S> {
 // DOCKER_HOST parsing
 // ---------------------------------------------------------------------------
 
+/// Port of a `tcp://` `DOCKER_HOST` that names none, as in the Docker CLI.
+const DEFAULT_TCP_PORT: u16 = 2375;
+
+/// The local `DOCKER_HOST` scheme this platform supports.
+const LOCAL_SCHEME: &str = if cfg!(windows) { "npipe" } else { "unix" };
+
+/// Split a `DOCKER_HOST` value into its scheme and the rest, ignoring
+/// surrounding whitespace.
+fn split_scheme(docker_host: &str) -> Option<(&str, &str)> {
+    docker_host.trim().split_once("://")
+}
+
+/// The part of `docker_host` after `scheme://`, when it uses that scheme
+/// (in any letter case).
+fn strip_scheme<'a>(docker_host: &'a str, scheme: &str) -> Option<&'a str> {
+    split_scheme(docker_host)
+        .filter(|(found, _)| found.eq_ignore_ascii_case(scheme))
+        .map(|(_, rest)| rest)
+}
+
 /// Extract a Unix socket path from a `DOCKER_HOST` value.
 ///
-/// Returns the path suffix when `docker_host` starts with `unix://`, or
-/// `None` if it is empty after the scheme or uses a different scheme.
+/// Returns the path after `unix://`, or `None` when it is empty or the
+/// value uses a different scheme.
 #[cfg(unix)]
 pub fn docker_host_unix_path(docker_host: &str) -> Option<String> {
-    let path = docker_host.strip_prefix("unix://")?;
+    let path = strip_scheme(docker_host, "unix")?;
     (!path.is_empty()).then(|| path.to_string())
 }
 
 /// Extract a named pipe path from a `DOCKER_HOST` value.
 ///
-/// Returns the pipe path (with forward slashes replaced by backslashes)
-/// when `docker_host` starts with `npipe://`, or `None` if it is empty
-/// after the scheme or uses a different scheme.
+/// Returns the pipe path, with forward slashes turned into backslashes,
+/// when the value is `npipe://` followed by `//./pipe/<name>` or
+/// `//<host>/pipe/<name>` (in either slash direction). Anything else,
+/// such as `npipe://C:/x.txt`, is rejected so that no ordinary file is
+/// ever opened as a daemon pipe.
 #[cfg(windows)]
 pub fn docker_host_npipe_path(docker_host: &str) -> Option<String> {
-    let raw = docker_host.strip_prefix("npipe://")?;
-    (!raw.is_empty()).then(|| raw.replace('/', "\\"))
+    let path = strip_scheme(docker_host, "npipe")?.replace('/', "\\");
+    if is_pipe_path(&path) {
+        Some(path)
+    } else {
+        debug!("ignoring DOCKER_HOST npipe:// value that names no pipe: path={path}");
+        None
+    }
+}
+
+/// Whether `path` is `\\<host>\pipe\<name>`, the only form of a named pipe
+/// path: `<host>` is `.` for the local machine, and neither it nor
+/// `<name>` is empty or contains a backslash.
+#[cfg(any(windows, test))]
+fn is_pipe_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(r"\\") else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '\\');
+    let (Some(host), Some(pipe), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !host.is_empty()
+        && pipe.eq_ignore_ascii_case("pipe")
+        && !name.is_empty()
+        && !name.contains('\\')
 }
 
 /// Extract a TCP address from a `DOCKER_HOST` value.
 ///
-/// Returns the `host:port` string when `docker_host` starts with `tcp://`,
-/// or `None` if it is empty after the scheme or uses a different scheme.
+/// Accepts what the Docker CLI accepts: `tcp://host:port`, `tcp://host`
+/// (port 2375), an IPv6 literal in brackets (`tcp://[::1]:2375` or
+/// `tcp://[::1]`), surrounding whitespace, any letter case in the scheme,
+/// and a trailing slash or path after the address, which is ignored.
+/// Returns `host:port`, or `None` for a malformed address or another
+/// scheme. A scheme nanodock does not support at all (such as `ssh://`,
+/// `fd://`, or `http://`) is logged at debug level and otherwise ignored,
+/// so only the default endpoints are used.
 pub fn docker_host_tcp_addr(docker_host: &str) -> Option<String> {
-    let addr = docker_host.strip_prefix("tcp://")?;
-    (!addr.is_empty()).then(|| addr.to_string())
+    let Some((scheme, rest)) = split_scheme(docker_host) else {
+        debug!("ignoring DOCKER_HOST without a scheme: value={docker_host}");
+        return None;
+    };
+    if !scheme.eq_ignore_ascii_case("tcp") {
+        if !scheme.eq_ignore_ascii_case(LOCAL_SCHEME) {
+            debug!("ignoring DOCKER_HOST with an unsupported scheme: scheme={scheme}");
+        }
+        return None;
+    }
+    let addr = tcp_host_port(rest);
+    if addr.is_none() {
+        debug!("ignoring malformed DOCKER_HOST tcp:// address: address={rest}");
+    }
+    addr
+}
+
+/// `host:port` from what follows `tcp://`: any path after the address is
+/// dropped, and a missing port is [`DEFAULT_TCP_PORT`].
+fn tcp_host_port(address_and_path: &str) -> Option<String> {
+    let address = address_and_path
+        .split_once('/')
+        .map_or(address_and_path, |(address, _)| address);
+    let (host, port) = match address.strip_prefix('[') {
+        Some(bracketed) => {
+            let (ip, after) = bracketed.split_once(']')?;
+            ip.parse::<std::net::Ipv6Addr>().ok()?;
+            let port = match after {
+                "" => None,
+                after => Some(after.strip_prefix(':')?),
+            };
+            // The literal with its brackets: `[`, the address, `]`.
+            (&address[..ip.len() + 2], port)
+        }
+        None => match address.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (address, None),
+        },
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        None | Some("") => DEFAULT_TCP_PORT,
+        Some(port) => port.parse().ok()?,
+    };
+    Some(format!("{host}:{port}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,24 +1339,59 @@ mod tests {
         );
     }
 
-    // ── fetch_all ────────────────────────────────────────────────────
+    // ── DOCKER_HOST parsing ──────────────────────────────────────────
 
     #[test]
-    fn docker_host_tcp_addr_parses_only_tcp_values() {
-        assert_eq!(
-            docker_host_tcp_addr("tcp://127.0.0.1:2375").as_deref(),
-            Some("127.0.0.1:2375")
-        );
-        assert_eq!(
-            docker_host_tcp_addr("tcp://"),
-            None,
-            "an empty address is ignored"
-        );
-        assert_eq!(
-            docker_host_tcp_addr("ssh://host"),
-            None,
-            "other schemes are ignored"
-        );
+    fn docker_host_tcp_addr_accepts_docker_cli_forms() {
+        for (value, expected) in [
+            ("tcp://127.0.0.1:2375", "127.0.0.1:2375"),
+            ("tcp://localhost", "localhost:2375"),
+            ("tcp://10.0.0.5", "10.0.0.5:2375"),
+            ("tcp://docker.example:", "docker.example:2375"),
+            ("tcp://127.0.0.1:2375/", "127.0.0.1:2375"),
+            ("tcp://127.0.0.1:2375/v1.43/api", "127.0.0.1:2375"),
+            ("tcp://host/", "host:2375"),
+            ("  tcp://127.0.0.1:2375\n", "127.0.0.1:2375"),
+            ("TCP://127.0.0.1:2376", "127.0.0.1:2376"),
+            ("Tcp://Host:1", "Host:1"),
+            ("tcp://[::1]:2375", "[::1]:2375"),
+            ("tcp://[::1]", "[::1]:2375"),
+            ("tcp://[fe80::1]:2376/", "[fe80::1]:2376"),
+        ] {
+            assert_eq!(
+                docker_host_tcp_addr(value).as_deref(),
+                Some(expected),
+                "{value:?} is a valid tcp:// DOCKER_HOST"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_host_tcp_addr_rejects_malformed_addresses_and_other_schemes() {
+        for value in [
+            "tcp://",
+            "tcp://:2375",
+            "tcp:///path",
+            "tcp://host:port",
+            "tcp://host:70000",
+            "tcp://::1:2375",
+            "tcp://[::1",
+            "tcp://[::1]2375",
+            "tcp://[not-an-ip]:2375",
+            "ssh://user@host",
+            "fd://",
+            "http://127.0.0.1:2375",
+            "unix:///var/run/docker.sock",
+            "npipe:////./pipe/docker_engine",
+            "127.0.0.1:2375",
+            "",
+        ] {
+            assert_eq!(
+                docker_host_tcp_addr(value),
+                None,
+                "{value:?} is no tcp:// address"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1270,20 +1401,79 @@ mod tests {
             docker_host_unix_path("unix:///run/docker.sock").as_deref(),
             Some("/run/docker.sock")
         );
+        assert_eq!(
+            docker_host_unix_path(" UNIX:///run/docker.sock ").as_deref(),
+            Some("/run/docker.sock"),
+            "whitespace and the scheme's letter case do not matter"
+        );
         assert_eq!(docker_host_unix_path("unix://"), None);
         assert_eq!(docker_host_unix_path("tcp://127.0.0.1:2375"), None);
     }
 
+    #[test]
+    fn pipe_paths_must_name_a_pipe() {
+        for path in [
+            r"\\.\pipe\docker_engine",
+            r"\\.\PIPE\podman-machine-default",
+            r"\\buildhost\pipe\docker_engine",
+        ] {
+            assert!(is_pipe_path(path), "{path} names a pipe");
+        }
+        for path in [
+            r"C:\x.txt",
+            r"\\.\C:\x.txt",
+            r"\\.\pipe\",
+            r"\\.\pipe",
+            r"\\\pipe\docker_engine",
+            r"\\.\pipes\docker_engine",
+            r"\\.\pipe\nested\name",
+            r"\.\pipe\docker_engine",
+            r"\\?\C:\x.txt",
+            "",
+        ] {
+            assert!(!is_pipe_path(path), "{path} must not be opened as a pipe");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn docker_host_npipe_path_converts_slashes() {
-        assert_eq!(
-            docker_host_npipe_path("npipe:////./pipe/docker_engine").as_deref(),
-            Some(r"\\.\pipe\docker_engine")
-        );
-        assert_eq!(docker_host_npipe_path("npipe://"), None);
-        assert_eq!(docker_host_npipe_path("tcp://127.0.0.1:2375"), None);
+    fn docker_host_npipe_path_accepts_only_pipe_paths() {
+        for (value, expected) in [
+            ("npipe:////./pipe/docker_engine", r"\\.\pipe\docker_engine"),
+            (r"npipe://\\.\pipe\docker_engine", r"\\.\pipe\docker_engine"),
+            (
+                " NPIPE:////./pipe/docker_engine ",
+                r"\\.\pipe\docker_engine",
+            ),
+            (
+                "npipe:////buildhost/pipe/docker_engine",
+                r"\\buildhost\pipe\docker_engine",
+            ),
+        ] {
+            assert_eq!(
+                docker_host_npipe_path(value).as_deref(),
+                Some(expected),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "npipe://",
+            "npipe://C:/x.txt",
+            "npipe:///C:/x.txt",
+            "npipe:////./C:/x.txt",
+            "npipe://./pipe/docker_engine",
+            "npipe:////./pipe/",
+            "tcp://127.0.0.1:2375",
+        ] {
+            assert_eq!(
+                docker_host_npipe_path(value),
+                None,
+                "{value:?} names no pipe"
+            );
+        }
     }
+
+    // ── fetch_all ────────────────────────────────────────────────────
 
     #[test]
     fn fetch_all_collects_every_result() {

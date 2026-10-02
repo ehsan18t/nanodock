@@ -475,6 +475,7 @@ pub type PortKey = (Option<IpAddr>, u16, Protocol);
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerPortMap {
     bindings: HashMap<PortKey, Arc<ContainerInfo>>,
+    truncated: bool,
 }
 
 impl ContainerPortMap {
@@ -494,6 +495,20 @@ impl ContainerPortMap {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
+    }
+
+    /// Whether bindings were dropped because a daemon's reply expanded to
+    /// more than nanodock keeps.
+    ///
+    /// Port ranges let a small reply describe millions of bindings, so one
+    /// daemon reply expands to at most 131072 bindings (every port of both
+    /// protocols). A port entry that would go past that is skipped, the
+    /// entries after it are still kept when they fit, and this returns
+    /// `true`. A lookup that finds nothing in a truncated map may have
+    /// missed a container. A warning is also logged when it happens.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// The container published on exactly this binding.
@@ -594,9 +609,20 @@ impl ContainerPortMap {
         self.bindings.reserve(additional);
     }
 
+    /// Record that bindings were dropped while this map was built.
+    pub(crate) const fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
     /// Add every binding of `other`, replacing bindings with the same key.
+    /// The result is truncated when either map was.
     fn merge(&mut self, other: Self) {
-        self.bindings.extend(other.bindings);
+        if self.bindings.is_empty() {
+            self.bindings = other.bindings;
+        } else {
+            self.bindings.extend(other.bindings);
+        }
+        self.truncated |= other.truncated;
     }
 }
 
@@ -1558,12 +1584,7 @@ fn merge_bodies<E>(
 ) -> Result<ContainerPortMap, E> {
     let mut merged = ContainerPortMap::new();
     for body in bodies.iter().rev() {
-        let map = parse(body)?;
-        if merged.is_empty() {
-            merged = map;
-        } else {
-            merged.merge(map);
-        }
+        merged.merge(parse(body)?);
     }
     Ok(merged)
 }
@@ -1923,6 +1944,26 @@ mod tests {
 
     fn bodies(bodies: &[&str]) -> Vec<String> {
         bodies.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn merged_map_is_truncated_when_any_reply_was() {
+        let oversized = r#"[{"Names": ["/wide"], "Ports": [
+            {"host_port": 1, "range": 65535, "protocol": "tcp"},
+            {"host_port": 1, "range": 65535, "protocol": "udp"},
+            {"host_ip": "127.0.0.1", "host_port": 1, "range": 65535, "protocol": "tcp"}
+        ]}]"#;
+        let small = r#"[{"Names": ["/web"], "Ports": [{"PublicPort": 80}]}]"#;
+
+        for order in [[small, oversized], [oversized, small]] {
+            let merged = merge_bodies_lenient(&bodies(&order));
+            assert!(merged.truncated(), "a truncated reply truncates the merge");
+            assert!(
+                merged.get(None, 80, Protocol::Tcp).is_some(),
+                "the other daemon's bindings are kept"
+            );
+        }
+        assert!(!merge_bodies_lenient(&bodies(&[small, small])).truncated());
     }
 
     #[test]

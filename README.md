@@ -237,7 +237,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | ------------------------- | ----------------------------------------------------------------------------------- |
 | `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, `stop`, `kill` |
 | `ContainerInfo`           | Container metadata: id, name, image, Compose project and service                    |
-| `ContainerPortMap`        | Map from `(host_ip, port, protocol)` to a shared `ContainerInfo`                    |
+| `ContainerPortMap`        | Map from `(host_ip, port, protocol)` to a shared `ContainerInfo`; `truncated()` reports bindings dropped past the per-reply cap |
 | `PortKey`                 | Alias for the `(host_ip, port, protocol)` key of a `ContainerPortMap` binding       |
 | `PortMapIter`             | Iterator over the bindings of a `ContainerPortMap`                                  |
 | `ProxyFallback`           | Whether a lookup may match a proxy process on port and protocol alone               |

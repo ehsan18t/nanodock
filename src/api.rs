@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use log::debug;
+use log::warn;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
@@ -364,8 +364,13 @@ fn container_info(container: &DockerContainer<'_>) -> ContainerInfo {
 }
 
 /// Insert the bindings of every container, at most [`MAX_PORT_BINDINGS`]
-/// in total. Past the cap the rest of the response is ignored; the bindings
-/// already inserted are kept.
+/// in total.
+///
+/// A port entry repeated within one container is expanded and charged once:
+/// Docker lists every port once for `0.0.0.0` and once for `::`, and both
+/// map to the same wildcard key. An entry that no longer fits under the cap
+/// is skipped, and the entries and containers after it are still inserted
+/// when they fit. Any skipped binding marks the map as truncated.
 fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'_>]) {
     // Size the map once instead of growing it while a range is expanded.
     let expected = containers
@@ -378,34 +383,37 @@ fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'
     map.reserve(expected.min(MAX_PORT_BINDINGS));
 
     let mut remaining = MAX_PORT_BINDINGS;
+    let mut dropped = 0_usize;
     for container in containers {
         let Some(ports) = &container.ports else {
             continue;
         };
         // Shared by every binding of this container.
         let info = Arc::new(container_info(container));
-        // Port ranges already expanded for this container. Only ranges are
-        // tracked: a repeated single port (Docker lists a port once for
-        // IPv4 and once for IPv6) costs one insert either way.
-        let mut expanded_ranges = HashSet::new();
+        // Port entries already expanded for this container.
+        let mut expanded = HashSet::new();
 
-        for (host_ip, first, last, proto) in ports.iter().filter_map(port_span) {
-            if first != last && !expanded_ranges.insert((host_ip, first, last, proto)) {
+        for span @ (host_ip, first, last, proto) in ports.iter().filter_map(port_span) {
+            if !expanded.insert(span) {
                 continue;
             }
             let count = usize::from(last - first) + 1;
             let Some(left) = remaining.checked_sub(count) else {
-                debug!(
-                    "stopped expanding published ports at {MAX_PORT_BINDINGS} bindings; \
-                     the rest of the container list is ignored"
-                );
-                return;
+                dropped = dropped.saturating_add(count);
+                continue;
             };
             remaining = left;
             for port in first..=last {
                 map.insert(host_ip, port, proto, Arc::clone(&info));
             }
         }
+    }
+
+    if dropped > 0 {
+        map.mark_truncated();
+        warn!(
+            "container list expands to more than {MAX_PORT_BINDINGS} port bindings;              {dropped} bindings were dropped"
+        );
     }
 }
 
@@ -1126,8 +1134,96 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "expansion is bounded, took {elapsed:?}"
         );
+        assert!(map.truncated(), "the ranges past the cap were dropped");
         let strict = parse_containers_json_strict(&json).expect("valid JSON");
         assert_eq!(strict, map, "strict and lenient parsing apply the same cap");
+    }
+
+    /// Two ranges that leave room for exactly `room` (at least 2) more
+    /// bindings under the cap: every TCP port, and as many UDP ports from 1
+    /// as the rest of the cap allows.
+    fn ranges_leaving_room(room: usize) -> String {
+        format!(
+            r#"{{"host_port": 1, "range": 65535, "protocol": "tcp"}},
+               {{"host_port": 1, "range": {}, "protocol": "udp"}}"#,
+            MAX_PORT_BINDINGS - 65_535 - room
+        )
+    }
+
+    #[test]
+    fn dual_stack_duplicates_are_charged_once() {
+        // Docker lists a port once for 0.0.0.0 and once for ::, which both
+        // map to the wildcard key. Charged twice, the pair would use up the
+        // room the last container needs.
+        let json = containers_with_ports(&[
+            &ranges_leaving_room(3),
+            r#"{"IP": "0.0.0.0", "PublicPort": 65535, "Type": "udp"},
+               {"IP": "::", "PublicPort": 65535, "Type": "udp"}"#,
+            r#"{"IP": "127.0.0.1", "PublicPort": 80, "Type": "tcp"},
+               {"IP": "127.0.0.1", "PublicPort": 81, "Type": "tcp"}"#,
+        ]);
+        let map = parse_containers_json(&json);
+
+        assert_eq!(map.len(), MAX_PORT_BINDINGS, "the cap is filled exactly");
+        assert_eq!(
+            mapped_container(&map, None, 65535, Protocol::Udp).name,
+            "c1"
+        );
+        for port in [80, 81] {
+            assert_eq!(
+                mapped_container(
+                    &map,
+                    Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    port,
+                    Protocol::Tcp
+                )
+                .name,
+                "c2",
+                "port {port} still fits under the cap"
+            );
+        }
+        assert!(!map.truncated(), "nothing was dropped");
+    }
+
+    #[test]
+    fn oversized_range_is_skipped_and_later_containers_are_kept() {
+        let json = containers_with_ports(&[
+            r#"{"host_port": 1, "range": 65535, "protocol": "tcp"}"#,
+            r#"{"host_port": 1, "range": 65534, "protocol": "udp"}"#,
+            r#"{"host_ip": "127.0.0.1", "host_port": 1, "range": 65535, "protocol": "tcp"},
+               {"host_ip": "127.0.0.1", "host_port": 8080, "protocol": "tcp"}"#,
+            r#"{"IP": "127.0.0.1", "PublicPort": 9090, "Type": "udp"}"#,
+        ]);
+        let map = parse_containers_json(&json);
+        let localhost = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        assert!(map.truncated(), "the oversized range was dropped");
+        assert!(
+            map.get(localhost, 1, Protocol::Tcp).is_none(),
+            "the range past the cap is skipped as a whole"
+        );
+        assert_eq!(
+            mapped_container(&map, localhost, 8080, Protocol::Tcp).name,
+            "c2",
+            "a later binding of the same container still fits"
+        );
+        assert_eq!(
+            mapped_container(&map, localhost, 9090, Protocol::Udp).name,
+            "c3",
+            "a later container still fits"
+        );
+        assert_eq!(map.len(), MAX_PORT_BINDINGS - 1);
+    }
+
+    #[test]
+    fn small_replies_are_not_truncated() {
+        let json = containers_with_ports(&[
+            r#"{"IP": "0.0.0.0", "PublicPort": 80, "Type": "tcp"}"#,
+            r#"{"host_port": 1000, "range": 100, "protocol": "udp"}"#,
+        ]);
+        assert!(!parse_containers_json(&json).truncated());
+        assert!(!parse_containers_json("[]").truncated());
+        assert!(!parse_containers_json("not json").truncated());
     }
 
     #[test]

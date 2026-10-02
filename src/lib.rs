@@ -906,9 +906,10 @@ impl Client {
     /// Tries the same daemons as detection, in priority order
     /// (`DOCKER_HOST` first, then the platform defaults; a `unix://`
     /// `DOCKER_HOST` replaces the default sockets). Before the stop request
-    /// is sent to a daemon, it must answer `GET /_ping` on a separate
-    /// connection; a daemon that cannot be reached or does not answer the
-    /// ping (for example a forwarder whose backend is down) is skipped
+    /// is sent to a daemon, it must answer `GET /_ping` with a 2xx status on
+    /// a separate connection; a daemon that cannot be reached or does not
+    /// answer the ping that way (for example a forwarder whose backend is
+    /// down, or a TLS port that answers plain HTTP with 400) is skipped
     /// without receiving the stop.
     ///
     /// Any reply from the `DOCKER_HOST` daemon, including "not found", is

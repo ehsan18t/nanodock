@@ -51,6 +51,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 
 - On Windows, a daemon that sends a reply without `Content-Length` over a named pipe and then stalls is reported as `Error::Timeout` once the deadline passes. Before, whatever had arrived was taken as the complete body, so a truncated reply could read as an empty container list.
 - Named pipe replies are read as they arrive instead of being polled every 10 ms, so a detection or a stop over a named pipe takes about 1 ms instead of about 20 ms. Named pipes now go through the same HTTP parser as Unix sockets and TCP.
+- The `GET /_ping` check before a stop or kill now requires a 2xx status. Any other reply, such as 400 from a TLS port that received plain HTTP or a 5xx from a forwarder whose backend is broken, marks the endpoint unreachable, so the stop is never sent there and the next daemon is tried. Before, any HTTP status passed the check.
 
 ### Migrating from 0.1
 

@@ -821,9 +821,9 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopAttempt {
     /// The stop request was never sent: the endpoint could not be reached,
-    /// it did not answer the `GET /_ping` preflight (for example a
-    /// forwarder whose backend is down), or writing the stop request
-    /// failed. Other endpoints may safely be tried.
+    /// it did not answer the `GET /_ping` preflight with a 2xx status (for
+    /// example a forwarder whose backend is down), or writing the stop
+    /// request failed. Other endpoints may safely be tried.
     Unreachable,
     /// The stop request was fully written but no usable reply arrived: the
     /// connection was closed or reset, the deadline passed, or the reply
@@ -839,16 +839,23 @@ fn ping_deadline(stop_deadline: Instant) -> Instant {
     stop_deadline.min(Instant::now() + PING_TIMEOUT)
 }
 
-/// Whether the ping preflight got any HTTP reply.
+/// Whether the ping preflight got a 2xx reply.
 ///
 /// Every failure, including a reply that is partial or malformed, counts as
-/// "not answered": the stop request has not been sent yet, so skipping this
-/// endpoint can never cause a second daemon to act on the same container.
+/// "not answered", and so does any other status: a 400 from a TLS port or a
+/// web server, or a 5xx from a forwarder whose backend is broken, means no
+/// working daemon is behind the endpoint. The stop request has not been sent
+/// yet, so skipping this endpoint can never cause a second daemon to act on
+/// the same container.
 fn ping_answered(result: Result<u16, http::StatusFailure>) -> bool {
     match result {
-        Ok(status_code) => {
+        Ok(status_code) if (200..300).contains(&status_code) => {
             debug!("container runtime answered ping: status={status_code}");
             true
+        }
+        Ok(status_code) => {
+            debug!("container runtime ping failed, skipping stop: status={status_code}");
+            false
         }
         Err(failure) => {
             debug!("container runtime did not answer ping, skipping stop: failure={failure:?}");
@@ -880,7 +887,8 @@ fn stop_attempt_from(result: Result<u16, http::StatusFailure>) -> StopAttempt {
 /// `connect`, and classify the result.
 ///
 /// The daemon must first answer a `GET /_ping` preflight on its own
-/// connection, within [`PING_TIMEOUT`]; otherwise the stop is not sent.
+/// connection with a 2xx status, within [`PING_TIMEOUT`]; otherwise the
+/// stop is not sent.
 /// The ping and the stop request share `deadline`.
 pub fn stop_via<S, C>(connect: C, endpoint: &str, deadline: Instant) -> StopAttempt
 where
@@ -1592,6 +1600,90 @@ mod tests {
             "a ping that times out leaves the stop unsent"
         );
         assert!(!any_post(&requests), "the stop must never be sent");
+    }
+
+    /// Answer the ping with 400 like a TLS port given plain HTTP, and any
+    /// other request with 204.
+    fn answer_ping_400(stream: &mut TcpStream, request: &[u8]) {
+        if is_ping(request) {
+            drop(stream.write_all(b"HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n"));
+        } else {
+            drop(stream.write_all(b"HTTP/1.0 204 No Content\r\n\r\n"));
+        }
+    }
+
+    /// Answer the ping with 502 like a forwarder whose backend is broken,
+    /// and any other request with 204.
+    fn answer_ping_502(stream: &mut TcpStream, request: &[u8]) {
+        if is_ping(request) {
+            drop(stream.write_all(b"HTTP/1.0 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"));
+        } else {
+            drop(stream.write_all(b"HTTP/1.0 204 No Content\r\n\r\n"));
+        }
+    }
+
+    #[test]
+    fn ping_counts_only_2xx_as_answered() {
+        for status in [200, 204, 299] {
+            assert!(ping_answered(Ok(status)), "{status} is a working daemon");
+        }
+        for status in [101, 199, 300, 400, 404, 500, 502, 503] {
+            assert!(!ping_answered(Ok(status)), "{status} is no working daemon");
+        }
+        assert!(!ping_answered(Err(http::StatusFailure::NoReply)));
+        assert!(!ping_answered(Err(http::StatusFailure::NotSent)));
+    }
+
+    #[test]
+    fn tcp_stop_never_sends_stop_when_ping_is_not_2xx() {
+        for (respond, status) in [(answer_ping_400 as Respond, 400), (answer_ping_502, 502)] {
+            let daemon = TestDaemon::start(respond);
+
+            let attempt = stop_tcp(
+                &daemon.addr,
+                "/containers/abc/stop",
+                Instant::now() + Duration::from_secs(5),
+            );
+            let requests = daemon.finish();
+
+            assert_eq!(
+                attempt,
+                StopAttempt::Unreachable,
+                "a ping answered with {status} means no working daemon"
+            );
+            assert_eq!(
+                requests,
+                vec![PING_REQUEST_LINE.to_string()],
+                "only the ping may be sent after a {status} ping"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_falls_through_non_2xx_ping_to_next_endpoint() {
+        let tls_port = TestDaemon::start(answer_ping_400);
+        let daemon = TestDaemon::start(answer_ping_then_204);
+
+        let targets = [(true, tls_port.addr.clone()), (false, daemon.addr.clone())];
+        let attempt = crate::first_stop_owner(targets, |addr| {
+            stop_tcp(
+                &addr,
+                "/containers/web/stop?t=10",
+                Instant::now() + STOP_TIMEOUT,
+            )
+        });
+        let tls_requests = tls_port.finish();
+        drop(daemon.finish());
+
+        assert_eq!(
+            crate::stop_outcome(attempt, crate::StopKind::Graceful),
+            crate::StopOutcome::Stopped,
+            "the daemon after the endpoint that failed the ping is used"
+        );
+        assert!(
+            !any_post(&tls_requests),
+            "the 400 endpoint never receives the stop"
+        );
     }
 
     #[test]

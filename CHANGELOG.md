@@ -47,6 +47,11 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** `lookup_published_container(map, socket, proto, allow_proxy_fallback)`. Use `ContainerPortMap::lookup(ip, port, proto, fallback)` with a `ProxyFallback` in place of the `bool`.
 - **Breaking:** `await_detection(handle)`. Use `DetectionHandle::wait`, or `DetectionHandle::wait_result` to keep the error.
 
+### Fixed
+
+- On Windows, a daemon that sends a reply without `Content-Length` over a named pipe and then stalls is reported as `Error::Timeout` once the deadline passes. Before, whatever had arrived was taken as the complete body, so a truncated reply could read as an empty container list.
+- Named pipe replies are read as they arrive instead of being polled every 10 ms, so a detection or a stop over a named pipe takes about 1 ms instead of about 20 ms. Named pipes now go through the same HTTP parser as Unix sockets and TCP.
+
 ### Migrating from 0.1
 
 Waiting for background detection:

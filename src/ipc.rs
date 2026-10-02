@@ -6,9 +6,11 @@
 //! [`FetchError`] that says why the endpoint produced none.
 //!
 //! Every query and stop request runs against one overall deadline. Socket
-//! read timeouts only apply per call, so streams are wrapped in
+//! read timeouts only apply per call, so sockets are wrapped in
 //! [`DeadlineStream`], which shrinks the timeout before every read and write
-//! and fails once the deadline has passed.
+//! and fails once the deadline has passed. Windows named pipes have no read
+//! timeout at all; `PipeStream` gives them the same deadline behavior, so
+//! every transport is a plain `Read + Write` stream for the HTTP parser.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
@@ -512,14 +514,14 @@ const ERROR_PIPE_BUSY: i32 = 231;
 #[cfg(windows)]
 const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 
+/// First wait of a [`PipeStream`] read that finds no bytes in the pipe.
 #[cfg(windows)]
-const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PIPE_POLL_MIN: Duration = Duration::from_micros(250);
 
-/// Upper bound on everything buffered from a named pipe. Applies whether or
-/// not the headers are complete yet, so a daemon that never finishes its
-/// headers cannot grow the buffer without limit before the deadline.
+/// Longest wait between two checks of an idle pipe; each wait doubles from
+/// [`PIPE_POLL_MIN`] up to this.
 #[cfg(windows)]
-const MAX_PIPE_BUFFER: usize = http::MAX_HEADER_SIZE + http::MAX_RESPONSE_BODY;
+const PIPE_POLL_MAX: Duration = Duration::from_millis(10);
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -537,82 +539,14 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 pub fn fetch_named_pipe_json(path: &str, deadline: Instant) -> Result<String, FetchError> {
-    let mut stream = open_named_pipe(path, deadline, "").map_err(FetchError::from_connect_error)?;
-    send_http_request_windows(&mut stream, deadline).inspect_err(|error| {
+    let file = open_named_pipe(path, deadline, "").map_err(FetchError::from_connect_error)?;
+    let mut stream = PipeStream::new(file, deadline);
+    http::send_http_request(&mut stream).map_err(|error| {
         debug!(
             "container runtime named pipe returned no usable response: pipe={path} error={error:?}"
         );
+        FetchError::from(error)
     })
-}
-
-#[cfg(windows)]
-fn send_http_request_windows(
-    stream: &mut std::fs::File,
-    deadline: Instant,
-) -> Result<String, FetchError> {
-    stream
-        .write_all(http::CONTAINERS_HTTP_REQUEST)
-        .map_err(|error| FetchError::from(http::ResponseError::Io(error)))?;
-
-    let mut response = Vec::with_capacity(8192);
-    let mut chunk = [0_u8; 8192];
-    let mut headers: Option<http::ParsedHeaders> = None;
-    let mut failure: Option<http::ResponseError> = None;
-
-    let result = poll_named_pipe_response(
-        stream,
-        deadline,
-        &mut chunk,
-        &mut response,
-        |response, eof| match container_list_step(response, eof, &mut headers) {
-            Ok(Some(body)) => PipeParseState::Done(body),
-            Ok(None) => PipeParseState::Pending,
-            Err(error) => {
-                failure = Some(error);
-                PipeParseState::Failed
-            }
-        },
-    );
-    match result {
-        Ok(body) => Ok(body),
-        Err(PipeFailure::TimedOut) => Err(FetchError::Timeout),
-        Err(PipeFailure::Closed | PipeFailure::Failed) => Err(failure.map_or_else(
-            || FetchError::Io(io::Error::other("reading the named pipe failed")),
-            FetchError::from,
-        )),
-    }
-}
-
-/// One parse step over the container-list reply buffered so far: `Ok(None)`
-/// while more bytes are needed.
-///
-/// Once the headers are parsed they are kept in `headers`, so later steps
-/// extract against the buffered body instead of reparsing the header block.
-#[cfg(windows)]
-fn container_list_step(
-    response: &[u8],
-    eof: bool,
-    headers: &mut Option<http::ParsedHeaders>,
-) -> Result<Option<String>, http::ResponseError> {
-    if eof {
-        return http::extract_body_at_eof(response, headers.as_ref()).map(Some);
-    }
-    if let Some(hdr) = headers.as_ref() {
-        return http::extract_http_body_from_buffer(response, hdr, false);
-    }
-
-    let hdr = match http::response_header_state(response) {
-        http::HeaderState::Pending => return Ok(None),
-        http::HeaderState::Invalid => {
-            return Err(http::ResponseError::Malformed(http::MALFORMED_HEADERS));
-        }
-        http::HeaderState::Complete(hdr) => hdr,
-    };
-    let body = http::extract_http_body_from_buffer(response, &hdr, false)?;
-    if body.is_none() {
-        *headers = Some(hdr);
-    }
-    Ok(body)
 }
 
 #[cfg(windows)]
@@ -639,143 +573,78 @@ fn open_named_pipe(
     }
 }
 
-#[cfg(windows)]
-enum PipeReadResult {
-    Continue,
-    Eof,
-    Failed,
-}
-
-#[cfg(windows)]
-enum PipeParseState<T> {
-    Pending,
-    Done(T),
-    Failed,
-}
-
-/// Why polling a named pipe produced no parsed value.
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PipeFailure {
-    /// The server closed the pipe before a complete reply was parsed.
-    Closed,
-    /// The deadline passed before a complete reply was parsed.
-    TimedOut,
-    /// The reply was invalid or too large, or a read failed.
-    Failed,
-}
-
-#[cfg(windows)]
-fn poll_named_pipe_response<T, F>(
-    stream: &mut std::fs::File,
-    deadline: Instant,
-    chunk: &mut [u8],
-    response: &mut Vec<u8>,
-    mut parse: F,
-) -> Result<T, PipeFailure>
-where
-    F: FnMut(&[u8], bool) -> PipeParseState<T>,
-{
-    loop {
-        match parse(response, false) {
-            PipeParseState::Pending => {}
-            PipeParseState::Done(value) => return Ok(value),
-            PipeParseState::Failed => return Err(PipeFailure::Failed),
-        }
-
-        let available = match peek_available_bytes(stream) {
-            Some(available) => available,
-            None if last_os_error_is_pipe_closed() => {
-                return finalize_pipe_parse(response, &mut parse, PipeFailure::Closed);
-            }
-            None => return Err(PipeFailure::Failed),
-        };
-
-        // Checked on every iteration so a daemon that streams continuously
-        // cannot hold the request open past the deadline.
-        if Instant::now() >= deadline {
-            if available == 0 {
-                // Idle at the deadline: treat the buffered bytes as the
-                // complete response, as before.
-                return finalize_pipe_parse(response, &mut parse, PipeFailure::TimedOut);
-            }
-            debug!("container runtime named pipe still streaming at deadline");
-            return Err(PipeFailure::TimedOut);
-        }
-
-        if available == 0 {
-            std::thread::sleep(PIPE_POLL_INTERVAL);
-            continue;
-        }
-
-        match read_named_pipe_bytes(stream, available, chunk, response) {
-            PipeReadResult::Continue => {}
-            PipeReadResult::Eof => {
-                return finalize_pipe_parse(response, &mut parse, PipeFailure::Closed);
-            }
-            PipeReadResult::Failed => return Err(PipeFailure::Failed),
-        }
-    }
-}
-
-/// Parse `response` as complete, failing with `failure` if it is not.
-#[cfg(windows)]
-fn finalize_pipe_parse<T, F>(
-    response: &[u8],
-    parse: &mut F,
-    failure: PipeFailure,
-) -> Result<T, PipeFailure>
-where
-    F: FnMut(&[u8], bool) -> PipeParseState<T>,
-{
-    match parse(response, true) {
-        PipeParseState::Done(value) => Ok(value),
-        PipeParseState::Pending | PipeParseState::Failed => Err(failure),
-    }
-}
-
-#[cfg(windows)]
-fn read_named_pipe_bytes(
-    stream: &mut std::fs::File,
-    available: u32,
-    chunk: &mut [u8],
-    response: &mut Vec<u8>,
-) -> PipeReadResult {
-    let Ok(max_chunk) = u32::try_from(chunk.len()) else {
-        return PipeReadResult::Failed;
-    };
-    let Ok(read_len) = usize::try_from(available.min(max_chunk)) else {
-        return PipeReadResult::Failed;
-    };
-
-    match Read::read(stream, &mut chunk[..read_len]) {
-        Ok(0) => PipeReadResult::Eof,
-        Ok(read) => {
-            if append_within_limit(response, &chunk[..read], MAX_PIPE_BUFFER) {
-                PipeReadResult::Continue
-            } else {
-                debug!(
-                    "container runtime named pipe response exceeded size limit: limit_bytes={MAX_PIPE_BUFFER}"
-                );
-                PipeReadResult::Failed
-            }
-        }
-        Err(error) if is_pipe_closed_code(error.raw_os_error()) => PipeReadResult::Eof,
-        Err(_) => PipeReadResult::Failed,
-    }
-}
-
-/// Append `bytes` to `response` unless the result would exceed `limit`.
+/// A connected named pipe read as a blocking stream under one overall
+/// deadline, so it goes through the same HTTP parser as sockets.
 ///
-/// Returns `false` (leaving `response` unchanged) when the limit would be
-/// exceeded.
+/// A synchronous pipe read has no timeout: a daemon that stops answering
+/// would block it forever. Each read therefore peeks first and reads only
+/// the bytes already in the pipe. While the pipe is empty it waits, starting
+/// at [`PIPE_POLL_MIN`] and doubling up to [`PIPE_POLL_MAX`], so a prompt
+/// reply is picked up within a fraction of a millisecond while an idle pipe
+/// costs little CPU. Once the deadline has passed, every read and write
+/// fails with [`io::ErrorKind::TimedOut`]. A pipe the server has closed
+/// reads as EOF.
 #[cfg(windows)]
-fn append_within_limit(response: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bool {
-    if response.len().saturating_add(bytes.len()) > limit {
-        return false;
+struct PipeStream {
+    file: std::fs::File,
+    deadline: Instant,
+}
+
+#[cfg(windows)]
+impl PipeStream {
+    const fn new(file: std::fs::File, deadline: Instant) -> Self {
+        Self { file, deadline }
     }
-    response.extend_from_slice(bytes);
-    true
+
+    fn remaining(&self) -> io::Result<Duration> {
+        remaining_until(self.deadline).ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    }
+}
+
+#[cfg(windows)]
+impl Read for PipeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut wait = PIPE_POLL_MIN;
+        loop {
+            // Checked before every peek, so a daemon that streams without
+            // pause cannot hold the request open past the deadline.
+            let remaining = self.remaining()?;
+            match peek_available_bytes(&self.file) {
+                Ok(0) => {}
+                Ok(available) => {
+                    let len = usize::try_from(available).map_or(buf.len(), |n| n.min(buf.len()));
+                    return closed_pipe_as_eof(self.file.read(&mut buf[..len]));
+                }
+                Err(error) => return closed_pipe_as_eof(Err(error)),
+            }
+            std::thread::sleep(wait.min(remaining));
+            wait = wait.saturating_mul(2).min(PIPE_POLL_MAX);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Write for PipeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.remaining()?;
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Report a pipe the server has closed as EOF (`Ok(0)`).
+#[cfg(windows)]
+fn closed_pipe_as_eof(result: io::Result<usize>) -> io::Result<usize> {
+    match result {
+        Err(error) if is_pipe_closed_code(error.raw_os_error()) => Ok(0),
+        other => other,
+    }
 }
 
 /// Wait until a busy pipe instance is free, failing with the OS error (or
@@ -796,8 +665,9 @@ fn wait_named_pipe(path: &str, deadline: Instant) -> io::Result<()> {
     }
 }
 
+/// The number of bytes waiting in the pipe, or the OS error of the peek.
 #[cfg(windows)]
-fn peek_available_bytes(stream: &std::fs::File) -> Option<u32> {
+fn peek_available_bytes(stream: &std::fs::File) -> io::Result<u32> {
     let mut available = 0;
     // SAFETY: `stream` is an open named-pipe file whose raw handle is valid
     // for the lifetime of this call. We pass null for all output pointers
@@ -814,7 +684,11 @@ fn peek_available_bytes(stream: &std::fs::File) -> Option<u32> {
             std::ptr::null_mut(),
         )
     };
-    (success != 0).then_some(available)
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available)
+    }
 }
 
 /// Milliseconds left before `deadline`, or `None` once it has passed.
@@ -850,11 +724,6 @@ fn wide_string(value: &str) -> Vec<u16> {
 #[cfg(windows)]
 const fn is_pipe_closed_code(code: Option<i32>) -> bool {
     matches!(code, Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED))
-}
-
-#[cfg(windows)]
-fn last_os_error_is_pipe_closed() -> bool {
-    is_pipe_closed_code(std::io::Error::last_os_error().raw_os_error())
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,64 +926,21 @@ pub fn stop_via_named_pipe(path: &str, endpoint: &str) -> StopAttempt {
     if !ping_named_pipe(path, ping_deadline(deadline)) {
         return StopAttempt::Unreachable;
     }
-    let Ok(mut stream) = open_named_pipe(path, deadline, " for stop") else {
+    let Ok(file) = open_named_pipe(path, deadline, " for stop") else {
         return StopAttempt::Unreachable;
     };
-    stop_attempt_from(send_http_status_request_windows(
-        &mut stream,
-        &http::format_post_request(endpoint),
-        deadline,
-    ))
+    post_status_attempt(&mut PipeStream::new(file, deadline), endpoint)
 }
 
 /// Whether the daemon behind a named pipe answers `GET /_ping`.
 #[cfg(windows)]
 fn ping_named_pipe(path: &str, deadline: Instant) -> bool {
-    let Ok(mut stream) = open_named_pipe(path, deadline, " for ping") else {
+    let Ok(file) = open_named_pipe(path, deadline, " for ping") else {
         return false;
     };
-    let result = send_http_status_request_windows(&mut stream, http::PING_HTTP_REQUEST, deadline);
+    let mut stream = PipeStream::new(file, deadline);
+    let result = http::send_http_status_request(&mut stream, http::PING_HTTP_REQUEST);
     ping_answered(result, &format!("pipe={path}"))
-}
-
-/// Windows named-pipe polled-IO loop for requests that need only the status
-/// code of the reply (no body).
-///
-/// Classifies failures like [`http::send_http_status_request`]: only a
-/// failed write is [`http::StatusFailure::NotSent`]; once the request is
-/// written, a closed pipe, a timeout, or a partial or malformed reply is
-/// [`http::StatusFailure::NoReply`].
-#[cfg(windows)]
-fn send_http_status_request_windows(
-    stream: &mut std::fs::File,
-    request: &[u8],
-    deadline: Instant,
-) -> Result<u16, http::StatusFailure> {
-    stream
-        .write_all(request)
-        .map_err(|_| http::StatusFailure::NotSent)?;
-
-    let mut response = Vec::with_capacity(1024);
-    let mut chunk = [0_u8; 1024];
-
-    poll_named_pipe_response(
-        stream,
-        deadline,
-        &mut chunk,
-        &mut response,
-        parse_pipe_status,
-    )
-    .map_err(|_| http::StatusFailure::NoReply)
-}
-
-/// Pipe parse step that only needs the status code of the reply.
-#[cfg(windows)]
-fn parse_pipe_status(response: &[u8], _eof: bool) -> PipeParseState<u16> {
-    match http::response_header_state(response) {
-        http::HeaderState::Pending => PipeParseState::Pending,
-        http::HeaderState::Complete(hdr) => PipeParseState::Done(hdr.status_code),
-        http::HeaderState::Invalid => PipeParseState::Failed,
-    }
 }
 
 /// Send a POST request to stop or kill a container via TCP.
@@ -2021,125 +1847,396 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn append_within_limit_rejects_overflowing_chunk() {
-        let mut response = vec![0_u8; 6];
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            max_instances: u32,
+            out_buffer_size: u32,
+            in_buffer_size: u32,
+            default_timeout: u32,
+            security_attributes: *mut c_void,
+        ) -> RawHandle;
+        fn ConnectNamedPipe(named_pipe: RawHandle, overlapped: *mut c_void) -> i32;
+    }
 
-        assert!(
-            append_within_limit(&mut response, &[1, 2], 8),
-            "filling up to the limit is allowed"
+    /// `PIPE_ACCESS_DUPLEX`: the server instance reads and writes.
+    #[cfg(windows)]
+    const PIPE_ACCESS_DUPLEX: u32 = 3;
+
+    /// `ERROR_PIPE_CONNECTED`: a client connected before `ConnectNamedPipe`.
+    #[cfg(windows)]
+    const ERROR_PIPE_CONNECTED: i32 = 535;
+
+    /// A pipe path no other test uses.
+    #[cfg(windows)]
+    fn test_pipe_path(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            r"\\.\pipe\nanodock-test-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
+    /// Create one byte-mode server instance of the pipe at `path`.
+    #[cfg(windows)]
+    fn create_pipe_instance(path: &str, max_instances: u32) -> std::fs::File {
+        use std::os::windows::io::FromRawHandle;
+
+        let wide_path = wide_string(path);
+        // SAFETY: `wide_path` is a valid null-terminated UTF-16 string, the
+        // sizes are plain integers, and null security attributes select the
+        // default descriptor.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wide_path.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                0,
+                max_instances,
+                64 * 1024,
+                64 * 1024,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            handle as isize,
+            -1,
+            "CreateNamedPipeW failed: {}",
+            io::Error::last_os_error()
         );
+        // SAFETY: `handle` is a valid pipe handle that nothing else owns.
+        unsafe { std::fs::File::from_raw_handle(handle) }
+    }
+
+    /// Block until a client connects to the server instance.
+    #[cfg(windows)]
+    fn accept_pipe_client(instance: &std::fs::File) {
+        // SAFETY: `instance` is an open pipe server handle, and a null
+        // `overlapped` pointer asks for a blocking call.
+        let connected = unsafe { ConnectNamedPipe(instance.as_raw_handle(), std::ptr::null_mut()) };
         assert!(
-            !append_within_limit(&mut response, &[3], 8),
-            "exceeding the limit must fail"
+            connected != 0
+                || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED),
+            "ConnectNamedPipe failed: {}",
+            io::Error::last_os_error()
         );
-        assert_eq!(response.len(), 8, "a rejected chunk must not be appended");
+    }
+
+    /// Named pipe stand-in for a daemon, like [`TestDaemon`]: serves up to
+    /// `connections` clients in order, answers each request head with a
+    /// [`PipeRespond`] function, and records the request lines.
+    #[cfg(windows)]
+    struct PipeDaemon {
+        path: String,
+        handle: JoinHandle<Vec<String>>,
+    }
+
+    /// How a [`PipeDaemon`] answers one connection, given the request head.
+    #[cfg(windows)]
+    type PipeRespond = fn(&mut std::fs::File, &[u8]);
+
+    #[cfg(windows)]
+    impl PipeDaemon {
+        fn start(connections: usize, respond: PipeRespond) -> Self {
+            let path = test_pipe_path("daemon");
+            // Created before returning, so the first client finds the pipe.
+            let mut instance = create_pipe_instance(&path, 255);
+            let server_path = path.clone();
+            let handle = std::thread::spawn(move || {
+                let mut lines = Vec::new();
+                for served in 1..=connections {
+                    accept_pipe_client(&instance);
+                    // Listen for the next client before answering, so a
+                    // client that reconnects right after the reply finds it.
+                    let next =
+                        (served < connections).then(|| create_pipe_instance(&server_path, 255));
+                    let request = drain_request(&mut instance);
+                    respond(&mut instance, &request);
+                    // FlushFileBuffers: wait until the client read the reply.
+                    drop(instance.sync_all());
+                    let line = String::from_utf8_lossy(&request);
+                    lines.push(line.lines().next().unwrap_or_default().to_string());
+                    match next {
+                        Some(next) => instance = next,
+                        None => break,
+                    }
+                }
+                lines
+            });
+            Self { path, handle }
+        }
+
+        /// Release any instance still waiting for a client and return the
+        /// request lines received, in order (empty heads are dropped).
+        fn finish(self) -> Vec<String> {
+            while !self.handle.is_finished() {
+                // An empty connection lets a waiting instance move on.
+                drop(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&self.path),
+                );
+                std::thread::yield_now();
+            }
+            let mut lines = self.handle.join().expect("pipe daemon thread");
+            lines.retain(|line| !line.is_empty());
+            lines
+        }
+    }
+
+    /// Keep the connection open until the client closes it.
+    #[cfg(windows)]
+    fn hold_until_client_closes(stream: &mut std::fs::File) {
+        let mut byte = [0_u8; 1];
+        while matches!(stream.read(&mut byte), Ok(read) if read > 0) {}
+    }
+
+    #[cfg(windows)]
+    fn pipe_answer_ping_only(stream: &mut std::fs::File, request: &[u8]) {
+        if is_ping(request) {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK"));
+        }
     }
 
     #[cfg(windows)]
     #[test]
-    fn poll_named_pipe_response_reports_close_without_reply() {
-        let (reader, writer) = std::io::pipe().expect("anonymous pipe");
-        let mut reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
-        drop(writer);
+    fn named_pipe_fetch_reads_reply_without_content_length_to_eof() {
+        let daemon = PipeDaemon::start(1, |stream, _| {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\nServer: test\r\n\r\n[]"));
+        });
 
-        let mut chunk = [0_u8; 64];
-        let mut response = Vec::new();
-        let result: Result<u16, PipeFailure> = poll_named_pipe_response(
-            &mut reader,
-            Instant::now() + Duration::from_secs(5),
-            &mut chunk,
-            &mut response,
-            parse_pipe_status,
-        );
+        let body = fetch_named_pipe_json(&daemon.path, Instant::now() + Duration::from_secs(5));
+        let requests = daemon.finish();
 
-        assert_eq!(
-            result,
-            Err(PipeFailure::Closed),
-            "a pipe closed by the server reports Closed, not a generic failure"
-        );
-        assert!(response.is_empty(), "no reply byte was received");
+        assert_eq!(body.ok().as_deref(), Some("[]"), "the body runs to EOF");
+        assert_eq!(requests, vec!["GET /containers/json HTTP/1.0".to_string()]);
     }
 
     #[cfg(windows)]
     #[test]
-    fn poll_named_pipe_response_rejects_headers_above_cap() {
-        let (reader, mut writer) = std::io::pipe().expect("anonymous pipe");
-        let mut reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
-        let writer_thread = std::thread::spawn(move || {
-            drop(writer.write_all(b"HTTP/1.0 200 OK\r\nX-Pad: "));
+    fn named_pipe_fetch_reports_idle_pipe_at_deadline_as_timeout() {
+        // Without a Content-Length the body runs until the daemon closes the
+        // pipe. A daemon that stalls must not have its partial body taken as
+        // complete: here that would read as an empty container list.
+        let daemon = PipeDaemon::start(1, |stream, _| {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n[]"));
+            hold_until_client_closes(stream);
+        });
+
+        let result =
+            fetch_named_pipe_json(&daemon.path, Instant::now() + Duration::from_millis(300));
+        drop(daemon.finish());
+
+        assert!(
+            matches!(result, Err(FetchError::Timeout)),
+            "an unfinished body must time out, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_fetch_rejects_headers_above_cap() {
+        let daemon = PipeDaemon::start(1, |stream, _| {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\nX-Pad: "));
             let block = [b'a'; 1024];
             for _ in 0..(http::MAX_HEADER_SIZE / block.len() + 2) {
-                if writer.write_all(&block).is_err() {
+                if stream.write_all(&block).is_err() {
                     return;
                 }
             }
             // Keep the pipe open so only the header cap can end the read.
-            std::thread::sleep(Duration::from_millis(500));
+            hold_until_client_closes(stream);
         });
 
-        let started = Instant::now();
-        let mut chunk = [0_u8; 1024];
-        let mut response = Vec::new();
-        let result: Result<u16, PipeFailure> = poll_named_pipe_response(
-            &mut reader,
-            started + Duration::from_secs(5),
-            &mut chunk,
-            &mut response,
-            parse_pipe_status,
-        );
-        let elapsed = started.elapsed();
-        drop(reader);
-        drop(writer_thread.join());
+        let result = fetch_named_pipe_json(&daemon.path, Instant::now() + Duration::from_secs(10));
+        drop(daemon.finish());
 
-        assert_eq!(
-            result,
-            Err(PipeFailure::Failed),
-            "oversized headers must fail"
-        );
         assert!(
-            elapsed < Duration::from_secs(3),
-            "the header cap, not the deadline, must end the read, took {elapsed:?}"
+            matches!(result, Err(FetchError::Malformed(_))),
+            "the header cap, not the deadline, must end the read, got {result:?}"
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn poll_named_pipe_response_stops_continuous_stream_at_deadline() {
-        let (reader, mut writer) = std::io::pipe().expect("anonymous pipe");
-        let mut reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
+    fn named_pipe_fetch_reports_missing_pipe_as_not_found() {
+        let result = fetch_named_pipe_json(
+            &test_pipe_path("missing"),
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(
+            matches!(result, Err(FetchError::NotFound)),
+            "got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_open_waits_for_busy_pipe_until_deadline() {
+        let path = test_pipe_path("busy");
+        let _instance = create_pipe_instance(&path, 1);
+        // The only instance is taken, so the next open finds the pipe busy.
+        let _first = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("first client");
+
+        let error = open_named_pipe(&path, Instant::now() + Duration::from_millis(200), "")
+            .expect_err("no instance frees up");
+
+        assert!(
+            matches!(FetchError::from_connect_error(error), FetchError::Timeout),
+            "a pipe that stays busy until the deadline is a timeout"
+        );
+    }
+
+    /// The read end of an anonymous pipe, which `PeekNamedPipe` also serves,
+    /// with its write end.
+    #[cfg(windows)]
+    fn anonymous_pipe() -> (std::fs::File, io::PipeWriter) {
+        let (reader, writer) = io::pipe().expect("anonymous pipe");
+        let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
+        (reader, writer)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_stream_reads_closed_pipe_as_eof() {
+        let (reader, writer) = anonymous_pipe();
+        drop(writer);
+        let mut stream = PipeStream::new(reader, Instant::now() + Duration::from_secs(5));
+
+        assert_eq!(
+            stream.read(&mut [0_u8; 16]).ok(),
+            Some(0),
+            "a pipe closed by the server reads as EOF, not as an error"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_stream_reads_only_available_bytes() {
+        let (reader, mut writer) = anonymous_pipe();
+        writer.write_all(b"abc").expect("write");
+        let mut stream = PipeStream::new(reader, Instant::now() + Duration::from_secs(5));
+        let mut buf = [0_u8; 16];
+
+        assert_eq!(
+            stream.read(&mut buf).ok(),
+            Some(3),
+            "no read waits for a full buffer"
+        );
+        assert_eq!(&buf[..3], b"abc");
+        drop(writer);
+        assert_eq!(stream.read(&mut buf).ok(), Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_stream_reports_idle_pipe_as_timed_out() {
+        let (reader, writer) = anonymous_pipe();
+        let started = Instant::now();
+        let mut stream = PipeStream::new(reader, started + Duration::from_millis(100));
+
+        let error = stream.read(&mut [0_u8; 16]).expect_err("nothing arrives");
+        drop(writer);
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the read waits for the whole deadline"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_stream_stops_continuous_stream_at_deadline() {
+        let (reader, mut writer) = anonymous_pipe();
         let writer_thread = std::thread::spawn(move || {
             let block = [b'x'; 512];
-            let started = Instant::now();
-            while started.elapsed() < Duration::from_secs(5) {
-                if writer.write_all(&block).is_err() {
-                    return;
-                }
-            }
+            // Ends once the reader is dropped and the write fails.
+            while writer.write_all(&block).is_ok() {}
         });
 
         let started = Instant::now();
-        let mut chunk = [0_u8; 256];
-        let mut response = Vec::new();
-        let result: Result<(), PipeFailure> = poll_named_pipe_response(
-            &mut reader,
-            started + Duration::from_millis(200),
-            &mut chunk,
-            &mut response,
-            |_, _| PipeParseState::Pending,
-        );
+        let mut stream = PipeStream::new(reader, started + Duration::from_millis(200));
+        let mut buf = [0_u8; 256];
+        let error = loop {
+            if let Err(error) = stream.read(&mut buf) {
+                break error;
+            }
+        };
         let elapsed = started.elapsed();
-        drop(reader);
+        drop(stream);
         drop(writer_thread.join());
 
-        assert_eq!(
-            result,
-            Err(PipeFailure::TimedOut),
-            "an unfinished response must not succeed"
-        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
             elapsed < Duration::from_secs(3),
             "a continuous stream must not outlive the deadline, took {elapsed:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_via_named_pipe_reports_status_code_after_ping() {
+        let daemon = PipeDaemon::start(2, |stream, request| {
+            if is_ping(request) {
+                pipe_answer_ping_only(stream, request);
+            } else {
+                drop(stream.write_all(b"HTTP/1.0 204 No Content\r\n\r\n"));
+            }
+        });
+
+        let attempt = stop_via_named_pipe(&daemon.path, "/containers/abc/stop?t=10");
+        let requests = daemon.finish();
+
+        assert_eq!(attempt, StopAttempt::Status(204));
+        assert_eq!(
+            requests,
+            vec![
+                PING_REQUEST_LINE.to_string(),
+                "POST /containers/abc/stop?t=10 HTTP/1.0".to_string()
+            ],
+            "the ping goes out on its own connection before the stop"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_via_named_pipe_never_sends_stop_when_ping_is_dropped() {
+        let daemon = PipeDaemon::start(2, |_, _| {});
+
+        let attempt = stop_via_named_pipe(&daemon.path, "/containers/abc/stop");
+        let requests = daemon.finish();
+
+        assert_eq!(attempt, StopAttempt::Unreachable);
+        assert_eq!(
+            requests,
+            vec![PING_REQUEST_LINE.to_string()],
+            "only the ping may be sent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_via_named_pipe_classifies_close_after_request_as_no_response() {
+        let daemon = PipeDaemon::start(2, pipe_answer_ping_only);
+
+        let attempt = stop_via_named_pipe(&daemon.path, "/containers/abc/stop");
+        let requests = daemon.finish();
+
+        assert_eq!(
+            attempt,
+            StopAttempt::NoResponse,
+            "a daemon that read the stop request may be acting on it"
+        );
+        assert!(any_post(&requests), "the stop request was received");
     }
 }

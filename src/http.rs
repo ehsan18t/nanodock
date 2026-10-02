@@ -1,20 +1,11 @@
 //! Minimal HTTP/1.0 response parser for Docker daemon replies.
 //!
 //! Header parsing is handled by `httparse`; chunked transfer-encoding
-//! body framing uses `httparse::parse_chunk_size`. Two code paths exist:
-//!
-//! - **Streaming** (`send_http_request`): reads from a `BufRead` trait
-//!   object (Unix sockets, TCP). Headers are consumed line-by-line so the
-//!   reader is left positioned at the body start.
-//!
-//! - **Buffered** (`send_http_request_windows`, via `parse_response_headers`):
-//!   operates on an already-collected `&[u8]` buffer (Windows named pipes
-//!   with polled I/O). Headers are parsed from the accumulated buffer and
-//!   the body is extracted once complete.
-//!
-//! The dual implementation is an architectural necessity: Windows named
-//! pipes use non-blocking peek-and-read loops that accumulate into a
-//! single buffer, while Unix/TCP sockets use blocking `BufReader` I/O.
+//! body framing uses `httparse::parse_chunk_size`. Every transport (Unix
+//! sockets, TCP, and Windows named pipes) is a blocking `Read + Write`
+//! stream, read through one `BufReader`: headers are consumed line by line
+//! so the reader is left positioned at the body start, and every read is
+//! capped so a misbehaving daemon cannot grow a buffer without bound.
 
 use std::io::{self, BufRead, BufReader, Read};
 
@@ -42,9 +33,6 @@ pub struct ParsedHeaders {
     pub status_ok: bool,
     /// Raw HTTP status code (e.g. 200, 204, 304, 404).
     pub status_code: u16,
-    /// Byte offset where the response body begins (after `\r\n\r\n`).
-    #[cfg(any(windows, test))]
-    pub body_offset: usize,
     /// Value of the `Content-Length` header, if present.
     pub content_length: Option<usize>,
     /// Transfer framing used for the response body.
@@ -161,8 +149,6 @@ fn read_response_headers(reader: &mut impl BufRead) -> Result<ParsedHeaders, Res
     Ok(ParsedHeaders {
         status_ok,
         status_code,
-        #[cfg(any(windows, test))]
-        body_offset: 0,
         content_length,
         transfer_encoding,
     })
@@ -380,233 +366,6 @@ pub fn send_http_post_status(
 }
 
 // ---------------------------------------------------------------------------
-// Buffered path (Windows named pipes / tests)
-// ---------------------------------------------------------------------------
-
-/// Progress of parsing the response headers out of a buffered reply.
-#[cfg(any(windows, test))]
-pub enum HeaderState {
-    /// The header/body boundary has not arrived yet.
-    Pending,
-    /// The headers are complete.
-    Complete(ParsedHeaders),
-    /// The headers are malformed or exceed [`MAX_HEADER_SIZE`]; more bytes
-    /// cannot fix them.
-    Invalid,
-}
-
-/// Parse the HTTP response headers buffered so far in `response`.
-///
-/// Enforces [`MAX_HEADER_SIZE`] on the buffered path: once more bytes than
-/// the cap are buffered without a complete header block, or a complete
-/// block is larger than the cap, the headers are [`HeaderState::Invalid`].
-/// An `httparse` error is also invalid rather than "still waiting".
-#[cfg(any(windows, test))]
-pub fn response_header_state(response: &[u8]) -> HeaderState {
-    let mut headers_buf = [httparse::EMPTY_HEADER; 64];
-    let mut parsed = httparse::Response::new(&mut headers_buf);
-
-    let body_offset = match parsed.parse(response) {
-        Ok(httparse::Status::Complete(body_offset)) if body_offset <= MAX_HEADER_SIZE => {
-            body_offset
-        }
-        Ok(httparse::Status::Partial) if response.len() <= MAX_HEADER_SIZE => {
-            return HeaderState::Pending;
-        }
-        Ok(_) | Err(_) => return HeaderState::Invalid,
-    };
-
-    let status_code = parsed.code.unwrap_or(0);
-    let status_ok = (200..300).contains(&status_code);
-    let (content_length, transfer_encoding) = extract_header_metadata(parsed.headers);
-
-    HeaderState::Complete(ParsedHeaders {
-        status_ok,
-        status_code,
-        body_offset,
-        content_length,
-        transfer_encoding,
-    })
-}
-
-/// Try to locate and parse the HTTP response headers in `response`.
-///
-/// Returns `None` if the header/body boundary (`\r\n\r\n`) has not yet
-/// been received or the headers are invalid (see [`response_header_state`]).
-#[cfg(test)]
-pub fn parse_response_headers(response: &[u8]) -> Option<ParsedHeaders> {
-    match response_header_state(response) {
-        HeaderState::Complete(headers) => Some(headers),
-        HeaderState::Pending | HeaderState::Invalid => None,
-    }
-}
-
-/// Extract the body from a fully received (EOF) response, using
-/// pre-parsed headers if available, or falling back to a full parse.
-#[cfg(any(windows, test))]
-pub fn extract_body_at_eof(
-    response: &[u8],
-    headers: Option<&ParsedHeaders>,
-) -> Result<String, ResponseError> {
-    let parsed;
-    let headers = match headers {
-        Some(headers) => headers,
-        // Headers not yet parsed at EOF: fall back to a full single-pass parse.
-        None => match response_header_state(response) {
-            HeaderState::Complete(headers) => {
-                parsed = headers;
-                &parsed
-            }
-            HeaderState::Pending => return Err(ResponseError::Malformed(INCOMPLETE_RESPONSE)),
-            HeaderState::Invalid => return Err(ResponseError::Malformed(MALFORMED_HEADERS)),
-        },
-    };
-    extract_http_body_from_buffer(response, headers, true)?
-        .ok_or(ResponseError::Malformed(INCOMPLETE_RESPONSE))
-}
-
-#[cfg(test)]
-pub fn try_extract_http_body(response: &[u8], eof: bool) -> Option<String> {
-    let hdr = parse_response_headers(response)?;
-    extract_http_body_from_buffer(response, &hdr, eof)
-        .ok()
-        .flatten()
-}
-
-/// Extract the body buffered so far: `Ok(None)` while more bytes are
-/// needed, `Ok(Some(body))` once it is complete.
-#[cfg(any(windows, test))]
-pub fn extract_http_body_from_buffer(
-    response: &[u8],
-    headers: &ParsedHeaders,
-    eof: bool,
-) -> Result<Option<String>, ResponseError> {
-    if !headers.status_ok {
-        return Err(ResponseError::Status(headers.status_code));
-    }
-
-    let body = response
-        .get(headers.body_offset..)
-        .ok_or(ResponseError::Malformed(MALFORMED_HEADERS))?;
-    let decoded = match headers.transfer_encoding {
-        TransferEncoding::Identity => match identity_body(body, headers.content_length, eof)? {
-            Some(body) => body.to_vec(),
-            None => return Ok(None),
-        },
-        TransferEncoding::Chunked => match decode_chunked_body(body, eof)? {
-            Some(decoded) => decoded,
-            None => return Ok(None),
-        },
-        TransferEncoding::Unsupported => {
-            return Err(ResponseError::Malformed(UNSUPPORTED_ENCODING));
-        }
-    };
-    String::from_utf8(decoded)
-        .map(Some)
-        .map_err(|_| ResponseError::Malformed(BODY_NOT_UTF8))
-}
-
-/// The complete identity-encoded body in `body`, or `None` while more bytes
-/// are needed.
-#[cfg(any(windows, test))]
-fn identity_body(
-    body: &[u8],
-    content_length: Option<usize>,
-    eof: bool,
-) -> Result<Option<&[u8]>, ResponseError> {
-    if let Some(content_length) = content_length {
-        if content_length > MAX_RESPONSE_BODY {
-            return Err(ResponseError::Malformed(BODY_TOO_LARGE));
-        }
-        return Ok(body.get(..content_length));
-    }
-
-    // Without a length, the body runs to EOF. Fail as soon as the buffered
-    // bytes exceed the cap so the caller stops reading.
-    if body.len() > MAX_RESPONSE_BODY {
-        return Err(ResponseError::Malformed(BODY_TOO_LARGE));
-    }
-    Ok(eof.then_some(body))
-}
-
-#[cfg(any(windows, test))]
-fn decode_chunked_body(body: &[u8], eof: bool) -> Result<Option<Vec<u8>>, ResponseError> {
-    decode_chunked_frames(body, eof).map_err(|()| ResponseError::Malformed(MALFORMED_CHUNKS))
-}
-
-#[cfg(any(windows, test))]
-fn decode_chunked_frames(body: &[u8], eof: bool) -> Result<Option<Vec<u8>>, ()> {
-    let mut decoded = Vec::new();
-    let mut offset = 0;
-
-    loop {
-        let Some(line_end) = find_crlf(body, offset) else {
-            // An unterminated chunk-size line longer than any legitimate
-            // one will never complete; fail instead of buffering forever.
-            if body.len().saturating_sub(offset) > MAX_CHUNK_LINE {
-                return Err(());
-            }
-            return Ok(None);
-        };
-
-        let chunk_line = body.get(offset..line_end + 2).ok_or(())?;
-        let chunk_size = match httparse::parse_chunk_size(chunk_line) {
-            Ok(httparse::Status::Complete((_, size))) => usize::try_from(size).map_err(|_| ())?,
-            _ => return Err(()),
-        };
-        offset = line_end + 2;
-
-        if chunk_size == 0 {
-            return parse_chunked_trailers(body, offset, eof)
-                .map(|complete| complete.then_some(decoded));
-        }
-
-        // Enforce the cap on the cumulative decoded body before waiting
-        // for (or copying) the chunk data.
-        let decoded_len = decoded.len().checked_add(chunk_size).ok_or(())?;
-        if decoded_len > MAX_RESPONSE_BODY {
-            return Err(());
-        }
-
-        let chunk_end = offset.checked_add(chunk_size).ok_or(())?;
-        let terminator_end = chunk_end.checked_add(2).ok_or(())?;
-        if body.len() < terminator_end {
-            return Ok(None);
-        }
-        if &body[chunk_end..terminator_end] != b"\r\n" {
-            return Err(());
-        }
-
-        decoded.extend_from_slice(&body[offset..chunk_end]);
-        offset = terminator_end;
-    }
-}
-
-#[cfg(any(windows, test))]
-fn parse_chunked_trailers(body: &[u8], offset: usize, eof: bool) -> Result<bool, ()> {
-    let trailers = body.get(offset..).ok_or(())?;
-    if trailers.starts_with(b"\r\n") {
-        return Ok(true);
-    }
-
-    if trailers.windows(4).any(|window| window == b"\r\n\r\n") {
-        return Ok(true);
-    }
-
-    // At EOF, accept the body even without trailing CRLF since
-    // all chunk data including the terminal chunk has been received.
-    Ok(eof)
-}
-
-#[cfg(any(windows, test))]
-fn find_crlf(body: &[u8], offset: usize) -> Option<usize> {
-    body.get(offset..)?
-        .windows(2)
-        .position(|window| window == b"\r\n")
-        .map(|position| offset + position)
-}
-
-// ---------------------------------------------------------------------------
 // Shared header extraction
 // ---------------------------------------------------------------------------
 
@@ -663,131 +422,100 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_body_parser_waits_for_complete_content_length() {
-        let partial = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n123";
-        assert!(try_extract_http_body(partial, false).is_none());
-
-        let complete = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n12345";
+    fn streaming_waits_for_complete_content_length() {
         assert_eq!(
-            try_extract_http_body(complete, false).as_deref(),
+            stream_response(&b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n12345"[..]).as_deref(),
             Some("12345")
         );
     }
 
     #[test]
-    fn http_body_parser_accepts_eof_without_content_length() {
-        let response = b"HTTP/1.0 200 OK\r\nServer: docker\r\n\r\n[]";
-        assert_eq!(try_extract_http_body(response, true).as_deref(), Some("[]"));
+    fn streaming_reads_body_to_eof_without_content_length() {
+        assert_eq!(
+            stream_response(&b"HTTP/1.0 200 OK\r\nServer: docker\r\n\r\n[1,2]"[..]).as_deref(),
+            Some("[1,2]"),
+            "without a length the body runs to EOF"
+        );
     }
 
     #[test]
-    fn http_body_parser_decodes_chunked_payloads() {
+    fn streaming_decodes_chunked_payloads() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n\r\n";
-        assert_eq!(
-            try_extract_http_body(response, false).as_deref(),
-            Some("[]")
-        );
-    }
-
-    #[test]
-    fn http_body_parser_waits_for_complete_chunked_payload() {
-        let partial = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
-        assert!(
-            try_extract_http_body(partial, false).is_none(),
-            "missing trailing CRLF without EOF should remain incomplete"
-        );
-    }
-
-    #[test]
-    fn chunked_body_accepted_at_eof_without_trailing_crlf() {
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
-        assert_eq!(
-            try_extract_http_body(response, true).as_deref(),
-            Some("[]"),
-            "at EOF the body should be accepted since all chunks are complete"
-        );
+        assert_eq!(stream_response(&response[..]).as_deref(), Some("[]"));
     }
 
     #[test]
     fn streaming_chunked_body_accepted_at_eof_without_trailing_crlf() {
-        struct MockDaemonStream {
-            reader: std::io::Cursor<Vec<u8>>,
-        }
-
-        impl std::io::Read for MockDaemonStream {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.reader.read(buf)
-            }
-        }
-
-        impl std::io::Write for MockDaemonStream {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let response_data =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
-        let mut stream = MockDaemonStream {
-            reader: std::io::Cursor::new(response_data.to_vec()),
-        };
-        let body = send_http_request(&mut stream).ok();
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n";
         assert_eq!(
-            body.as_deref(),
+            stream_response(&response[..]).as_deref(),
             Some("[]"),
             "streaming path should accept chunked body when server closes after terminal chunk"
         );
     }
 
     #[test]
-    fn http_body_parser_rejects_unsupported_transfer_encoding() {
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
-        assert!(try_extract_http_body(response, false).is_none());
+    fn streaming_rejects_unsupported_transfer_encoding() {
+        let result = send_http_request(&mut MockStream {
+            reader: &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"[..],
+        });
+        assert!(
+            matches!(result, Err(ResponseError::Malformed(UNSUPPORTED_ENCODING))),
+            "got {result:?}"
+        );
+    }
+
+    /// Parse the header block at the start of `response`.
+    fn headers_of(response: &[u8]) -> Result<ParsedHeaders, ResponseError> {
+        read_response_headers(&mut BufReader::new(response))
     }
 
     #[test]
-    fn parse_response_headers_returns_none_for_incomplete_headers() {
-        let partial = b"HTTP/1.0 200 OK\r\nContent-Len";
+    fn headers_report_incomplete_block_at_eof() {
         assert!(
-            parse_response_headers(partial).is_none(),
-            "incomplete headers should return None"
+            matches!(
+                headers_of(b"HTTP/1.0 200 OK\r\nContent-Len"),
+                Err(ResponseError::Malformed(INCOMPLETE_RESPONSE))
+            ),
+            "headers cut off by EOF are incomplete"
         );
     }
 
     #[test]
-    fn parse_response_headers_extracts_content_length_and_offset() {
-        let response = b"HTTP/1.0 200 OK\r\nContent-Length: 42\r\n\r\nbody";
-        let hdr = parse_response_headers(response).expect("headers should parse");
+    fn headers_extract_content_length() {
+        let hdr = headers_of(b"HTTP/1.0 200 OK\r\nContent-Length: 42\r\n\r\nbody")
+            .expect("headers should parse");
         assert!(hdr.status_ok, "status should be ok");
         assert_eq!(hdr.content_length, Some(42));
         assert_eq!(hdr.transfer_encoding, TransferEncoding::Identity);
-        assert_eq!(hdr.body_offset, 39, "body should start after CRLFCRLF");
     }
 
     #[test]
-    fn parse_response_headers_detects_chunked_transfer_encoding() {
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let hdr = parse_response_headers(response).expect("headers should parse");
+    fn headers_detect_chunked_transfer_encoding() {
+        let hdr = headers_of(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .expect("headers should parse");
         assert_eq!(hdr.transfer_encoding, TransferEncoding::Chunked);
     }
 
     #[test]
-    fn parse_response_headers_detects_non_2xx_status() {
-        let response = b"HTTP/1.0 404 Not Found\r\n\r\n";
-        let hdr = parse_response_headers(response).expect("headers should parse");
+    fn headers_detect_non_2xx_status() {
+        let hdr = headers_of(b"HTTP/1.0 404 Not Found\r\n\r\n").expect("headers should parse");
         assert!(!hdr.status_ok, "404 should not be marked as ok");
+        assert_eq!(hdr.status_code, 404);
     }
 
     #[test]
-    fn extract_body_at_eof_returns_body_without_content_length() {
-        let response = b"HTTP/1.0 200 OK\r\nServer: docker\r\n\r\n[1,2]";
-        let hdr = parse_response_headers(response).unwrap();
-        let body = extract_body_at_eof(response, Some(&hdr)).ok();
-        assert_eq!(body.as_deref(), Some("[1,2]"));
+    fn headers_reject_complete_block_above_cap() {
+        let mut response = b"HTTP/1.0 200 OK\r\nX-Pad: ".to_vec();
+        response.resize(MAX_HEADER_SIZE, b'a');
+        response.extend_from_slice(b"\r\n\r\n[]");
+        assert!(
+            matches!(
+                headers_of(&response),
+                Err(ResponseError::Malformed(MALFORMED_HEADERS))
+            ),
+            "a header block larger than the cap must fail"
+        );
     }
 
     /// Daemon stand-in that discards writes and serves reads from `R`.
@@ -945,89 +673,6 @@ mod tests {
             stream_response(head.chain(std::io::repeat(b'a'))).as_deref(),
             Some("[]"),
             "trailer consumption is bounded and the complete body is kept"
-        );
-    }
-
-    #[test]
-    fn buffered_rejects_content_length_above_cap() {
-        let response = b"HTTP/1.0 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n[]";
-        let hdr = parse_response_headers(response).expect("headers should parse");
-        assert!(extract_http_body_from_buffer(response, &hdr, false).is_err());
-        assert!(extract_body_at_eof(response, Some(&hdr)).is_err());
-    }
-
-    #[test]
-    fn buffered_rejects_overflowing_chunk_size() {
-        let response =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\nffffffffffffffff\r\n";
-        let hdr = parse_response_headers(response).expect("headers should parse");
-        assert!(extract_http_body_from_buffer(response, &hdr, false).is_err());
-    }
-
-    #[test]
-    fn buffered_rejects_oversize_chunked_body() {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n{:x}\r\n",
-            MAX_RESPONSE_BODY - 1
-        );
-        let hdr = parse_response_headers(response.as_bytes()).expect("headers should parse");
-        assert!(extract_http_body_from_buffer(response.as_bytes(), &hdr, false).is_err());
-    }
-
-    #[test]
-    fn buffered_rejects_endless_chunk_size_line() {
-        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
-        response.resize(response.len() + MAX_CHUNK_LINE + 1, b'0');
-        let hdr = parse_response_headers(&response).expect("headers should parse");
-        assert!(extract_http_body_from_buffer(&response, &hdr, false).is_err());
-    }
-
-    #[test]
-    fn extract_body_at_eof_falls_back_when_no_headers_parsed() {
-        let response = b"HTTP/1.0 200 OK\r\n\r\nhello";
-        let body = extract_body_at_eof(response, None).ok();
-        assert_eq!(body.as_deref(), Some("hello"));
-    }
-
-    // ── buffered header cap ──────────────────────────────────────────
-
-    #[test]
-    fn header_state_waits_for_short_partial_headers() {
-        assert!(matches!(
-            response_header_state(b"HTTP/1.0 200 OK\r\nServer: dock"),
-            HeaderState::Pending
-        ));
-    }
-
-    #[test]
-    fn header_state_rejects_partial_headers_above_cap() {
-        let mut response = b"HTTP/1.0 200 OK\r\nX-Pad: ".to_vec();
-        response.resize(MAX_HEADER_SIZE + 1, b'a');
-        assert!(
-            matches!(response_header_state(&response), HeaderState::Invalid),
-            "an unterminated header block above the cap must fail, not wait"
-        );
-    }
-
-    #[test]
-    fn header_state_rejects_complete_headers_above_cap() {
-        let mut response = b"HTTP/1.0 200 OK\r\nX-Pad: ".to_vec();
-        response.resize(MAX_HEADER_SIZE, b'a');
-        response.extend_from_slice(b"\r\n\r\n[]");
-        assert!(
-            matches!(response_header_state(&response), HeaderState::Invalid),
-            "a header block larger than the cap must fail"
-        );
-    }
-
-    #[test]
-    fn header_state_treats_parse_errors_as_invalid() {
-        assert!(
-            matches!(
-                response_header_state(b"NOT-HTTP garbage\r\n\r\n"),
-                HeaderState::Invalid
-            ),
-            "a malformed status line can never complete"
         );
     }
 

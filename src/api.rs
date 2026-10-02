@@ -162,20 +162,19 @@ struct ComposeLabels<'a> {
 impl ComposeLabels<'_> {
     /// The Compose project, preferring the Docker label over the Podman one.
     fn project(&self) -> Option<String> {
-        non_empty_label(self.project.as_deref())
-            .or_else(|| non_empty_label(self.podman_project.as_deref()))
+        trimmed_non_empty(self.project.as_deref())
+            .or_else(|| trimmed_non_empty(self.podman_project.as_deref()))
+            .map(ToOwned::to_owned)
     }
 
     fn service(&self) -> Option<String> {
-        non_empty_label(self.service.as_deref())
+        trimmed_non_empty(self.service.as_deref()).map(ToOwned::to_owned)
     }
 }
 
-fn non_empty_label(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+/// `value` without surrounding whitespace, or `None` when nothing is left.
+fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 impl<'de: 'a, 'a> Deserialize<'de> for ComposeLabels<'a> {
@@ -302,17 +301,16 @@ impl<'de> Visitor<'de> for LabelValueVisitor {
 /// syntactically valid JSON array yields an empty map.
 #[must_use]
 pub fn parse_containers_json(json_body: &str) -> ContainerPortMap {
-    let mut map = ContainerPortMap::new();
-
-    // Fast path: the whole array deserializes in one zero-copy pass.
-    if let Ok(containers) = serde_json::from_str::<Vec<DockerContainer<'_>>>(json_body) {
-        populate_port_map(&mut map, &containers);
+    // Fast path: the strict parser takes the whole array in one zero-copy
+    // pass.
+    if let Ok(map) = parse_containers_json_strict(json_body) {
         return map;
     }
 
     // Slow path, only taken for malformed input: decode the array into
     // untyped values, then convert each element independently so one bad
     // container cannot poison the rest.
+    let mut map = ContainerPortMap::new();
     let Ok(elements) = serde_json::from_str::<Vec<serde_json::Value>>(json_body) else {
         return map;
     };
@@ -451,33 +449,19 @@ const fn parse_port_protocol(proto: Option<&str>) -> Option<Protocol> {
     }
 }
 
+/// The first non-empty container name without its leading `/`, else the
+/// image, else the short ID, else `"container"`.
 fn container_display_name(container: &DockerContainer<'_>) -> String {
     container
         .names
-        .as_ref()
-        .and_then(|names| names.iter().find_map(|name| normalize_container_name(name)))
-        .or_else(|| {
-            container
-                .image
-                .as_deref()
-                .map(str::trim)
-                .filter(|image| !image.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            container
-                .id
-                .as_deref()
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(|id| short_container_id(id).to_owned())
-        })
-        .unwrap_or_else(|| "container".to_string())
-}
-
-fn normalize_container_name(name: &str) -> Option<String> {
-    let normalized = name.trim().trim_start_matches('/');
-    (!normalized.is_empty()).then(|| normalized.to_string())
+        .iter()
+        .flatten()
+        .map(|name| name.trim().trim_start_matches('/'))
+        .find(|name| !name.is_empty())
+        .or_else(|| trimmed_non_empty(container.image.as_deref()))
+        .or_else(|| trimmed_non_empty(container.id.as_deref()).map(short_container_id))
+        .unwrap_or("container")
+        .to_owned()
 }
 
 /// The 12-character short form of a full container ID, borrowed from `id`.

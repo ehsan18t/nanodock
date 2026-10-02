@@ -53,7 +53,7 @@ Do not create modules or add `[dependencies]` without explicit human approval. T
 
 ## Testing
 
-- Run `cargo test --lib --tests` and `cargo test --doc`. Never run a bare `cargo test`: it also starts the Gungraun benchmarks, which panic without Valgrind.
+- Run `cargo test --lib --tests --all-features` and `cargo test --doc --all-features`. Never run a bare `cargo test`: it also starts the Gungraun benchmarks, which panic without Valgrind.
 - Unit tests live in `#[cfg(test)] mod tests` in each module. Use `assert_eq!` with a message that says what is being checked.
 - Integration tests under `tests/` use only the public API. Tests that need a live daemon return early unless their opt-in variable is set (`NANODOCK_IT=1` for Docker, `NANODOCK_IT_PODMAN=1` for rootless Podman); CI sets them.
 - Benchmarks count instructions with Gungraun (`cargo bench --bench benchmarks`, Linux only). Do not use or optimize for wall-clock benchmarks.

@@ -165,8 +165,8 @@ docs: update README with rootless Podman section
 
 ```bash
 # A plain `cargo test` would also try to run the Gungraun benchmarks.
-cargo test --lib --tests
-cargo test --doc
+cargo test --lib --tests --all-features
+cargo test --doc --all-features
 
 # Against a local Docker daemon with the CI containers started:
 NANODOCK_IT=1 cargo test --test daemon_it -- --test-threads=1

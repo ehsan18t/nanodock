@@ -24,13 +24,9 @@
 
 ## Quality Checklist
 
-> All gates are enforced by `pre-commit` and `pre-push` hooks.
-> Run `cargo fmt && cargo clippy && cargo test` before pushing.
+> The gates are listed once, in the Quality Gates section of `docs/CONTRIBUTING.md`; the `pre-commit` and `pre-push` hooks run them. Run tests with `cargo test --lib --tests --all-features` and `cargo test --doc --all-features`: a bare `cargo test` also starts the benchmarks, which fail without Valgrind.
 
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --all-targets` passes (deny level)
-- [ ] `cargo test --lib --tests && cargo test --doc` passes
-- [ ] `cargo doc --no-deps` builds without warnings
+- [ ] The quality gates in `docs/CONTRIBUTING.md` pass
 - [ ] Documentation updated (README, docs) if behaviour changed
 - [ ] Commits follow [Conventional Commits](https://www.conventionalcommits.org) format
 

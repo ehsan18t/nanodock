@@ -322,9 +322,9 @@ src/
 # Debug build
 cargo build
 
-# Run tests
-cargo test --lib --tests
-cargo test --doc
+# Run tests (a bare `cargo test` would also start the benchmarks)
+cargo test --lib --tests --all-features
+cargo test --doc --all-features
 
 # Compile benchmarks
 cargo bench --no-run
@@ -336,7 +336,7 @@ cargo bench --bench benchmarks
 cargo fmt --check
 
 # Run clippy (all+pedantic+nursery at deny level)
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Build documentation
 cargo doc --no-deps --open
@@ -347,17 +347,7 @@ cargo deny check
 
 ## Quality Gates
 
-All of the following must pass before merging:
-
-| Gate | Command                                        | Purpose                   |
-| ---- | ---------------------------------------------- | ------------------------- |
-| 1    | `cargo fmt --check`                            | Consistent formatting     |
-| 2    | `cargo clippy`                                 | Zero lint warnings        |
-| 3    | `cargo test --lib --tests && cargo test --doc` | All tests pass            |
-| 4    | `cargo bench --no-run`                         | Benchmarks compile        |
-| 5    | `cargo build`                                  | Library compiles          |
-| 6    | `cargo doc --no-deps`                          | Documentation builds      |
-| 7    | `cargo deny check`                             | No vulnerable/banned deps |
+The gates every change must pass before merging, and which of them the hooks and CI run, are listed once in [CONTRIBUTING.md](docs/CONTRIBUTING.md#quality-gates).
 
 ## Instruction Benchmarks
 

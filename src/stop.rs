@@ -13,7 +13,10 @@ use crate::{ipc, short_container_id};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum StopOutcome {
-    /// Container was successfully stopped (HTTP 204).
+    /// The daemon accepted the request (HTTP 204). After a stop the
+    /// container has exited; after a kill the signal was delivered and the
+    /// container exits moments later, so an immediate listing may still
+    /// show it briefly.
     Stopped,
     /// Container was already stopped (HTTP 304 for stop, 409 for kill).
     AlreadyStopped,

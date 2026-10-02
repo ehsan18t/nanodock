@@ -243,8 +243,11 @@ impl Client {
 
     /// Kill a running container at once through the daemon API.
     ///
-    /// Sends `POST /containers/{id}/kill` (SIGKILL, no grace period). A
-    /// container that is not running is [`StopOutcome::AlreadyStopped`].
+    /// Sends `POST /containers/{id}/kill` (SIGKILL, no grace period). The
+    /// daemon answers once the signal is delivered, before the container has
+    /// finished exiting, so [`StopOutcome::Stopped`] does not mean it is gone
+    /// from a listing taken right away. A container that is not running is
+    /// [`StopOutcome::AlreadyStopped`].
     ///
     /// The `id`, the daemons tried, their order, the `GET /_ping` check
     /// before the request, and every outcome rule are the same as for

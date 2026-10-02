@@ -79,13 +79,30 @@ fn detect_merges_rootless_podman_and_docker() {
     );
 }
 
-/// Map one `rootlessport` pid to its container.
+/// Map each `rootlessport` pid to the name of its container.
 ///
-/// The only place that touches the resolver API, so a signature change is a
-/// one-line edit. The resolver reads the home directory from the environment.
+/// The only place that touches the resolver API. One resolver serves the
+/// whole scan, as the resolver documentation asks, and it reads the home
+/// directory from the environment. After `clear`, a second pass must give the
+/// same answers from fresh storage reads.
 #[cfg(target_os = "linux")]
-fn resolve_rootlessport(pid: u32) -> Option<nanodock::ContainerInfo> {
-    nanodock::RootlessPodmanResolver::new().lookup(pid, "rootlessport")
+fn resolve_rootlessport(pids: &[u32]) -> Vec<(u32, Option<String>)> {
+    let mut resolver = nanodock::RootlessPodmanResolver::new();
+    let scan = |resolver: &mut nanodock::RootlessPodmanResolver| -> Vec<(u32, Option<String>)> {
+        pids.iter()
+            .map(|&pid| {
+                (
+                    pid,
+                    resolver.lookup(pid, "rootlessport").map(|info| info.name),
+                )
+            })
+            .collect()
+    };
+    let first = scan(&mut resolver);
+    resolver.clear();
+    let again = scan(&mut resolver);
+    assert_eq!(first, again, "a cleared resolver gives the same answers");
+    first
 }
 
 /// `NANODOCK_IT_ROOTLESSPORT_PIDS` lists the `rootlessport` pids CI found
@@ -112,10 +129,7 @@ fn rootless_resolver_maps_rootlessport_pid() {
     );
 
     let podman = podman_name();
-    let resolved: Vec<(u32, Option<String>)> = pids
-        .iter()
-        .map(|&pid| (pid, resolve_rootlessport(pid).map(|info| info.name)))
-        .collect();
+    let resolved = resolve_rootlessport(&pids);
     assert!(
         resolved
             .iter()

@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nanodock::{
-    ContainerInfo, ContainerPortMap, Protocol, ProxyFallback, PublishedContainerMatch,
+    ContainerInfo, ContainerPortMap, PortKey, Protocol, ProxyFallback, PublishedContainerMatch,
     is_container_proxy_process, parse_containers_json, parse_containers_json_strict,
     short_container_id,
 };
@@ -376,6 +376,7 @@ proptest! {
     fn short_id_is_a_bounded_prefix(id in any::<String>()) {
         let short = short_container_id(&id);
         prop_assert!(id.starts_with(short), "{:?} is a prefix of {:?}", short, id);
+        prop_assert_eq!(short.as_ptr(), id.as_ptr(), "the short id borrows its argument");
         prop_assert!(short.len() == 12 || short == id, "{:?} from {:?}", short, id);
         if id.len() <= 12 {
             prop_assert_eq!(&short, &id);
@@ -392,8 +393,6 @@ proptest! {
 }
 
 // ── ContainerPortMap against a HashMap model ────────────────────────
-
-type Key = (Option<IpAddr>, u16, Protocol);
 
 /// Host IPs bindings use; `None` is the wildcard.
 const BIND_IPS: [Option<IpAddr>; 4] = [
@@ -418,7 +417,7 @@ fn container(name: u8) -> ContainerInfo {
     ContainerInfo::new(format!("id{name}"), format!("c{name}"), "image")
 }
 
-fn gen_insert() -> impl Strategy<Value = (Key, u8)> {
+fn gen_insert() -> impl Strategy<Value = (PortKey, u8)> {
     (0..BIND_IPS.len(), 1..=4_u16, 0..PROTOS.len(), 0..3_u8)
         .prop_map(|(ip, port, proto, name)| ((BIND_IPS[ip], port, PROTOS[proto]), name))
 }
@@ -426,7 +425,7 @@ fn gen_insert() -> impl Strategy<Value = (Key, u8)> {
 /// The documented lookup: exact address, then wildcard, then (with the
 /// proxy fallback) a unique container on the port and protocol.
 fn model_lookup(
-    model: &HashMap<Key, u8>,
+    model: &HashMap<PortKey, u8>,
     ip: IpAddr,
     port: u16,
     proto: Protocol,
@@ -470,7 +469,7 @@ proptest! {
     #[test]
     fn port_map_matches_a_hashmap_model(inserts in proptest::collection::vec(gen_insert(), 0..24)) {
         let mut map = ContainerPortMap::new();
-        let mut model: HashMap<Key, u8> = HashMap::new();
+        let mut model: HashMap<PortKey, u8> = HashMap::new();
         for &((ip, port, proto), name) in &inserts {
             let replaced = map.insert(ip, port, proto, container(name));
             prop_assert_eq!(
@@ -484,9 +483,9 @@ proptest! {
         for (&(ip, port, proto), &name) in &model {
             prop_assert_eq!(map.get(ip, port, proto), Some(&container(name)));
         }
-        let iterated: BTreeSet<(Key, String)> =
+        let iterated: BTreeSet<(PortKey, String)> =
             map.iter().map(|(key, info)| (key, info.name.clone())).collect();
-        let modeled: BTreeSet<(Key, String)> =
+        let modeled: BTreeSet<(PortKey, String)> =
             model.iter().map(|(&key, &name)| (key, container(name).name)).collect();
         prop_assert_eq!(iterated, modeled);
         prop_assert_eq!(map.iter().len(), model.len());

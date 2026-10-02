@@ -11,10 +11,9 @@
 )]
 
 use std::collections::BTreeSet;
-use std::net::IpAddr;
 use std::time::Duration;
 
-use nanodock::{Client, ContainerInfo, ContainerPortMap, Protocol};
+use nanodock::{Client, ContainerInfo, ContainerPortMap, PortKey};
 
 /// Whether the opt-in variable `var` is set to `1`. Prints why the test is
 /// skipped otherwise, so `--nocapture` output explains an empty run.
@@ -61,10 +60,7 @@ pub fn find_by_name<'a>(map: &'a ContainerPortMap, name: &str) -> Option<&'a Con
 }
 
 /// Every binding the container called `name` publishes, in sorted order.
-pub fn bindings_of(
-    map: &ContainerPortMap,
-    name: &str,
-) -> BTreeSet<(Option<IpAddr>, u16, Protocol)> {
+pub fn bindings_of(map: &ContainerPortMap, name: &str) -> BTreeSet<PortKey> {
     map.iter()
         .filter(|(_, info)| info.name == name)
         .map(|(key, _)| key)

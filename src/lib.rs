@@ -279,7 +279,10 @@ fn most_informative(errors: impl IntoIterator<Item = Error>) -> Error {
 /// container list that is not valid JSON.
 ///
 /// The type is opaque so the JSON parser behind it stays an implementation
-/// detail; its [`Display`](std::fmt::Display) output describes the problem.
+/// detail. Its [`Display`](std::fmt::Display) output says which part of the
+/// reply was wrong; for invalid JSON,
+/// [`source`](std::error::Error::source) returns the parser's error, which
+/// says where the JSON broke.
 #[derive(Debug)]
 pub struct ParseError(ParseErrorKind);
 
@@ -304,13 +307,22 @@ impl ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            ParseErrorKind::Json(error) => write!(f, "invalid container list JSON: {error}"),
+            ParseErrorKind::Json(_) => f.write_str("invalid container list JSON"),
             ParseErrorKind::Http(reason) => write!(f, "malformed HTTP response: {reason}"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for ParseError {
+    /// The JSON parser's error, for a container list that is not valid
+    /// JSON. Its type is not part of the API; use it through `Display`.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.0 {
+            ParseErrorKind::Json(error) => Some(error),
+            ParseErrorKind::Http(_) => None,
+        }
+    }
+}
 
 // ── Protocol ─────────────────────────────────────────────────────────
 
@@ -2630,12 +2642,16 @@ mod tests {
         );
 
         let json_error = api::parse_containers_json_strict("not json").expect_err("invalid JSON");
+        assert_eq!(json_error.to_string(), "invalid container list JSON");
+        let serde_message = json_error
+            .source()
+            .expect("the JSON parser's error is chained")
+            .to_string();
         assert!(
-            json_error
-                .to_string()
-                .starts_with("invalid container list JSON"),
-            "got {json_error}"
+            serde_message.contains("line 1"),
+            "the source says where the JSON broke, got {serde_message}"
         );
+        assert!(ParseError::http("bad framing").source().is_none());
         let error = Error::from(json_error);
         assert!(
             error.source().is_some(),

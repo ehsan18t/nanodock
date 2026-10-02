@@ -96,6 +96,7 @@ mod proxy;
 struct ReadmeDoctests;
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -110,8 +111,8 @@ use serde::{Deserialize, Serialize};
 pub use api::parse_containers_json;
 pub use api::parse_containers_json_strict;
 pub use api::short_container_id;
+pub use podman::RootlessPodmanResolver;
 pub use podman::is_podman_rootlessport_process;
-pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
 pub use proxy::is_container_proxy_process;
 
 // ── Error type ───────────────────────────────────────────────────────
@@ -278,7 +279,10 @@ fn most_informative(errors: impl IntoIterator<Item = Error>) -> Error {
 /// container list that is not valid JSON.
 ///
 /// The type is opaque so the JSON parser behind it stays an implementation
-/// detail; its [`Display`](std::fmt::Display) output describes the problem.
+/// detail. Its [`Display`](std::fmt::Display) output says which part of the
+/// reply was wrong; for invalid JSON,
+/// [`source`](std::error::Error::source) returns the parser's error, which
+/// says where the JSON broke.
 #[derive(Debug)]
 pub struct ParseError(ParseErrorKind);
 
@@ -303,13 +307,22 @@ impl ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            ParseErrorKind::Json(error) => write!(f, "invalid container list JSON: {error}"),
+            ParseErrorKind::Json(_) => f.write_str("invalid container list JSON"),
             ParseErrorKind::Http(reason) => write!(f, "malformed HTTP response: {reason}"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for ParseError {
+    /// The JSON parser's error, for a container list that is not valid
+    /// JSON. Its type is not part of the API; use it through `Display`.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.0 {
+            ParseErrorKind::Json(error) => Some(error),
+            ParseErrorKind::Http(_) => None,
+        }
+    }
+}
 
 // ── Protocol ─────────────────────────────────────────────────────────
 
@@ -418,9 +431,23 @@ impl std::fmt::Display for ContainerInfo {
     }
 }
 
-/// Key of one published binding: host IP (`None` for every interface),
-/// host port, and protocol.
-type PortKey = (Option<IpAddr>, u16, Protocol);
+/// Key of one published binding in a [`ContainerPortMap`]: host IP (`None`
+/// for a wildcard binding on every interface), host port, and protocol.
+///
+/// Iterating a map yields `(PortKey, &ContainerInfo)` pairs, and a map can
+/// be collected from `(PortKey, info)` pairs.
+///
+/// ```
+/// use nanodock::{ContainerInfo, ContainerPortMap, PortKey, Protocol};
+///
+/// let key: PortKey = (None, 80, Protocol::Tcp);
+/// let map: ContainerPortMap = [(key, ContainerInfo::new("abc", "web", "nginx"))]
+///     .into_iter()
+///     .collect();
+/// let keys: Vec<PortKey> = map.iter().map(|(key, _)| key).collect();
+/// assert_eq!(keys, vec![key]);
+/// ```
+pub type PortKey = (Option<IpAddr>, u16, Protocol);
 
 /// Published container ports: maps `(host_ip, host_port, protocol)` to the
 /// container that publishes it.
@@ -562,6 +589,11 @@ impl ContainerPortMap {
         }
     }
 
+    /// Make room for at least `additional` more bindings.
+    fn reserve(&mut self, additional: usize) {
+        self.bindings.reserve(additional);
+    }
+
     /// Add every binding of `other`, replacing bindings with the same key.
     fn merge(&mut self, other: Self) {
         self.bindings.extend(other.bindings);
@@ -569,7 +601,7 @@ impl ContainerPortMap {
 }
 
 impl<'a> IntoIterator for &'a ContainerPortMap {
-    type Item = ((Option<IpAddr>, u16, Protocol), &'a ContainerInfo);
+    type Item = (PortKey, &'a ContainerInfo);
     type IntoIter = PortMapIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -577,20 +609,16 @@ impl<'a> IntoIterator for &'a ContainerPortMap {
     }
 }
 
-impl<I: Into<Arc<ContainerInfo>>> FromIterator<((Option<IpAddr>, u16, Protocol), I)>
-    for ContainerPortMap
-{
-    fn from_iter<T: IntoIterator<Item = ((Option<IpAddr>, u16, Protocol), I)>>(iter: T) -> Self {
+impl<I: Into<Arc<ContainerInfo>>> FromIterator<(PortKey, I)> for ContainerPortMap {
+    fn from_iter<T: IntoIterator<Item = (PortKey, I)>>(iter: T) -> Self {
         let mut map = Self::new();
         map.extend(iter);
         map
     }
 }
 
-impl<I: Into<Arc<ContainerInfo>>> Extend<((Option<IpAddr>, u16, Protocol), I)>
-    for ContainerPortMap
-{
-    fn extend<T: IntoIterator<Item = ((Option<IpAddr>, u16, Protocol), I)>>(&mut self, iter: T) {
+impl<I: Into<Arc<ContainerInfo>>> Extend<(PortKey, I)> for ContainerPortMap {
+    fn extend<T: IntoIterator<Item = (PortKey, I)>>(&mut self, iter: T) {
         self.bindings
             .extend(iter.into_iter().map(|(key, info)| (key, info.into())));
     }
@@ -606,7 +634,7 @@ pub struct PortMapIter<'a> {
 }
 
 impl<'a> Iterator for PortMapIter<'a> {
-    type Item = ((Option<IpAddr>, u16, Protocol), &'a ContainerInfo);
+    type Item = (PortKey, &'a ContainerInfo);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(key, info)| (*key, info.as_ref()))
@@ -639,24 +667,6 @@ pub enum ProxyFallback {
     /// Match on the address-level bindings only.
     #[default]
     Deny,
-}
-
-#[cfg(test)]
-fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
-    ContainerInfo::new(id, name, image)
-}
-
-#[cfg(test)]
-fn insert_test_container(
-    map: &mut ContainerPortMap,
-    host_ip: Option<IpAddr>,
-    port: u16,
-    proto: Protocol,
-    id: &str,
-    name: &str,
-    image: &str,
-) {
-    map.insert(host_ip, port, proto, test_container_info(id, name, image));
 }
 
 /// Result of matching a socket against published container port bindings.
@@ -854,12 +864,12 @@ impl Client {
     ///
     /// Fails only when no endpoint produced a container list, with the
     /// most informative endpoint failure (see [`Error`]), or with
-    /// [`Error::InvalidResponse`] when the merged list is not valid JSON.
+    /// [`Error::InvalidResponse`] when a daemon whose answer is used sent
+    /// something other than a JSON array of containers.
     pub fn detect(&self) -> Result<ContainerPortMap, Error> {
         debug!("starting synchronous container runtime detection");
         let bodies = self.query_daemon_bodies(Instant::now())?;
-        let body = merge_prioritized_bodies(&bodies).ok_or(Error::DaemonNotFound)?;
-        let map = api::parse_containers_json_strict(&body)?;
+        let map = merge_bodies(&bodies, api::parse_containers_json_strict)?;
         debug!(
             "finished synchronous container runtime detection: port_mappings={}",
             map.len()
@@ -915,9 +925,12 @@ impl Client {
     /// still running 10 seconds later. Use [`Client::kill`] to kill it at
     /// once.
     ///
-    /// The `id` can be a container ID (hex) or a container name. Characters
-    /// that would corrupt the HTTP request path (`/`, `?`, `#`, `%`, control
-    /// characters, spaces) are rejected early with [`StopOutcome::NotFound`].
+    /// The `id` can be a container ID (hex), a unique ID prefix, or a
+    /// container name. An `id` that cannot name a container is rejected with
+    /// [`StopOutcome::NotFound`] before any daemon is contacted: it must
+    /// start with an ASCII letter or digit, continue with ASCII letters,
+    /// digits, `_`, `.`, or `-`, and be at most 256 bytes long (the name
+    /// pattern Docker and Podman enforce).
     ///
     /// Tries the same daemons as detection, in priority order
     /// (`DOCKER_HOST` first, then the platform defaults; a `unix://`
@@ -964,7 +977,7 @@ impl Client {
     /// Validate `id` and send a stop or kill request for it.
     fn send_stop(&self, id: &str, kind: StopKind) -> StopOutcome {
         if !is_safe_container_id(id) {
-            debug!("rejected container id with unsafe characters");
+            debug!("rejected a container id that cannot name a container");
             return StopOutcome::NotFound;
         }
 
@@ -1090,8 +1103,8 @@ pub enum StopOutcome {
     Stopped,
     /// Container was already stopped (HTTP 304 for stop, 409 for kill).
     AlreadyStopped,
-    /// Container was not found (HTTP 404), or the id contains characters
-    /// that cannot name a container.
+    /// Container was not found (HTTP 404), or the id cannot name a
+    /// container.
     NotFound,
     /// No daemon could be contacted, so no daemon received the request and
     /// the container was not touched.
@@ -1155,17 +1168,24 @@ fn stop_endpoint(id: &str, kind: StopKind) -> String {
     endpoint
 }
 
-/// Reject container IDs that would corrupt the HTTP request line.
+/// Longest container id or name a stop or kill request accepts. A full ID
+/// is 64 hex digits; the cap only keeps a hostile id out of the request.
+const MAX_CONTAINER_ID_LEN: usize = 256;
+
+/// Whether `id` can name a container: Docker's and Podman's name pattern
+/// `[A-Za-z0-9][A-Za-z0-9_.-]*`, which hex IDs and ID prefixes also match,
+/// at most [`MAX_CONTAINER_ID_LEN`] bytes long.
 ///
-/// Docker accepts both hex IDs and container names (alphanumeric, hyphens,
-/// underscores, dots). This function rejects only characters that could
-/// cause path traversal or HTTP header injection: `/`, `?`, `#`, `%`,
-/// spaces, and every control character.
+/// An allow-list keeps everything that could change the request out of the
+/// path: `/`, `?`, `#`, `%`, spaces, control characters, `.` and `..`, and
+/// every non-ASCII character (line separators, zero-width characters).
 fn is_safe_container_id(id: &str) -> bool {
-    !id.is_empty()
-        && !id
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '?' | '#' | '%' | ' '))
+    let bytes = id.as_bytes();
+    bytes.len() <= MAX_CONTAINER_ID_LEN
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 /// Map the combined result of a stop request to `StopOutcome`.
@@ -1406,8 +1426,7 @@ impl Client {
 
     /// One lenient detection pass whose budget runs from `started`.
     fn query_daemon(&self, started: Instant) -> Result<ContainerPortMap, Error> {
-        merge_prioritized_responses(&self.query_daemon_bodies(started)?)
-            .ok_or(Error::DaemonNotFound)
+        Ok(merge_bodies_lenient(&self.query_daemon_bodies(started)?))
     }
 }
 
@@ -1528,75 +1547,34 @@ fn select_daemon_bodies(mut responses: Vec<(usize, bool, String)>) -> Vec<String
     chosen.into_iter().map(|(_, _, body)| body).collect()
 }
 
-/// Merge bodies (highest priority first) into one JSON array for strict
-/// parsing.
+/// Parse every daemon's body with `parse` and merge the port maps.
 ///
-/// The bodies are concatenated lowest priority first: when two daemons
-/// publish the same key, the later entry wins the map insert, so the
-/// higher-priority daemon is kept.
-fn merge_prioritized_bodies(bodies: &[String]) -> Option<String> {
-    merge_daemon_response_bodies(bodies.iter().rev())
-}
-
-/// Merge bodies (highest priority first) into one port map.
-///
-/// Bodies are merged lowest priority first so that, when two daemons
-/// publish the same key, the higher-priority daemon overwrites the other.
-fn merge_prioritized_responses(bodies: &[String]) -> Option<ContainerPortMap> {
-    merge_daemon_responses(bodies.iter().rev())
-}
-
-fn merge_daemon_response_bodies<T, I>(responses: I) -> Option<String>
-where
-    T: AsRef<str>,
-    I: IntoIterator<Item = T>,
-{
-    let mut saw_response = false;
-    let mut has_content = false;
-    let mut combined = String::from("[");
-
-    for response in responses {
-        saw_response = true;
-        let body = response.as_ref().trim();
-        // Each daemon returns a JSON array; unwrap the outer brackets and
-        // concatenate elements so the caller sees a single flat array.
-        let inner = body
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(body)
-            .trim();
-        if inner.is_empty() {
-            continue;
-        }
-        if has_content {
-            combined.push(',');
-        }
-        has_content = true;
-        combined.push_str(inner);
-    }
-
-    if !saw_response {
-        return None;
-    }
-
-    combined.push(']');
-    Some(combined)
-}
-
-fn merge_daemon_responses<T, I>(responses: I) -> Option<ContainerPortMap>
-where
-    T: AsRef<str>,
-    I: IntoIterator<Item = T>,
-{
-    let mut saw_response = false;
+/// `bodies` are highest priority first. They are merged lowest priority
+/// first, so when two daemons publish the same binding the higher-priority
+/// daemon overwrites the other. The first parse error ends the merge.
+fn merge_bodies<E>(
+    bodies: &[String],
+    mut parse: impl FnMut(&str) -> Result<ContainerPortMap, E>,
+) -> Result<ContainerPortMap, E> {
     let mut merged = ContainerPortMap::new();
-
-    for response in responses {
-        saw_response = true;
-        merged.merge(api::parse_containers_json(response.as_ref()));
+    for body in bodies.iter().rev() {
+        let map = parse(body)?;
+        if merged.is_empty() {
+            merged = map;
+        } else {
+            merged.merge(map);
+        }
     }
+    Ok(merged)
+}
 
-    saw_response.then_some(merged)
+/// Merge bodies like [`merge_bodies`], parsing each one leniently: a body
+/// that is not a container list contributes no bindings.
+fn merge_bodies_lenient(bodies: &[String]) -> ContainerPortMap {
+    let Ok(map) = merge_bodies(bodies, |body| {
+        Ok::<_, Infallible>(api::parse_containers_json(body))
+    });
+    map
 }
 
 #[cfg(test)]
@@ -1604,23 +1582,16 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    #[test]
-    fn merge_daemon_responses_combines_multiple_runtime_payloads() {
-        let merged = merge_daemon_responses([
-            "[]",
-            r#"[{
-                "Names": ["/backend-postgres-1"],
-                "Image": "postgres:16",
-                "Ports": [{"PublicPort": 5432, "Type": "tcp"}]
-            }]"#,
-        ])
-        .expect("at least one daemon response should produce a map");
-
-        let container = merged
-            .get(None, 5432, Protocol::Tcp)
-            .expect("podman/docker ports should survive multi-daemon merging");
-        assert_eq!(container.name, "backend-postgres-1");
-        assert_eq!(container.image, "postgres:16");
+    fn insert_test_container(
+        map: &mut ContainerPortMap,
+        host_ip: Option<IpAddr>,
+        port: u16,
+        proto: Protocol,
+        id: &str,
+        name: &str,
+        image: &str,
+    ) {
+        map.insert(host_ip, port, proto, ContainerInfo::new(id, name, image));
     }
 
     #[test]
@@ -1748,11 +1719,11 @@ mod tests {
         let map: ContainerPortMap = [
             (
                 (None, 80, Protocol::Tcp),
-                test_container_info("a", "web", "nginx"),
+                ContainerInfo::new("a", "web", "nginx"),
             ),
             (
                 (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 53, Protocol::Udp),
-                test_container_info("b", "dns", "bind9"),
+                ContainerInfo::new("b", "dns", "bind9"),
             ),
         ]
         .into_iter()
@@ -1774,7 +1745,7 @@ mod tests {
     #[test]
     fn lookup_shares_the_stored_arc() {
         let mut map = ContainerPortMap::new();
-        let shared = Arc::new(test_container_info("a", "web", "nginx"));
+        let shared = Arc::new(ContainerInfo::new("a", "web", "nginx"));
         map.insert(None, 80, Protocol::Tcp, Arc::clone(&shared));
         // Bound on another address, so the lookup below needs the fallback.
         map.insert(
@@ -1819,7 +1790,7 @@ mod tests {
                 None,
                 80,
                 Protocol::Tcp,
-                test_container_info("a", "old", "img")
+                ContainerInfo::new("a", "old", "img")
             )
             .is_none()
         );
@@ -1827,7 +1798,7 @@ mod tests {
             None,
             80,
             Protocol::Tcp,
-            test_container_info("b", "new", "img"),
+            ContainerInfo::new("b", "new", "img"),
         );
         assert_eq!(
             previous.map(|info| info.name.clone()).as_deref(),
@@ -1895,62 +1866,45 @@ mod tests {
     // ── interpret_stop_status ────────────────────────────────────────
 
     #[test]
-    fn interpret_stop_status_204_means_stopped() {
-        assert_eq!(
-            interpret_stop_status(204, StopKind::Graceful),
-            StopOutcome::Stopped,
-            "204 should mean stopped for graceful stop"
-        );
-        assert_eq!(
-            interpret_stop_status(204, StopKind::Kill),
-            StopOutcome::Stopped,
-            "204 should mean stopped for kill"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_304_means_already_stopped() {
-        assert_eq!(
-            interpret_stop_status(304, StopKind::Graceful),
-            StopOutcome::AlreadyStopped,
-            "304 from stop endpoint means already stopped"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_409_on_kill_means_already_stopped() {
-        assert_eq!(
-            interpret_stop_status(409, StopKind::Kill),
-            StopOutcome::AlreadyStopped,
-            "409 from kill endpoint means container not running"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_409_on_graceful_is_rejected() {
-        assert_eq!(
-            interpret_stop_status(409, StopKind::Graceful),
-            StopOutcome::Rejected { status: 409 },
-            "409 on a graceful stop is unexpected and should be reported with its status"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_404_means_not_found() {
-        assert_eq!(
-            interpret_stop_status(404, StopKind::Graceful),
-            StopOutcome::NotFound,
-            "404 means container not found"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_500_is_rejected() {
-        assert_eq!(
-            interpret_stop_status(500, StopKind::Graceful),
-            StopOutcome::Rejected { status: 500 },
-            "a server error is reported with its status"
-        );
+    fn interpret_stop_status_maps_each_status() {
+        use StopKind::{Graceful, Kill};
+        let cases = [
+            (204, Graceful, StopOutcome::Stopped, "204 means stopped"),
+            (204, Kill, StopOutcome::Stopped, "204 means killed"),
+            (
+                304,
+                Graceful,
+                StopOutcome::AlreadyStopped,
+                "304 from stop means already stopped",
+            ),
+            (
+                409,
+                Kill,
+                StopOutcome::AlreadyStopped,
+                "409 from kill means not running",
+            ),
+            (
+                409,
+                Graceful,
+                StopOutcome::Rejected { status: 409 },
+                "409 on a graceful stop is unexpected",
+            ),
+            (404, Graceful, StopOutcome::NotFound, "404 means not found"),
+            (404, Kill, StopOutcome::NotFound, "404 means not found"),
+            (
+                500,
+                Graceful,
+                StopOutcome::Rejected { status: 500 },
+                "a server error is reported with its status",
+            ),
+        ];
+        for (status, kind, expected, why) in cases {
+            assert_eq!(
+                interpret_stop_status(status, kind),
+                expected,
+                "{status} on {kind:?}: {why}"
+            );
+        }
     }
 
     #[test]
@@ -1965,129 +1919,114 @@ mod tests {
         );
     }
 
-    // ── merge_daemon_response_bodies ─────────────────────────────────
+    // ── merge_bodies ─────────────────────────────────────────────────
 
-    #[test]
-    fn merge_bodies_empty_iterator_returns_none() {
-        let result = merge_daemon_response_bodies::<&str, Vec<&str>>(vec![]);
-        assert!(result.is_none(), "no responses means None");
+    fn bodies(bodies: &[&str]) -> Vec<String> {
+        bodies.iter().map(ToString::to_string).collect()
     }
 
     #[test]
-    fn merge_bodies_single_empty_array() {
-        let result = merge_daemon_response_bodies(["[]"]);
+    fn merge_bodies_combines_every_daemon() {
+        let bodies = bodies(&[
+            "[]",
+            r#"[{"Names": ["/db"], "Image": "postgres:16", "Ports": [{"PublicPort": 5432}]}]"#,
+            r#"[{"Names": ["/web"], "Ports": [{"PublicPort": 80}]}, {"Names": ["/idle"]}]"#,
+        ]);
+        let lenient = merge_bodies_lenient(&bodies);
+        assert_eq!(lenient.len(), 2, "every daemon's bindings are kept");
         assert_eq!(
-            result.as_deref(),
-            Some("[]"),
-            "single empty array should produce []"
+            lenient
+                .get(None, 5432, Protocol::Tcp)
+                .map(|info| info.image.as_str()),
+            Some("postgres:16"),
+            "a lower-priority daemon's containers survive the merge"
+        );
+
+        let strict = merge_bodies(&bodies, api::parse_containers_json_strict).expect("valid lists");
+        assert_eq!(strict, lenient, "both modes merge valid lists the same way");
+        assert!(
+            merge_bodies(&[], api::parse_containers_json_strict)
+                .expect("nothing to parse")
+                .is_empty()
         );
     }
 
     #[test]
-    fn merge_bodies_concatenates_non_empty_arrays() {
-        let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, r#"[{"b":2},{"c":3}]"#]);
-        assert_eq!(
-            result.as_deref(),
-            Some(r#"[{"a":1},{"b":2},{"c":3}]"#),
-            "elements from both arrays should be combined"
+    fn merge_bodies_rejects_a_reply_that_is_not_a_list_only_when_strict() {
+        let bodies = bodies(&[
+            r#"{"message": "page not found"}"#,
+            r#"[{"Names": ["/web"], "Ports": [{"PublicPort": 80}]}]"#,
+        ]);
+        let error = merge_bodies(&bodies, api::parse_containers_json_strict)
+            .map_err(Error::from)
+            .expect_err("an error object is not a container list");
+        assert!(
+            matches!(error, Error::InvalidResponse { .. }),
+            "got {error:?}"
         );
-    }
 
-    #[test]
-    fn merge_bodies_skips_empty_arrays_without_spurious_commas() {
-        let result = merge_daemon_response_bodies(["[]", r#"[{"a":1}]"#]);
-        assert_eq!(
-            result.as_deref(),
-            Some(r#"[{"a":1}]"#),
-            "empty arrays should not introduce leading commas"
-        );
-    }
-
-    #[test]
-    fn merge_bodies_trailing_empty_array_does_not_add_comma() {
-        let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, "[]"]);
-        assert_eq!(
-            result.as_deref(),
-            Some(r#"[{"a":1}]"#),
-            "trailing empty array should not add trailing comma"
-        );
-    }
-
-    #[test]
-    fn merge_bodies_all_empty_arrays_produces_empty_array() {
-        let result = merge_daemon_response_bodies(["[]", "[]"]);
-        assert_eq!(result.as_deref(), Some("[]"), "all-empty should produce []");
+        let lenient = merge_bodies_lenient(&bodies);
+        assert_eq!(lenient.len(), 1, "the error object contributes nothing");
+        assert!(lenient.get(None, 80, Protocol::Tcp).is_some());
     }
 
     // ── is_safe_container_id ─────────────────────────────────────────
 
     #[test]
-    fn safe_id_accepts_hex_id() {
-        assert!(
-            is_safe_container_id("abc123def456"),
-            "hex ID should be valid"
-        );
-    }
+    fn safe_id_accepts_only_container_names_and_ids() {
+        let longest = "a".repeat(MAX_CONTAINER_ID_LEN);
+        let accepted = [
+            ("abc123def456", "short hex ID"),
+            (
+                "e603f8ebd438b8405b9b835b9d38cb913ea2479f5b29f8e4308b88e9a92e8c4b",
+                "full hex ID",
+            ),
+            ("a", "one-character ID prefix"),
+            (
+                "my-container_1.0",
+                "name with hyphens, underscores, and dots",
+            ),
+            ("9to5", "name starting with a digit"),
+            (longest.as_str(), "name at the length cap"),
+        ];
+        for (id, why) in accepted {
+            assert!(is_safe_container_id(id), "{why} should be accepted: {id:?}");
+        }
 
-    #[test]
-    fn safe_id_accepts_container_name() {
-        assert!(
-            is_safe_container_id("my-container_1.0"),
-            "name with hyphens, underscores, dots should be valid"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_empty() {
-        assert!(!is_safe_container_id(""), "empty ID should be rejected");
-    }
-
-    #[test]
-    fn safe_id_rejects_path_traversal() {
-        assert!(
-            !is_safe_container_id("../../../etc/passwd"),
-            "path traversal should be rejected"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_query_injection() {
-        assert!(
-            !is_safe_container_id("abc?signal=SIGKILL"),
-            "query injection should be rejected"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_crlf_injection() {
-        assert!(
-            !is_safe_container_id("abc\r\nX-Injected: true"),
-            "CRLF injection should be rejected"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_every_control_character() {
-        for id in [
-            "abc\tdef",
-            "abc\0",
-            "abc\u{7f}",
-            "abc\u{85}",
-            "abc\u{1b}[0m",
-        ] {
+        let too_long = "a".repeat(MAX_CONTAINER_ID_LEN + 1);
+        let huge = "a".repeat(100 * 1024);
+        let rejected = [
+            ("", "empty ID"),
+            (".", "current directory"),
+            ("..", "parent directory"),
+            ("../../../etc/passwd", "path traversal"),
+            ("-abc", "leading hyphen"),
+            ("_abc", "leading underscore"),
+            (".abc", "leading dot"),
+            ("abc?signal=SIGKILL", "query injection"),
+            ("abc#frag", "fragment"),
+            ("abc%2F..", "percent encoding"),
+            ("abc def", "space"),
+            ("abc\r\nX-Injected: true", "CRLF injection"),
+            ("abc\tdef", "tab"),
+            ("abc\0", "NUL"),
+            ("abc\u{7f}", "DEL"),
+            ("abc\u{85}", "C1 control character"),
+            ("abc\u{1b}[0m", "escape sequence"),
+            ("abc\u{2028}", "line separator"),
+            ("abc\u{200b}def", "zero-width space"),
+            ("\u{feff}abc", "byte order mark"),
+            ("caf\u{e9}-container", "non-ASCII name"),
+            (too_long.as_str(), "one byte past the length cap"),
+            (huge.as_str(), "100 KiB ID"),
+        ];
+        for (id, why) in rejected {
             assert!(
                 !is_safe_container_id(id),
-                "control character in {id:?} should be rejected"
+                "{why} should be rejected: {:?}",
+                id.get(..40).unwrap_or(id)
             );
         }
-    }
-
-    #[test]
-    fn safe_id_accepts_non_ascii_name() {
-        assert!(
-            is_safe_container_id("caf\u{e9}-container"),
-            "non-ASCII printable characters do not corrupt the request line"
-        );
     }
 
     // ── stop_endpoint ────────────────────────────────────────────────
@@ -2128,9 +2067,9 @@ mod tests {
         drop(log::set_logger(&ENABLED_LOGGER));
         log::set_max_level(log::LevelFilter::Debug);
 
-        // Byte 12 falls inside the two-byte 'e9' character.
+        // Byte 12 falls inside the two-byte 'e9' character. Validation
+        // rejects such an id, but logging must not rely on that.
         let id = "aaaaaaaaaaa\u{e9}bc";
-        assert!(is_safe_container_id(id), "non-ASCII ids pass validation");
         assert_eq!(
             stop_endpoint(id, StopKind::Graceful),
             format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS),
@@ -2330,8 +2269,13 @@ mod tests {
             targets.first(),
             Some(&(true, DaemonEndpoint::Tcp("10.0.0.1:2375".to_string())))
         );
-        assert!(
-            targets.len() > 1,
+        // The defaults that exist depend on the host (a macOS runner has no
+        // Docker socket at all), so compare with a client without the
+        // override instead of counting them.
+        let defaults = Client::new().home(None).docker_host(None);
+        assert_eq!(
+            targets.get(1..),
+            Some(defaults.detection_targets().as_slice()),
             "a tcp:// daemon never replaces the default endpoints"
         );
     }
@@ -2423,7 +2367,7 @@ mod tests {
             None,
             80,
             Protocol::Tcp,
-            test_container_info("a", "web", "nginx"),
+            ContainerInfo::new("a", "web", "nginx"),
         );
         tx.send(Ok(map)).expect("receiver alive");
         let handle = DetectionHandle {
@@ -2526,14 +2470,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn unix_local_override_replaces_defaults() {
-        const {
-            assert!(LOCAL_OVERRIDE_REPLACES_DEFAULTS);
-        }
-    }
-
     // ── Merge priority ───────────────────────────────────────────────
 
     fn shared_port_body(name: &str) -> String {
@@ -2550,7 +2486,7 @@ mod tests {
         for responses in [vec![first.clone(), second.clone()], vec![second, first]] {
             let bodies = select_daemon_bodies(responses);
 
-            let lenient = merge_prioritized_responses(&bodies).expect("responses were given");
+            let lenient = merge_bodies_lenient(&bodies);
             assert_eq!(
                 lenient
                     .get(None, 8080, Protocol::Tcp)
@@ -2559,8 +2495,8 @@ mod tests {
                 "the earlier default endpoint wins a shared key"
             );
 
-            let merged = merge_prioritized_bodies(&bodies).expect("responses were given");
-            let strict = api::parse_containers_json_strict(&merged).expect("valid JSON");
+            let strict =
+                merge_bodies(&bodies, api::parse_containers_json_strict).expect("valid JSON");
             assert_eq!(
                 strict
                     .get(None, 8080, Protocol::Tcp)
@@ -2755,12 +2691,16 @@ mod tests {
         );
 
         let json_error = api::parse_containers_json_strict("not json").expect_err("invalid JSON");
+        assert_eq!(json_error.to_string(), "invalid container list JSON");
+        let serde_message = json_error
+            .source()
+            .expect("the JSON parser's error is chained")
+            .to_string();
         assert!(
-            json_error
-                .to_string()
-                .starts_with("invalid container list JSON"),
-            "got {json_error}"
+            serde_message.contains("line 1"),
+            "the source says where the JSON broke, got {serde_message}"
         );
+        assert!(ParseError::http("bad framing").source().is_none());
         let error = Error::from(json_error);
         assert!(
             error.source().is_some(),

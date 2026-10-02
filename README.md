@@ -238,6 +238,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 | `Client`                  | Daemon settings (home, timeout, `DOCKER_HOST`) with `detect`, `start_detection`, `stop`, `kill` |
 | `ContainerInfo`           | Container metadata: id, name, image, Compose project and service                    |
 | `ContainerPortMap`        | Map from `(host_ip, port, protocol)` to a shared `ContainerInfo`                    |
+| `PortKey`                 | Alias for the `(host_ip, port, protocol)` key of a `ContainerPortMap` binding       |
 | `PortMapIter`             | Iterator over the bindings of a `ContainerPortMap`                                  |
 | `ProxyFallback`           | Whether a lookup may match a proxy process on port and protocol alone               |
 | `PublishedContainerMatch` | Result of looking up a socket address in the port map                               |
@@ -282,13 +283,17 @@ Full API documentation is available on [docs.rs](https://docs.rs/nanodock).
 
 ### Rootless Podman Helpers
 
-These exist on every platform with the same signature, so callers need no `cfg` gates. Only Linux runs `rootlessport` on the host, so on other platforms `lookup_rootless_podman_container` always returns `None` and the resolver stays empty.
+These exist on every platform with the same signature, so callers need no `cfg` gates. Only Linux runs `rootlessport` on the host, so on other platforms `RootlessPodmanResolver::lookup` always returns `None` and the resolver stays empty.
 
-| Item                                   | Description                               |
-| -------------------------------------- | ----------------------------------------- |
-| `is_podman_rootlessport_process(name)` | Check if a process name is `rootlessport` |
-| `lookup_rootless_podman_container()`   | Resolve container from rootlessport PIDs  |
-| `RootlessPodmanResolver`               | Cached resolver for rootless Podman       |
+| Item                                        | Description                                                    |
+| ------------------------------------------- | -------------------------------------------------------------- |
+| `is_podman_rootlessport_process(name)`      | Check if a process name is `rootlessport`                      |
+| `RootlessPodmanResolver::new()`             | Resolver that searches the home directory from the environment |
+| `.home(home)`                               | Chainable setting for the home directory to search             |
+| `RootlessPodmanResolver::lookup(pid, name)` | Resolve the container behind a `rootlessport` process          |
+| `RootlessPodmanResolver::clear()`           | Forget the cached storage and processes                        |
+
+The resolver reads the overlay storage on its first lookup and caches every answer, so use one resolver per scan (or call `clear` between scans): containers started later are not seen, and a reused process ID keeps its old answer.
 
 ## Architecture
 

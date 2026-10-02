@@ -13,6 +13,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - `Client` holds the daemon settings and runs detection, stop, and kill requests. `Client::new()` reads `DOCKER_HOST` and the home directory from the environment, and the chainable `home`, `timeout`, and `docker_host` setters replace them. `Client::detect`, `Client::start_detection`, `Client::stop`, and `Client::kill` do what the free functions do; `detect_containers`, `start_detection`, `stop_container`, and the new `kill_container` are shorthands for `Client::new()`. The detection timeout (3 seconds by default) is configurable, and the internal query budget is derived from it so the detection thread always hands over its result before the waiting side gives up. A `DOCKER_HOST` value can be set or ignored per client instead of only through the environment.
 - `ContainerInfo` carries the Compose project and service of a container in the new `compose_project` and `compose_service` fields, read from the `com.docker.compose.project` and `com.docker.compose.service` labels. Containers started by `podman-compose` are recognised too, with `io.podman.compose.project` as a fallback for the project. A label value that is not a string (a number, boolean, `null`, array, or object) is ignored instead of making the container fail to parse, so lenient detection never drops a container over its labels.
 - `ContainerInfo::new`, `ContainerInfo::with_compose_project`, and `ContainerInfo::with_compose_service` build container metadata outside the crate.
+- `PortKey` names the `(Option<IpAddr>, u16, Protocol)` key of a `ContainerPortMap` binding, which iteration, `FromIterator`, and `Extend` use.
 - `Error` describes what went wrong: `PermissionDenied { endpoint }` (most often a Linux user outside the `docker` group), `Timeout { endpoint }`, `HttpStatus { status }`, `InvalidResponse { source }` (a `ParseError`), and `Io { source, endpoint }` (a `std::io::Error`). `Timeout` and `Io` name the endpoint when it is known, as an `Option<String>`. Every variant that carries data is a `#[non_exhaustive]` struct variant, so later releases can add fields; match it with `..`. When every endpoint fails, detection reports the most informative failure, so a permission problem on `/var/run/docker.sock` is no longer hidden behind "daemon not found".
 - `DetectionHandle::wait_result` reports why background detection produced no containers.
 - `ProxyFallback` (`Allow` or `Deny`) says whether `ContainerPortMap::lookup` may match a proxy process on port and protocol alone.
@@ -23,7 +24,9 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - Default Unix socket paths that do not exist are now skipped before any worker thread is spawned, and paths that resolve to the same file (for example `/var/run/docker.sock` symlinked to Docker Desktop's, OrbStack's, or Podman's socket) are queried once, at the first position. `DOCKER_HOST=unix://` still replaces the defaults and is not filtered.
 - **Security:** a default Unix socket whose file is owned by neither the current user nor root is skipped, so a socket another local user planted at a well-known path can neither add containers to detection nor receive a stop request. An explicit `DOCKER_HOST=unix://` path is not checked.
 - `is_container_proxy_process(name)` recognizes container runtime port-proxy processes (`docker-proxy`, `rootlesskit`, `rootlessport`, `rootlessport-child`, `slirp4netns`, `pasta`, `pasta.avx2`, `com.docker.backend`, `com.docker.vpnkit`, `vpnkit`, `wslrelay`, `gvproxy`, `limactl`), ignoring ASCII case and a trailing `.exe` and accepting names truncated to 15 bytes by Linux or to 16 bytes by macOS (such as `com.docker.backe`). A truncated name matches only when it is exactly 15 or 16 bytes long and is the start of a longer known name. Callers no longer need to keep their own list.
-- `RootlessPodmanResolver`, `lookup_rootless_podman_container`, and `is_podman_rootlessport_process` are now available on every platform with the same signatures, so callers no longer need `cfg(target_os = "linux")` gates around them. Outside Linux the lookup always returns `None` without touching the filesystem; Linux behavior is unchanged.
+- `RootlessPodmanResolver` and `is_podman_rootlessport_process` are now available on every platform with the same signatures, so callers no longer need `cfg(target_os = "linux")` gates around them. Outside Linux the lookup always returns `None` without touching the filesystem.
+- `RootlessPodmanResolver::clear` forgets the cached overlay storage and process answers. The resolver never refreshes its cache on its own, so use one resolver per scan or clear it between scans.
+- A rootless Podman container whose first name is empty now takes its next name, or the name in its storage metadata, instead of falling back to its short ID.
 
 ### Changed
 
@@ -39,7 +42,14 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** `PublishedContainerMatch::Match` holds `&Arc<ContainerInfo>` instead of `&ContainerInfo`. Field access and `Display` work through the `Arc` as before, but code that returns the bound value as `&ContainerInfo` or clones it into a `ContainerInfo` must say so: use `PublishedContainerMatch::container`, or `ContainerInfo::clone(info)` (or `Arc::clone(info)` to share it).
 - **Breaking:** `StopOutcome` no longer implements `Copy`, so a later variant can carry data that is not `Copy`. Clone it where a copy was relied on; `StopOutcome::is_stopped` takes `&self`.
 - **Breaking:** `ContainerInfo` and `PublishedContainerMatch` no longer implement `Hash`, so `ContainerInfo` can gain fields that cannot be hashed (such as a label map) in a minor release. Key a set or map on `info.id` instead of the whole `ContainerInfo`.
-- `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
+- **Breaking:** `short_container_id` returns `&str`, borrowed from its argument, instead of a new `String`. Call `.to_owned()` on the result where an owned string is needed.
+- **Breaking:** `lookup_rootless_podman_container(pid, name, &mut resolver, home)` is replaced by the method `RootlessPodmanResolver::lookup(pid, name)`. The home directory belongs to the resolver: `RootlessPodmanResolver::new()` reads it from the environment and `.home(home)` replaces it, instead of being passed on every call while only the first call used it.
+- `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`. The same holds for `ParseError`: an invalid container list displays as `invalid container list JSON`, and `source()` returns the JSON parser's error with the position where the JSON broke.
+- **Security:** port ranges can no longer make a small reply expand to millions of bindings. One daemon reply expands to at most 131072 bindings (every port of both protocols); past that, the rest of the reply is ignored and the bindings already parsed are kept. A range repeated within one container is expanded once. Before, a reply of a few kilobytes of `"range": 65535` entries took about 0.7 seconds and millions of map inserts to parse.
+- `Client::detect` and `detect_containers` parse each daemon's reply on its own and merge the results, instead of splicing the replies into one JSON array first. A reply that is not a JSON array, such as `{"message": "page not found"}`, now fails with `Error::InvalidResponse`; before, it was spliced into the array as a container without ports and detection succeeded with nothing found. Background detection still skips such a reply.
+- **Security:** `stop`, `kill`, `stop_container`, and `kill_container` accept only an id that can name a container: an ASCII letter or digit followed by ASCII letters, digits, `_`, `.`, or `-` (the name pattern Docker and Podman enforce, which hex IDs and ID prefixes also match), at most 256 bytes long. Anything else, such as `.`, `..`, a line separator (U+2028), a zero-width character, or a 100 KB id, is `StopOutcome::NotFound` without contacting a daemon. Before, only `/`, `?`, `#`, `%`, spaces, and control characters were rejected.
+- A reply with a large Podman port range parses about twice as fast: the port map is sized once, up to the binding cap, before the bindings are inserted (a 10001-port range takes about 0.5 ms instead of 1 ms).
+- The `range` field is read only from Podman's libpod port format (`host_port`). A Docker-format entry (`PublicPort`) always publishes one port, because Docker lists every port of a range as its own entry.
 - The background detection wait window is measured from the moment detection started rather than from the call that waits, so it never ends later than the detection timeout after `start_detection`.
 
 ### Removed
@@ -166,6 +176,31 @@ let again = outcome; // StopOutcome was Copy
 // 0.2: key on the container ID, and clone or borrow the outcome
 let seen: HashSet<String> = containers.map(|info| info.id.clone()).collect();
 let again = outcome.clone();
+```
+
+Resolving a rootless Podman `rootlessport` process:
+
+```rust,ignore
+// 0.1
+let mut resolver = RootlessPodmanResolver::default();
+let found = nanodock::lookup_rootless_podman_container(pid, name, &mut resolver, home.as_deref());
+// 0.2, home directory read from the environment
+let mut resolver = RootlessPodmanResolver::new();
+let found = resolver.lookup(pid, name);
+// 0.2, a specific home directory
+let mut resolver = RootlessPodmanResolver::new().home(home);
+// one resolver per scan, or forget the cache between scans
+resolver.clear();
+```
+
+`short_container_id` borrows instead of allocating:
+
+```rust,ignore
+// 0.1
+let short: String = nanodock::short_container_id(&info.id);
+// 0.2
+let short: &str = nanodock::short_container_id(&info.id);
+let owned: String = nanodock::short_container_id(&info.id).to_owned();
 ```
 
 `parse_containers_json_strict` now fails with `nanodock::ParseError`; code that named `serde_json::Error` should name `ParseError` or use `impl std::error::Error`.

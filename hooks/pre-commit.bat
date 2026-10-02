@@ -2,8 +2,8 @@
 REM nanodock - Pre-commit hook (Windows batch version)
 REM Prevents committing code that doesn't pass quality gates.
 REM
-REM Install: copy this file to .git\hooks\pre-commit
-REM          (remove the .bat extension when copying)
+REM Install: scripts\install-hooks.ps1. The gates are listed in
+REM docs\CONTRIBUTING.md (Quality Gates).
 
 echo ======================================
 echo   nanodock Pre-Commit Quality Gate
@@ -43,7 +43,7 @@ echo   OK Cross-target clippy
 
 REM Gate 3: Tests
 echo -^> Running tests...
-cargo test --lib --tests
+cargo test --locked --lib --tests --all-features
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X TESTS FAILED
@@ -51,7 +51,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-cargo test --doc
+cargo test --locked --doc --all-features
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X TESTS FAILED

@@ -431,9 +431,23 @@ impl std::fmt::Display for ContainerInfo {
     }
 }
 
-/// Key of one published binding: host IP (`None` for every interface),
-/// host port, and protocol.
-type PortKey = (Option<IpAddr>, u16, Protocol);
+/// Key of one published binding in a [`ContainerPortMap`]: host IP (`None`
+/// for a wildcard binding on every interface), host port, and protocol.
+///
+/// Iterating a map yields `(PortKey, &ContainerInfo)` pairs, and a map can
+/// be collected from `(PortKey, info)` pairs.
+///
+/// ```
+/// use nanodock::{ContainerInfo, ContainerPortMap, PortKey, Protocol};
+///
+/// let key: PortKey = (None, 80, Protocol::Tcp);
+/// let map: ContainerPortMap = [(key, ContainerInfo::new("abc", "web", "nginx"))]
+///     .into_iter()
+///     .collect();
+/// let keys: Vec<PortKey> = map.iter().map(|(key, _)| key).collect();
+/// assert_eq!(keys, vec![key]);
+/// ```
+pub type PortKey = (Option<IpAddr>, u16, Protocol);
 
 /// Published container ports: maps `(host_ip, host_port, protocol)` to the
 /// container that publishes it.
@@ -587,7 +601,7 @@ impl ContainerPortMap {
 }
 
 impl<'a> IntoIterator for &'a ContainerPortMap {
-    type Item = ((Option<IpAddr>, u16, Protocol), &'a ContainerInfo);
+    type Item = (PortKey, &'a ContainerInfo);
     type IntoIter = PortMapIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -595,20 +609,16 @@ impl<'a> IntoIterator for &'a ContainerPortMap {
     }
 }
 
-impl<I: Into<Arc<ContainerInfo>>> FromIterator<((Option<IpAddr>, u16, Protocol), I)>
-    for ContainerPortMap
-{
-    fn from_iter<T: IntoIterator<Item = ((Option<IpAddr>, u16, Protocol), I)>>(iter: T) -> Self {
+impl<I: Into<Arc<ContainerInfo>>> FromIterator<(PortKey, I)> for ContainerPortMap {
+    fn from_iter<T: IntoIterator<Item = (PortKey, I)>>(iter: T) -> Self {
         let mut map = Self::new();
         map.extend(iter);
         map
     }
 }
 
-impl<I: Into<Arc<ContainerInfo>>> Extend<((Option<IpAddr>, u16, Protocol), I)>
-    for ContainerPortMap
-{
-    fn extend<T: IntoIterator<Item = ((Option<IpAddr>, u16, Protocol), I)>>(&mut self, iter: T) {
+impl<I: Into<Arc<ContainerInfo>>> Extend<(PortKey, I)> for ContainerPortMap {
+    fn extend<T: IntoIterator<Item = (PortKey, I)>>(&mut self, iter: T) {
         self.bindings
             .extend(iter.into_iter().map(|(key, info)| (key, info.into())));
     }
@@ -624,7 +634,7 @@ pub struct PortMapIter<'a> {
 }
 
 impl<'a> Iterator for PortMapIter<'a> {
-    type Item = ((Option<IpAddr>, u16, Protocol), &'a ContainerInfo);
+    type Item = (PortKey, &'a ContainerInfo);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(key, info)| (*key, info.as_ref()))

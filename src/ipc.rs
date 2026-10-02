@@ -9,8 +9,9 @@
 //! read timeouts only apply per call, so sockets are wrapped in
 //! [`DeadlineStream`], which shrinks the timeout before every read and write
 //! and fails once the deadline has passed. Windows named pipes have no read
-//! timeout at all; `PipeStream` gives them the same deadline behavior, so
-//! every transport is a plain `Read + Write` stream for the HTTP parser.
+//! timeout at all; `PipeStream` uses overlapped I/O to give them the same
+//! deadline behavior, so every transport is a plain `Read + Write` stream
+//! for the HTTP parser.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
@@ -620,10 +621,18 @@ pub fn connect_unix(
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-use std::{ffi::OsStr, ffi::c_void, os::windows::ffi::OsStrExt, os::windows::io::AsRawHandle};
+use std::{
+    ffi::OsStr,
+    ffi::c_void,
+    os::windows::ffi::OsStrExt,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+};
 
 #[cfg(windows)]
 type RawHandle = *mut c_void;
+
+#[cfg(windows)]
+const ERROR_HANDLE_EOF: i32 = 38;
 
 #[cfg(windows)]
 const ERROR_BROKEN_PIPE: i32 = 109;
@@ -634,26 +643,82 @@ const ERROR_PIPE_BUSY: i32 = 231;
 #[cfg(windows)]
 const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 
-/// First wait of a [`PipeStream`] read that finds no bytes in the pipe.
 #[cfg(windows)]
-const PIPE_POLL_MIN: Duration = Duration::from_micros(250);
+const ERROR_MORE_DATA: i32 = 234;
 
-/// Longest wait between two checks of an idle pipe; each wait doubles from
-/// [`PIPE_POLL_MIN`] up to this.
 #[cfg(windows)]
-const PIPE_POLL_MAX: Duration = Duration::from_millis(10);
+const ERROR_IO_PENDING: i32 = 997;
+
+/// `FILE_FLAG_OVERLAPPED`: open the pipe for overlapped I/O, so every read
+/// and write can be waited on with a timeout and cancelled.
+#[cfg(windows)]
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+/// `WaitForSingleObject` result: the event was signaled.
+#[cfg(windows)]
+const WAIT_OBJECT_0: u32 = 0;
+
+/// `WaitForSingleObject` result: the timeout elapsed first.
+#[cfg(windows)]
+const WAIT_TIMEOUT: u32 = 258;
+
+/// The Win32 `OVERLAPPED` structure, with the `Offset`/`OffsetHigh` versus
+/// `Pointer` union spelled as its offset fields (pipes ignore them).
+#[cfg(windows)]
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: RawHandle,
+}
+
+#[cfg(windows)]
+impl Overlapped {
+    /// A zeroed `OVERLAPPED` whose completion signals `event`.
+    const fn with_event(event: RawHandle) -> Self {
+        Self {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event,
+        }
+    }
+}
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
-    fn PeekNamedPipe(
-        named_pipe: RawHandle,
+    fn CreateEventW(
+        security_attributes: *mut c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> RawHandle;
+    fn ReadFile(
+        file: RawHandle,
         buffer: *mut c_void,
-        buffer_size: u32,
+        bytes_to_read: u32,
         bytes_read: *mut u32,
-        total_bytes_avail: *mut u32,
-        bytes_left_this_message: *mut u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+    fn WriteFile(
+        file: RawHandle,
+        buffer: *const c_void,
+        bytes_to_write: u32,
+        bytes_written: *mut u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+    fn WaitForSingleObject(handle: RawHandle, timeout_ms: u32) -> u32;
+    fn CancelIoEx(file: RawHandle, overlapped: *mut Overlapped) -> i32;
+    fn GetOverlappedResult(
+        file: RawHandle,
+        overlapped: *mut Overlapped,
+        bytes_transferred: *mut u32,
+        wait: i32,
     ) -> i32;
 }
 
@@ -663,15 +728,26 @@ unsafe extern "system" {
 /// `WaitNamedPipeW`, but never past `deadline`.
 #[cfg(windows)]
 pub fn connect_pipe(path: &str, deadline: Instant) -> io::Result<PipeStream> {
-    open_named_pipe(path, deadline).map(|file| PipeStream::new(file, deadline))
+    open_named_pipe(path, deadline).and_then(|file| PipeStream::new(file, deadline))
 }
 
+/// Open the client end of the pipe at `path` for overlapped I/O.
+///
+/// The pipe stays in byte read mode (the default for a client), even when
+/// the server created it in message mode, so a read never fails with
+/// `ERROR_MORE_DATA` for a message larger than the buffer.
 #[cfg(windows)]
 fn open_named_pipe(path: &str, deadline: Instant) -> io::Result<std::fs::File> {
     use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
 
     loop {
-        match OpenOptions::new().read(true).write(true).open(path) {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(path)
+        {
             Ok(stream) => return Ok(stream),
             Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 wait_named_pipe(path, deadline)?;
@@ -688,27 +764,85 @@ fn open_named_pipe(path: &str, deadline: Instant) -> io::Result<std::fs::File> {
 /// deadline, so it goes through the same HTTP parser as sockets.
 ///
 /// A synchronous pipe read has no timeout: a daemon that stops answering
-/// would block it forever. Each read therefore peeks first and reads only
-/// the bytes already in the pipe. While the pipe is empty it waits, starting
-/// at [`PIPE_POLL_MIN`] and doubling up to [`PIPE_POLL_MAX`], so a prompt
-/// reply is picked up within a fraction of a millisecond while an idle pipe
-/// costs little CPU. Once the deadline has passed, every read and write
-/// fails with [`io::ErrorKind::TimedOut`]. A pipe the server has closed
-/// reads as EOF.
+/// would block it forever. The pipe is therefore opened for overlapped I/O:
+/// every read and write is started asynchronously and waited on for the
+/// time left before the deadline, so it returns as soon as the kernel
+/// completes it. If the deadline passes first, the operation is cancelled
+/// and the cancellation is awaited before the call returns
+/// [`io::ErrorKind::TimedOut`], so the kernel never touches the caller's
+/// buffer after the call has returned.
+///
+/// A read of zero bytes, or a pipe the server has closed, reads as EOF. A
+/// zero-byte read is how a message-mode server (Docker's go-winio listener)
+/// signals that it will write no more (`CloseWrite`).
+///
+/// `file` is an overlapped handle: it must only be read and written
+/// through this type, never through `std::fs::File`'s own `Read` or
+/// `Write`, which assume a synchronous handle.
 #[cfg(windows)]
 pub struct PipeStream {
     file: std::fs::File,
+    /// Manual-reset event the kernel signals when a read or write completes.
+    event: OwnedHandle,
     deadline: Instant,
 }
 
 #[cfg(windows)]
 impl PipeStream {
-    const fn new(file: std::fs::File, deadline: Instant) -> Self {
-        Self { file, deadline }
+    /// Wrap a pipe handle opened with [`FILE_FLAG_OVERLAPPED`].
+    fn new(file: std::fs::File, deadline: Instant) -> io::Result<Self> {
+        // SAFETY: null security attributes and a null name create an unnamed
+        // event with the default descriptor; the two flags are plain
+        // integers (manual reset, initially not signaled).
+        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `event` is a valid handle that `CreateEventW` just returned
+        // and nothing else owns, so `OwnedHandle` may close it on drop.
+        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        Ok(Self {
+            file,
+            event,
+            deadline,
+        })
     }
 
     fn remaining(&self) -> io::Result<Duration> {
         remaining_until(self.deadline).ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    }
+
+    /// Run one overlapped read or write, started by `start`, and wait for
+    /// it until the deadline.
+    ///
+    /// `start` receives the pipe handle and a pointer to an `OVERLAPPED`
+    /// that lives on this function's stack, and begins the operation with
+    /// `ReadFile` or `WriteFile`. This function returns only once the kernel
+    /// is done with the operation: it completed, or it was cancelled and the
+    /// cancellation completed. The buffer `start` hands to the kernel must
+    /// stay valid until then, which holds when it is borrowed by the caller
+    /// of this function. Only `read` and `write` call this, through
+    /// `&mut self`, so one operation at a time uses the stream's event.
+    fn transfer(&self, start: impl FnOnce(RawHandle, *mut Overlapped) -> i32) -> io::Result<usize> {
+        let remaining = self.remaining()?;
+        let handle = self.file.as_raw_handle();
+        let event = self.event.as_raw_handle();
+        let mut overlapped = Overlapped::with_event(event);
+        if start(handle, &raw mut overlapped) == 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(ERROR_IO_PENDING) => {}
+                // A message-mode read that filled the buffer completed at
+                // once; the rest of the message stays in the pipe.
+                Some(ERROR_MORE_DATA) => return overlapped_result(handle, &mut overlapped, false),
+                // The operation failed to start, so nothing is in flight.
+                _ => return Err(error),
+            }
+            if let Err(error) = wait_for_event(event, remaining) {
+                return cancel_and_settle(handle, &mut overlapped, error);
+            }
+        }
+        overlapped_result(handle, &mut overlapped, false)
     }
 }
 
@@ -718,34 +852,117 @@ impl Read for PipeStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut wait = PIPE_POLL_MIN;
-        loop {
-            // Checked before every peek, so a daemon that streams without
-            // pause cannot hold the request open past the deadline.
-            let remaining = self.remaining()?;
-            match peek_available_bytes(&self.file) {
-                Ok(0) => {}
-                Ok(available) => {
-                    let len = usize::try_from(available).map_or(buf.len(), |n| n.min(buf.len()));
-                    return closed_pipe_as_eof(self.file.read(&mut buf[..len]));
-                }
-                Err(error) => return closed_pipe_as_eof(Err(error)),
-            }
-            std::thread::sleep(wait.min(remaining));
-            wait = wait.saturating_mul(2).min(PIPE_POLL_MAX);
-        }
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        let buffer = buf.as_mut_ptr().cast::<c_void>();
+        let result = self.transfer(|handle, overlapped| {
+            // SAFETY: `handle` is the open pipe, opened for overlapped I/O.
+            // `buffer` points to `len` writable bytes of `buf`, which stays
+            // mutably borrowed until `transfer` returns, and `overlapped`
+            // points to a live `OVERLAPPED` on `transfer`'s stack; `transfer`
+            // returns only once the read has completed or its cancellation
+            // has. The byte count pointer may be null for overlapped reads.
+            unsafe { ReadFile(handle, buffer, len, std::ptr::null_mut(), overlapped) }
+        });
+        closed_pipe_as_eof(result)
     }
 }
 
 #[cfg(windows)]
 impl Write for PipeStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.remaining()?;
-        self.file.write(buf)
+        // A zero-byte write would send an empty message on a message-mode
+        // pipe, which the server may read as the end of the request.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        let buffer = buf.as_ptr().cast::<c_void>();
+        self.transfer(|handle, overlapped| {
+            // SAFETY: `handle` is the open pipe, opened for overlapped I/O.
+            // `buffer` points to `len` readable bytes of `buf`, which stays
+            // borrowed until `transfer` returns, and `overlapped` points to a
+            // live `OVERLAPPED` on `transfer`'s stack; `transfer` returns only
+            // once the write has completed or its cancellation has. The byte
+            // count pointer may be null for overlapped writes.
+            unsafe { WriteFile(handle, buffer, len, std::ptr::null_mut(), overlapped) }
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        // A write completes once the pipe holds the bytes; nothing is
+        // buffered on this side.
+        Ok(())
+    }
+}
+
+/// Wait until `event` is signaled, for at most `timeout`.
+///
+/// Fails with [`io::ErrorKind::TimedOut`] when the timeout elapses first.
+#[cfg(windows)]
+fn wait_for_event(event: RawHandle, timeout: Duration) -> io::Result<()> {
+    // SAFETY: `event` is the stream's event handle, open for the stream's
+    // lifetime, and the timeout is a plain integer.
+    match unsafe { WaitForSingleObject(event, wait_timeout_ms(timeout)) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(io::ErrorKind::TimedOut.into()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Cancel the pending operation of `overlapped` and wait until the kernel
+/// is done with it, then fail with `error`.
+///
+/// If the operation finished with data before the cancellation took
+/// effect, its byte count is returned instead, so no data is lost.
+///
+/// The wait has no timeout on purpose: returning while the operation is
+/// still pending would let the kernel write into a buffer, and an
+/// `OVERLAPPED`, that no longer exist. Cancelling a pipe read or write
+/// completes promptly.
+#[cfg(windows)]
+fn cancel_and_settle(
+    handle: RawHandle,
+    overlapped: &mut Overlapped,
+    error: io::Error,
+) -> io::Result<usize> {
+    // SAFETY: `handle` is the open pipe and `overlapped` the live
+    // `OVERLAPPED` of the operation to cancel. A failure (`ERROR_NOT_FOUND`)
+    // only means the operation already completed, which the wait below
+    // observes either way.
+    unsafe { CancelIoEx(handle, overlapped) };
+    match overlapped_result(handle, overlapped, true) {
+        Ok(transferred) if transferred > 0 => Ok(transferred),
+        _ => Err(error),
+    }
+}
+
+/// The byte count of the operation of `overlapped`, or its OS error.
+///
+/// With `wait`, blocks until the operation is complete; without it, the
+/// operation must already be complete. A read that filled the buffer of a
+/// message-mode read (`ERROR_MORE_DATA`) counts as a successful read of the
+/// bytes it returned.
+#[cfg(windows)]
+fn overlapped_result(
+    handle: RawHandle,
+    overlapped: &mut Overlapped,
+    wait: bool,
+) -> io::Result<usize> {
+    let mut transferred = 0_u32;
+    // SAFETY: `handle` is the open pipe, `overlapped` the live `OVERLAPPED`
+    // of an operation on it, and `transferred` a stack-local u32. The
+    // `OVERLAPPED` carries a manual-reset event, which a waiting call needs.
+    let success =
+        unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, i32::from(wait)) };
+    let transferred = usize::try_from(transferred).unwrap_or(usize::MAX);
+    if success != 0 {
+        return Ok(transferred);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_MORE_DATA) {
+        Ok(transferred)
+    } else {
+        Err(error)
     }
 }
 
@@ -762,13 +979,13 @@ fn closed_pipe_as_eof(result: io::Result<usize>) -> io::Result<usize> {
 /// [`io::ErrorKind::TimedOut`] once the deadline has passed).
 #[cfg(windows)]
 fn wait_named_pipe(path: &str, deadline: Instant) -> io::Result<()> {
-    let timeout_ms =
-        remaining_timeout_ms(deadline).ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+    let remaining =
+        remaining_until(deadline).ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
     let wide_path = wide_string(path);
     // SAFETY: `wide_path` is a valid null-terminated UTF-16 string produced by
-    // `wide_string`, and `timeout_ms` is a plain u32. No aliasing or lifetime
+    // `wide_string`, and the timeout is a plain u32. No aliasing or lifetime
     // invariants apply; the kernel copies the string internally.
-    let success = unsafe { WaitNamedPipeW(wide_path.as_ptr(), timeout_ms) };
+    let success = unsafe { WaitNamedPipeW(wide_path.as_ptr(), wait_timeout_ms(remaining)) };
     if success == 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -776,51 +993,20 @@ fn wait_named_pipe(path: &str, deadline: Instant) -> io::Result<()> {
     }
 }
 
-/// The number of bytes waiting in the pipe, or the OS error of the peek.
-#[cfg(windows)]
-fn peek_available_bytes(stream: &std::fs::File) -> io::Result<u32> {
-    let mut available = 0;
-    // SAFETY: `stream` is an open named-pipe file whose raw handle is valid
-    // for the lifetime of this call. We pass null for all output pointers
-    // except `total_bytes_avail`, which points to a stack-local u32. The
-    // zero-length buffer and null `bytes_read` pointer tell the kernel we
-    // only want the available-byte count, not actual data.
-    let success = unsafe {
-        PeekNamedPipe(
-            stream.as_raw_handle(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            &raw mut available,
-            std::ptr::null_mut(),
-        )
-    };
-    if success == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(available)
-    }
-}
-
-/// Milliseconds left before `deadline`, or `None` once it has passed.
+/// Convert a remaining duration to a Win32 wait timeout in the range
+/// `1..u32::MAX` milliseconds, rounding up so a wait never ends before the
+/// deadline.
 ///
-/// Never returns 0: `WaitNamedPipeW` reads a zero timeout as
-/// `NMPWAIT_USE_DEFAULT_WAIT` (the pipe's default, typically 50ms), not as
-/// "do not wait".
+/// Never returns 0, which `WaitNamedPipeW` reads as
+/// `NMPWAIT_USE_DEFAULT_WAIT` (the pipe's default, typically 50 ms), nor
+/// `u32::MAX`, which both `WaitNamedPipeW` and `WaitForSingleObject` read
+/// as "wait forever".
 #[cfg(windows)]
-fn remaining_timeout_ms(deadline: Instant) -> Option<u32> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .map(pipe_wait_timeout_ms)
-}
-
-/// Convert a remaining duration to a `WaitNamedPipeW` timeout in the range
-/// `1..=u32::MAX` milliseconds.
-#[cfg(windows)]
-fn pipe_wait_timeout_ms(remaining: Duration) -> u32 {
-    u32::try_from(remaining.as_millis())
+fn wait_timeout_ms(remaining: Duration) -> u32 {
+    let millis = remaining.as_nanos().div_ceil(1_000_000);
+    u32::try_from(millis)
         .unwrap_or(u32::MAX)
-        .max(1)
+        .clamp(1, u32::MAX - 1)
 }
 
 #[cfg(windows)]
@@ -831,10 +1017,14 @@ fn wide_string(value: &str) -> Vec<u16> {
         .collect()
 }
 
-/// Whether a Windows error code means the server closed its end of the pipe.
+/// Whether a Windows error code means the server closed its end of the
+/// pipe (or the read reached the end of the data).
 #[cfg(windows)]
 const fn is_pipe_closed_code(code: Option<i32>) -> bool {
-    matches!(code, Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED))
+    matches!(
+        code,
+        Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED | ERROR_HANDLE_EOF)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2226,26 +2416,31 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn pipe_wait_timeout_ms_never_returns_zero() {
+    fn wait_timeout_ms_stays_between_zero_and_forever() {
         assert_eq!(
-            pipe_wait_timeout_ms(Duration::ZERO),
+            wait_timeout_ms(Duration::ZERO),
             1,
             "0 means NMPWAIT_USE_DEFAULT_WAIT to WaitNamedPipeW"
         );
         assert_eq!(
-            pipe_wait_timeout_ms(Duration::from_micros(500)),
+            wait_timeout_ms(Duration::from_micros(500)),
             1,
             "sub-millisecond budgets must not round down to 0"
         );
         assert_eq!(
-            pipe_wait_timeout_ms(Duration::from_secs(5)),
+            wait_timeout_ms(Duration::from_micros(1500)),
+            2,
+            "partial milliseconds round up so a wait never ends early"
+        );
+        assert_eq!(
+            wait_timeout_ms(Duration::from_secs(5)),
             5000,
             "longer budgets are passed through"
         );
         assert_eq!(
-            pipe_wait_timeout_ms(Duration::from_secs(u64::MAX)),
-            u32::MAX,
-            "huge budgets saturate"
+            wait_timeout_ms(Duration::from_secs(u64::MAX)),
+            u32::MAX - 1,
+            "huge budgets saturate below INFINITE"
         );
     }
 
@@ -2284,9 +2479,31 @@ mod tests {
         )
     }
 
+    /// `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE`: a byte stream, like the
+    /// pipes Podman machine serves.
+    #[cfg(windows)]
+    const BYTE_PIPE: u32 = 0;
+
+    /// `PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE`: the mode Docker's
+    /// go-winio listener uses (`MessageMode: true`), where every write is one
+    /// message and `CloseWrite` sends a zero-length message.
+    #[cfg(windows)]
+    const MESSAGE_PIPE: u32 = 4 | 2;
+
     /// Create one byte-mode server instance of the pipe at `path`.
     #[cfg(windows)]
     fn create_pipe_instance(path: &str, max_instances: u32) -> std::fs::File {
+        create_pipe_instance_with_mode(path, max_instances, BYTE_PIPE)
+    }
+
+    /// Create one server instance of the pipe at `path` in `pipe_mode`
+    /// ([`BYTE_PIPE`] or [`MESSAGE_PIPE`]).
+    #[cfg(windows)]
+    fn create_pipe_instance_with_mode(
+        path: &str,
+        max_instances: u32,
+        pipe_mode: u32,
+    ) -> std::fs::File {
         use std::os::windows::io::FromRawHandle;
 
         let wide_path = wide_string(path);
@@ -2297,7 +2514,7 @@ mod tests {
             CreateNamedPipeW(
                 wide_path.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
-                0,
+                pipe_mode,
                 max_instances,
                 64 * 1024,
                 64 * 1024,
@@ -2507,21 +2724,78 @@ mod tests {
         );
     }
 
-    /// The read end of an anonymous pipe, which `PeekNamedPipe` also serves,
-    /// with its write end.
+    /// Read the request head a client wrote to a server instance in either
+    /// pipe mode. Reads in blocks, so a message-mode instance never fails a
+    /// read with `ERROR_MORE_DATA`.
     #[cfg(windows)]
-    fn anonymous_pipe() -> (std::fs::File, io::PipeWriter) {
-        let (reader, writer) = io::pipe().expect("anonymous pipe");
-        let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
-        (reader, writer)
+    fn drain_pipe_request(stream: &mut std::fs::File) {
+        let mut request = Vec::new();
+        let mut block = [0_u8; 4096];
+        while !request.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut block) {
+                Ok(read) if read > 0 => request.extend_from_slice(&block[..read]),
+                _ => break,
+            }
+        }
+    }
+
+    /// Write a zero-length message, which go-winio's `CloseWrite` sends to
+    /// say that no more data follows.
+    #[cfg(windows)]
+    fn write_empty_message(stream: &std::fs::File) {
+        let mut written = 0;
+        // SAFETY: `stream` is an open synchronous pipe server handle, a
+        // zero-length write reads no bytes from the null buffer, and a null
+        // `overlapped` pointer asks for a blocking call.
+        let success = unsafe {
+            WriteFile(
+                stream.as_raw_handle(),
+                std::ptr::null(),
+                0,
+                &raw mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            success,
+            0,
+            "zero-length WriteFile failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    /// Serve one client on a new pipe in `pipe_mode`: read its request head,
+    /// hand the server end to `respond`, and close the pipe when it returns.
+    #[cfg(windows)]
+    fn serve_pipe_once(
+        pipe_mode: u32,
+        respond: impl FnOnce(&mut std::fs::File) + Send + 'static,
+    ) -> (String, JoinHandle<()>) {
+        let path = test_pipe_path("once");
+        let mut instance = create_pipe_instance_with_mode(&path, 1, pipe_mode);
+        let handle = std::thread::spawn(move || {
+            accept_pipe_client(&instance);
+            drain_pipe_request(&mut instance);
+            respond(&mut instance);
+        });
+        (path, handle)
+    }
+
+    /// A server instance in `pipe_mode` and a connected [`PipeStream`] to it.
+    #[cfg(windows)]
+    fn pipe_pair(pipe_mode: u32, deadline: Instant) -> (std::fs::File, PipeStream) {
+        let path = test_pipe_path("pair");
+        let server = create_pipe_instance_with_mode(&path, 1, pipe_mode);
+        let client = connect_pipe(&path, deadline).expect("client end");
+        accept_pipe_client(&server);
+        (server, client)
     }
 
     #[cfg(windows)]
     #[test]
     fn pipe_stream_reads_closed_pipe_as_eof() {
-        let (reader, writer) = anonymous_pipe();
-        drop(writer);
-        let mut stream = PipeStream::new(reader, Instant::now() + Duration::from_secs(5));
+        let (server, mut stream) = pipe_pair(BYTE_PIPE, Instant::now() + Duration::from_secs(5));
+        drop(server);
 
         assert_eq!(
             stream.read(&mut [0_u8; 16]).ok(),
@@ -2533,9 +2807,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pipe_stream_reads_only_available_bytes() {
-        let (reader, mut writer) = anonymous_pipe();
-        writer.write_all(b"abc").expect("write");
-        let mut stream = PipeStream::new(reader, Instant::now() + Duration::from_secs(5));
+        let (mut server, mut stream) =
+            pipe_pair(BYTE_PIPE, Instant::now() + Duration::from_secs(5));
+        server.write_all(b"abc").expect("write");
         let mut buf = [0_u8; 16];
 
         assert_eq!(
@@ -2544,39 +2818,85 @@ mod tests {
             "no read waits for a full buffer"
         );
         assert_eq!(&buf[..3], b"abc");
-        drop(writer);
+        drop(server);
         assert_eq!(stream.read(&mut buf).ok(), Some(0));
     }
 
     #[cfg(windows)]
     #[test]
-    fn pipe_stream_reports_idle_pipe_as_timed_out() {
-        let (reader, writer) = anonymous_pipe();
+    fn pipe_stream_reads_zero_length_message_as_eof() {
+        let (mut server, mut stream) =
+            pipe_pair(MESSAGE_PIPE, Instant::now() + Duration::from_secs(5));
+        server.write_all(b"abc").expect("write");
+        let mut buf = [0_u8; 16];
+        assert_eq!(stream.read(&mut buf).ok(), Some(3), "the message arrives");
+
+        write_empty_message(&server);
         let started = Instant::now();
-        let mut stream = PipeStream::new(reader, started + Duration::from_millis(100));
+        let read = stream.read(&mut buf).ok();
+
+        assert_eq!(read, Some(0), "an empty message is the end of the reply");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the empty message ends the read at once, took {:?}",
+            started.elapsed()
+        );
+        drop(server);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_stream_reports_idle_pipe_as_timed_out() {
+        let started = Instant::now();
+        let (server, mut stream) = pipe_pair(BYTE_PIPE, started + Duration::from_millis(100));
 
         let error = stream.read(&mut [0_u8; 16]).expect_err("nothing arrives");
-        drop(writer);
+        let elapsed = started.elapsed();
+        drop(server);
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
-            started.elapsed() >= Duration::from_millis(100),
-            "the read waits for the whole deadline"
+            elapsed >= Duration::from_millis(100),
+            "the read waits for the whole deadline, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the read is cancelled at the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_stream_bounds_blocked_write_by_deadline() {
+        // The server never reads, so a write larger than the pipe buffer
+        // cannot complete.
+        let started = Instant::now();
+        let (server, mut stream) = pipe_pair(BYTE_PIPE, started + Duration::from_millis(200));
+
+        let error = stream
+            .write_all(&vec![b'x'; 1024 * 1024])
+            .expect_err("the server reads nothing");
+        let elapsed = started.elapsed();
+        drop(server);
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a blocked write is cancelled at the deadline, took {elapsed:?}"
         );
     }
 
     #[cfg(windows)]
     #[test]
     fn pipe_stream_stops_continuous_stream_at_deadline() {
-        let (reader, mut writer) = anonymous_pipe();
+        let started = Instant::now();
+        let (mut server, mut stream) = pipe_pair(BYTE_PIPE, started + Duration::from_millis(200));
         let writer_thread = std::thread::spawn(move || {
             let block = [b'x'; 512];
             // Ends once the reader is dropped and the write fails.
-            while writer.write_all(&block).is_ok() {}
+            while server.write_all(&block).is_ok() {}
         });
 
-        let started = Instant::now();
-        let mut stream = PipeStream::new(reader, started + Duration::from_millis(200));
         let mut buf = [0_u8; 256];
         let error = loop {
             if let Err(error) = stream.read(&mut buf) {
@@ -2591,6 +2911,82 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "a continuous stream must not outlive the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_fetch_ends_reply_at_empty_message_after_drain() {
+        // Docker's go-winio listener runs in message mode: after a reply
+        // without Content-Length it sends an empty message (CloseWrite),
+        // then closes. The empty message arrives after the client has read
+        // the whole reply and is waiting for more.
+        let (path, server) = serve_pipe_once(MESSAGE_PIPE, |stream| {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\nServer: test\r\n\r\n[]"));
+            // FlushFileBuffers: wait until the client has read the reply.
+            drop(stream.sync_all());
+            write_empty_message(stream);
+        });
+
+        let started = Instant::now();
+        let body = fetch_pipe(&path, started + Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        drop(server.join());
+
+        assert_eq!(body.ok().as_deref(), Some("[]"), "the body ends at EOF");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the end of the reply is seen well before the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_fetch_reads_reply_written_just_before_close() {
+        for (pipe_mode, mode_name) in [(BYTE_PIPE, "byte"), (MESSAGE_PIPE, "message")] {
+            for body_len in [0, 1, 4095, 64 * 1024, 300 * 1024] {
+                let (path, server) = serve_pipe_once(pipe_mode, move |stream| {
+                    let mut reply = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+                    reply.resize(reply.len() + body_len, b'x');
+                    drop(stream.write_all(&reply));
+                });
+
+                let body = fetch_pipe(&path, Instant::now() + Duration::from_secs(5));
+                drop(server.join());
+
+                assert_eq!(
+                    body.as_ref().map(String::len).ok(),
+                    Some(body_len),
+                    "{mode_name} pipe, {body_len} byte body closed right after the write: {:?}",
+                    body.as_ref().err()
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_fetch_reports_trickling_message_server_as_timeout() {
+        let (path, server) = serve_pipe_once(MESSAGE_PIPE, |stream| {
+            drop(stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n["));
+            // One byte at a time, never finishing, until the client leaves.
+            while stream.write_all(b" ").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let started = Instant::now();
+        let result = fetch_pipe(&path, started + Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        drop(server.join());
+
+        assert!(
+            matches!(result, Err(FetchError::Timeout)),
+            "a reply still arriving at the deadline is a timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the read ends at the deadline, took {elapsed:?}"
         );
     }
 

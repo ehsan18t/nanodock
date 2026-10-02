@@ -838,7 +838,8 @@ impl PipeStream {
     /// of this function. Only `read` and `write` call this, through
     /// `&mut self`, so one operation at a time uses the stream's event.
     fn transfer(&self, start: impl FnOnce(RawHandle, *mut Overlapped) -> i32) -> io::Result<usize> {
-        let remaining = self.remaining()?;
+        // Fail before starting an operation once the deadline has passed.
+        self.remaining()?;
         let handle = self.file.as_raw_handle();
         let event = self.event.as_raw_handle();
         let mut overlapped = Overlapped::with_event(event);
@@ -852,7 +853,7 @@ impl PipeStream {
                 // The operation failed to start, so nothing is in flight.
                 _ => return Err(error),
             }
-            if let Err(error) = wait_for_event(event, remaining) {
+            if let Err(error) = wait_for_event(event, self.deadline) {
                 return cancel_and_settle(handle, &mut overlapped, error);
             }
         }
@@ -913,14 +914,19 @@ impl Write for PipeStream {
 ///
 /// Fails with [`io::ErrorKind::TimedOut`] when the timeout elapses first.
 #[cfg(windows)]
-fn wait_for_event(event: RawHandle, timeout: Duration) -> io::Result<()> {
-    // SAFETY: `event` is the stream's event handle, open for the stream's
-    // lifetime, and the timeout is a plain integer.
-    match unsafe { WaitForSingleObject(event, wait_timeout_ms(timeout)) } {
-        WAIT_OBJECT_0 => Ok(()),
-        WAIT_TIMEOUT => Err(io::ErrorKind::TimedOut.into()),
-        _ => Err(io::Error::last_os_error()),
+fn wait_for_event(event: RawHandle, deadline: Instant) -> io::Result<()> {
+    // `WaitForSingleObject` may wake up to a timer tick before its timeout,
+    // so keep waiting until the deadline has really passed.
+    while let Some(remaining) = remaining_until(deadline) {
+        // SAFETY: `event` is the stream's event handle, open for the
+        // stream's lifetime, and the timeout is a plain integer.
+        match unsafe { WaitForSingleObject(event, wait_timeout_ms(remaining)) } {
+            WAIT_OBJECT_0 => return Ok(()),
+            WAIT_TIMEOUT => {}
+            _ => return Err(io::Error::last_os_error()),
+        }
     }
+    Err(io::ErrorKind::TimedOut.into())
 }
 
 /// Cancel the pending operation of `overlapped` and wait until the kernel
@@ -1008,8 +1014,9 @@ fn wait_named_pipe(path: &str, deadline: Instant) -> io::Result<()> {
 }
 
 /// Convert a remaining duration to a Win32 wait timeout in the range
-/// `1..u32::MAX` milliseconds, rounding up so a wait never ends before the
-/// deadline.
+/// `1..u32::MAX` milliseconds, rounding up. The OS may still wake a wait up
+/// to a timer tick early, so callers that need the deadline to have passed
+/// re-check it after a timeout.
 ///
 /// Never returns 0, which `WaitNamedPipeW` reads as
 /// `NMPWAIT_USE_DEFAULT_WAIT` (the pipe's default, typically 50 ms), nor

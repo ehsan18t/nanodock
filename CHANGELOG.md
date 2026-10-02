@@ -55,6 +55,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - A stale `DOCKER_HOST` that points at a closed loopback port (`tcp://127.0.0.1:2375` or `tcp://localhost:2375`) no longer adds about 2 to 2.5 seconds to every detection, stop, and kill on Windows, which retries a refused connect. Connect attempts to loopback addresses are capped at 250 ms; other addresses keep the 3 second cap.
 - `DOCKER_HOST` accepts the forms the Docker CLI accepts: `tcp://host` without a port (2375), a trailing slash or path after the address (ignored), surrounding whitespace, an uppercase scheme, and IPv6 addresses in brackets (`tcp://[::1]:2375`, `tcp://[::1]`). Before, these were passed to the resolver as written and failed, so only the default endpoints were used.
 - An `npipe://` `DOCKER_HOST` must name a named pipe (`//./pipe/<name>` or `//<host>/pipe/<name>`). A value such as `npipe://C:/x.txt` is ignored instead of having an ordinary file opened and sent HTTP requests. Unsupported schemes (`ssh://`, `fd://`, `http://`) are still ignored and are now logged at debug level.
+- Detection no longer panics when the operating system cannot start a thread. `start_detection` reports `Error::Io` through its handle, and an endpoint whose query thread cannot start counts as an `Error::Io` failure while the other endpoints are still queried. The threads are named `nanodock-detect` and `nanodock-query`.
 
 ### Migrating from 0.1
 

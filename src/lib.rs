@@ -872,14 +872,17 @@ impl Client {
     /// Other work (socket enumeration, process lookups) can run while the
     /// daemons are queried; collect the result from the returned
     /// [`DetectionHandle`]. Detection parses each daemon's list leniently,
-    /// skipping malformed container entries instead of failing.
+    /// skipping malformed container entries instead of failing. If the
+    /// operating system cannot start the thread, the handle reports
+    /// [`Error::Io`] at once.
     #[must_use]
     pub fn start_detection(&self) -> DetectionHandle {
         let (tx, rx) = std::sync::mpsc::channel();
         let started = Instant::now();
         let client = self.clone();
         debug!("starting container runtime detection");
-        std::thread::spawn(move || {
+        let worker_tx = tx.clone();
+        let spawned = ipc::spawn_detached("nanodock-detect", move || {
             let result = client.query_daemon(started);
             match &result {
                 Ok(map) => debug!(
@@ -889,8 +892,16 @@ impl Client {
                 Err(error) => debug!("container runtime detection failed: {error}"),
             }
             // Ignore send error: receiver may have timed out and been dropped.
-            drop(tx.send(result));
+            drop(worker_tx.send(result));
         });
+        if let Err(source) = spawned {
+            // The handle reports the failure at once instead of waiting
+            // for a result that cannot come.
+            drop(tx.send(Err(Error::Io {
+                source,
+                endpoint: None,
+            })));
+        }
         DetectionHandle {
             receiver: rx,
             deadline: started + self.timeout,
@@ -1000,8 +1011,9 @@ impl DetectionHandle {
     /// # Errors
     ///
     /// Fails with the most informative endpoint failure when no daemon
-    /// produced a container list (see [`Error`]), or with
-    /// [`Error::Timeout`] when the client's timeout passed first.
+    /// produced a container list (see [`Error`]), with [`Error::Timeout`]
+    /// when the client's timeout passed first, or with [`Error::Io`] when
+    /// the detection thread could not be started.
     pub fn wait_result(self) -> Result<ContainerPortMap, Error> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         match self.receiver.recv_timeout(remaining) {
@@ -1465,6 +1477,20 @@ where
             Ok(body) => responses.push((priority, from_docker_host, body)),
             Err(error) => failures.push((priority, error)),
         }
+    }
+    // A target whose thread could not be started was never queried: the
+    // failure is local, so it names no endpoint.
+    for (priority, source) in fan_out.spawn_failures {
+        if let Some(name) = unfinished.get_mut(priority) {
+            *name = None;
+        }
+        failures.push((
+            priority,
+            Error::Io {
+                source,
+                endpoint: None,
+            },
+        ));
     }
 
     if responses.is_empty() {

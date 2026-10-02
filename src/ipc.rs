@@ -292,6 +292,22 @@ pub struct FanOut<T> {
     pub results: Vec<T>,
     /// Workers still running at the deadline; their results are dropped.
     pub unfinished: usize,
+    /// Candidates whose worker thread could not be started, by their
+    /// position in the candidate list, with the error.
+    pub spawn_failures: Vec<(usize, io::Error)>,
+}
+
+/// Start `work` on a detached thread named `name`.
+///
+/// Fails, instead of panicking like `std::thread::spawn`, when the OS cannot
+/// create the thread (for example when the process is out of threads or
+/// memory).
+pub fn spawn_detached(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(work)
+        .map(drop)
+        .inspect_err(|error| debug!("failed to start thread: name={name} error={error}"))
 }
 
 /// Query every candidate on its own thread and collect the results that
@@ -302,6 +318,8 @@ pub struct FanOut<T> {
 /// detached rather than joined: a stuck endpoint must not delay or discard
 /// the answers of the others. Detached workers are bounded by their own
 /// transport deadline, and their late results are dropped with the channel.
+/// A candidate whose thread cannot be started is listed in
+/// [`FanOut::spawn_failures`]; the others still run.
 pub fn fetch_all<P, T, I, F>(candidates: I, fetch: F, deadline: Instant) -> FanOut<T>
 where
     P: Send + 'static,
@@ -309,19 +327,38 @@ where
     I: IntoIterator<Item = P>,
     F: Fn(P) -> T + Send + Sync + 'static,
 {
+    fetch_all_with(candidates, fetch, deadline, |work| {
+        spawn_detached("nanodock-query", work)
+    })
+}
+
+/// [`fetch_all`] with the thread spawner passed in, so tests can make it
+/// fail.
+fn fetch_all_with<P, T, I, F, S>(candidates: I, fetch: F, deadline: Instant, spawn: S) -> FanOut<T>
+where
+    P: Send + 'static,
+    T: Send + 'static,
+    I: IntoIterator<Item = P>,
+    F: Fn(P) -> T + Send + Sync + 'static,
+    S: Fn(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+{
     let (tx, rx) = std::sync::mpsc::channel();
     let fetch = std::sync::Arc::new(fetch);
     let mut spawned = 0_usize;
+    let mut spawn_failures = Vec::new();
 
-    for candidate in candidates {
-        spawned += 1;
+    for (position, candidate) in candidates.into_iter().enumerate() {
         let tx = tx.clone();
         let fetch = std::sync::Arc::clone(&fetch);
         // Detached on purpose: the collector below never joins workers.
-        drop(std::thread::spawn(move || {
+        let started = spawn(Box::new(move || {
             // The receiver is gone once the deadline passed; ignore that.
             drop(tx.send(fetch(candidate)));
         }));
+        match started {
+            Ok(()) => spawned += 1,
+            Err(error) => spawn_failures.push((position, error)),
+        }
     }
 
     drop(tx);
@@ -342,6 +379,7 @@ where
     FanOut {
         unfinished: spawned.saturating_sub(results.len()),
         results,
+        spawn_failures,
     }
 }
 
@@ -1491,6 +1529,52 @@ mod tests {
             "every successful candidate should be returned"
         );
         assert_eq!(fan_out.unfinished, 0, "every worker reported back");
+    }
+
+    #[test]
+    fn fetch_all_reports_workers_that_cannot_start() {
+        let attempts = std::cell::Cell::new(0_usize);
+        let fan_out = fetch_all_with(
+            [1_u8, 2, 3],
+            |candidate| candidate,
+            Instant::now() + Duration::from_secs(5),
+            |work| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 2 {
+                    Err(io::Error::other("no threads left"))
+                } else {
+                    spawn_detached("nanodock-test", work)
+                }
+            },
+        );
+        let mut results = fan_out.results;
+        results.sort_unstable();
+
+        assert_eq!(results, vec![1, 3], "the other candidates still run");
+        assert_eq!(
+            fan_out.unfinished, 0,
+            "a worker that never started is not waited for"
+        );
+        let failed: Vec<usize> = fan_out
+            .spawn_failures
+            .iter()
+            .map(|(position, _)| *position)
+            .collect();
+        assert_eq!(
+            failed,
+            vec![1],
+            "the failure names the candidate's position"
+        );
+    }
+
+    #[test]
+    fn fetch_all_workers_are_named() {
+        let fan_out = fetch_all(
+            [()],
+            |()| std::thread::current().name().map(str::to_string),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(fan_out.results, vec![Some("nanodock-query".to_string())]);
     }
 
     #[test]

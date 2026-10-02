@@ -80,7 +80,7 @@ To run the instruction benchmarks locally on Linux:
 
 ```bash
 sudo apt-get install valgrind
-cargo install --version 0.18.1 gungraun-runner
+cargo install --version 0.18.2 gungraun-runner
 cargo bench --bench benchmarks
 ```
 

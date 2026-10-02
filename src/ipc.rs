@@ -1072,6 +1072,26 @@ const fn connect_attempt_cap(socket_addr: &std::net::SocketAddr) -> Duration {
     }
 }
 
+/// Report a loopback connect attempt that [`LOOPBACK_CONNECT_ATTEMPT_TIMEOUT`]
+/// ended, rather than the overall deadline, as refused.
+///
+/// A loopback connect is accepted at once when something listens. Windows
+/// answers a refused loopback connect by retrying for about 2 seconds
+/// instead of failing, so an attempt the cap cut short means nothing
+/// listens there, which Linux and macOS report as refused at once.
+/// Reporting it the same way keeps a stale `DOCKER_HOST` on a closed
+/// loopback port from turning "no daemon found" into a timeout.
+fn loopback_timeout_as_refused(error: io::Error, ended_by_loopback_cap: bool) -> io::Error {
+    if ended_by_loopback_cap && is_timeout(error.kind()) {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "nothing accepted the loopback connection within the loopback connect cap",
+        )
+    } else {
+        error
+    }
+}
+
 /// Connect to a Docker/Podman daemon over plain TCP (`DOCKER_HOST` set to
 /// `tcp://host:port`) and apply `deadline` to all I/O.
 pub fn connect_tcp(
@@ -1104,14 +1124,16 @@ fn connect_tcp_stream(addr: &str, deadline: Instant) -> io::Result<std::net::Tcp
             debug!("container runtime TCP connect deadline expired: tcp={addr}");
             return Err(io::ErrorKind::TimedOut.into());
         };
-        let attempt_timeout = remaining.min(connect_attempt_cap(&socket_addr));
-        match std::net::TcpStream::connect_timeout(&socket_addr, attempt_timeout) {
+        let cap = connect_attempt_cap(&socket_addr);
+        match std::net::TcpStream::connect_timeout(&socket_addr, remaining.min(cap)) {
             Ok(stream) => return Ok(stream),
             Err(error) => {
                 debug!(
                     "failed to connect to container runtime TCP address: socket_addr={socket_addr} error={error}"
                 );
-                last_error = error;
+                let ended_by_loopback_cap =
+                    cap == LOOPBACK_CONNECT_ATTEMPT_TIMEOUT && remaining > cap;
+                last_error = loopback_timeout_as_refused(error, ended_by_loopback_cap);
             }
         }
     }
@@ -2064,10 +2086,33 @@ mod tests {
         let result = connect_tcp_stream(&addr, started + Duration::from_secs(5));
         let elapsed = started.elapsed();
 
-        assert!(result.is_err(), "nothing listens on {addr}");
+        let error = result.expect_err("nothing listens");
         assert!(
             elapsed < Duration::from_secs(1),
             "a refused loopback connect must not take {elapsed:?}"
+        );
+        assert!(
+            matches!(FetchError::from_connect_error(error), FetchError::NotFound),
+            "a refused loopback connect means no daemon on every platform"
+        );
+    }
+
+    #[test]
+    fn only_a_loopback_attempt_ended_by_its_cap_counts_as_refused() {
+        let timed_out = || io::Error::from(io::ErrorKind::TimedOut);
+        assert_eq!(
+            loopback_timeout_as_refused(timed_out(), true).kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+        assert_eq!(
+            loopback_timeout_as_refused(timed_out(), false).kind(),
+            io::ErrorKind::TimedOut,
+            "a connect the overall deadline ended stays a timeout"
+        );
+        assert_eq!(
+            loopback_timeout_as_refused(io::ErrorKind::PermissionDenied.into(), true).kind(),
+            io::ErrorKind::PermissionDenied,
+            "other failures are kept"
         );
     }
 

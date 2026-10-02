@@ -369,6 +369,16 @@ fn container_info(container: &DockerContainer<'_>) -> ContainerInfo {
 /// in total. Past the cap the rest of the response is ignored; the bindings
 /// already inserted are kept.
 fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'_>]) {
+    // Size the map once instead of growing it while a range is expanded.
+    let expected = containers
+        .iter()
+        .filter_map(|container| container.ports.as_deref())
+        .flatten()
+        .filter_map(port_span)
+        .map(|(_, first, last, _)| usize::from(last - first) + 1)
+        .fold(0, usize::saturating_add);
+    map.reserve(expected.min(MAX_PORT_BINDINGS));
+
     let mut remaining = MAX_PORT_BINDINGS;
     for container in containers {
         let Some(ports) = &container.ports else {
@@ -1158,5 +1168,24 @@ mod tests {
         let map = parse_containers_json(json);
         assert_eq!(map.len(), 6, "a range ends at port 65535");
         assert!(map.get(None, 65535, Protocol::Tcp).is_some());
+    }
+
+    #[test]
+    fn reserved_capacity_is_bounded_by_the_binding_cap() {
+        let entries: Vec<String> = (1..200)
+            .map(|first| format!(r#"{{"host_port": {first}, "range": 65535}}"#))
+            .collect();
+        let json = containers_with_ports(&[&entries.join(",")]);
+        let map = parse_containers_json(&json);
+        assert!(
+            map.bindings.capacity() < 4 * MAX_PORT_BINDINGS,
+            "the map is sized for at most the cap, got capacity {}",
+            map.bindings.capacity()
+        );
+
+        let range = containers_with_ports(&[r#"{"host_port": 10000, "range": 10001}"#]);
+        let map = parse_containers_json(&range);
+        assert_eq!(map.len(), 10_001);
+        assert!(map.bindings.capacity() >= 10_001);
     }
 }

@@ -562,6 +562,11 @@ impl ContainerPortMap {
         }
     }
 
+    /// Make room for at least `additional` more bindings.
+    fn reserve(&mut self, additional: usize) {
+        self.bindings.reserve(additional);
+    }
+
     /// Add every binding of `other`, replacing bindings with the same key.
     fn merge(&mut self, other: Self) {
         self.bindings.extend(other.bindings);

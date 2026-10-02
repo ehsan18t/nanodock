@@ -412,7 +412,7 @@ fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'
     if dropped > 0 {
         map.mark_truncated();
         warn!(
-            "container list expands to more than {MAX_PORT_BINDINGS} port bindings;              {dropped} bindings were dropped"
+            "container list expands to more than {MAX_PORT_BINDINGS} port bindings; {dropped} bindings were dropped"
         );
     }
 }

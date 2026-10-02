@@ -2293,8 +2293,13 @@ mod tests {
             targets.first(),
             Some(&(true, DaemonEndpoint::Tcp("10.0.0.1:2375".to_string())))
         );
-        assert!(
-            targets.len() > 1,
+        // The defaults that exist depend on the host (a macOS runner has no
+        // Docker socket at all), so compare with a client without the
+        // override instead of counting them.
+        let defaults = Client::new().home(None).docker_host(None);
+        assert_eq!(
+            targets.get(1..),
+            Some(defaults.detection_targets().as_slice()),
             "a tcp:// daemon never replaces the default endpoints"
         );
     }

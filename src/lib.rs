@@ -905,9 +905,12 @@ impl Client {
     /// still running 10 seconds later. Use [`Client::kill`] to kill it at
     /// once.
     ///
-    /// The `id` can be a container ID (hex) or a container name. Characters
-    /// that would corrupt the HTTP request path (`/`, `?`, `#`, `%`, control
-    /// characters, spaces) are rejected early with [`StopOutcome::NotFound`].
+    /// The `id` can be a container ID (hex), a unique ID prefix, or a
+    /// container name. An `id` that cannot name a container is rejected with
+    /// [`StopOutcome::NotFound`] before any daemon is contacted: it must
+    /// start with an ASCII letter or digit, continue with ASCII letters,
+    /// digits, `_`, `.`, or `-`, and be at most 256 bytes long (the name
+    /// pattern Docker and Podman enforce).
     ///
     /// Tries the same daemons as detection, in priority order
     /// (`DOCKER_HOST` first, then the platform defaults; a `unix://`
@@ -953,7 +956,7 @@ impl Client {
     /// Validate `id` and send a stop or kill request for it.
     fn send_stop(&self, id: &str, kind: StopKind) -> StopOutcome {
         if !is_safe_container_id(id) {
-            debug!("rejected container id with unsafe characters");
+            debug!("rejected a container id that cannot name a container");
             return StopOutcome::NotFound;
         }
 
@@ -1078,8 +1081,8 @@ pub enum StopOutcome {
     Stopped,
     /// Container was already stopped (HTTP 304 for stop, 409 for kill).
     AlreadyStopped,
-    /// Container was not found (HTTP 404), or the id contains characters
-    /// that cannot name a container.
+    /// Container was not found (HTTP 404), or the id cannot name a
+    /// container.
     NotFound,
     /// No daemon could be contacted, so no daemon received the request and
     /// the container was not touched.
@@ -1143,17 +1146,24 @@ fn stop_endpoint(id: &str, kind: StopKind) -> String {
     endpoint
 }
 
-/// Reject container IDs that would corrupt the HTTP request line.
+/// Longest container id or name a stop or kill request accepts. A full ID
+/// is 64 hex digits; the cap only keeps a hostile id out of the request.
+const MAX_CONTAINER_ID_LEN: usize = 256;
+
+/// Whether `id` can name a container: Docker's and Podman's name pattern
+/// `[A-Za-z0-9][A-Za-z0-9_.-]*`, which hex IDs and ID prefixes also match,
+/// at most [`MAX_CONTAINER_ID_LEN`] bytes long.
 ///
-/// Docker accepts both hex IDs and container names (alphanumeric, hyphens,
-/// underscores, dots). This function rejects only characters that could
-/// cause path traversal or HTTP header injection: `/`, `?`, `#`, `%`,
-/// spaces, and every control character.
+/// An allow-list keeps everything that could change the request out of the
+/// path: `/`, `?`, `#`, `%`, spaces, control characters, `.` and `..`, and
+/// every non-ASCII character (line separators, zero-width characters).
 fn is_safe_container_id(id: &str) -> bool {
-    !id.is_empty()
-        && !id
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '?' | '#' | '%' | ' '))
+    let bytes = id.as_bytes();
+    bytes.len() <= MAX_CONTAINER_ID_LEN
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 /// Map the combined result of a stop request to `StopOutcome`.
@@ -1927,72 +1937,60 @@ mod tests {
     // ── is_safe_container_id ─────────────────────────────────────────
 
     #[test]
-    fn safe_id_accepts_hex_id() {
-        assert!(
-            is_safe_container_id("abc123def456"),
-            "hex ID should be valid"
-        );
-    }
+    fn safe_id_accepts_only_container_names_and_ids() {
+        let longest = "a".repeat(MAX_CONTAINER_ID_LEN);
+        let accepted = [
+            ("abc123def456", "short hex ID"),
+            (
+                "e603f8ebd438b8405b9b835b9d38cb913ea2479f5b29f8e4308b88e9a92e8c4b",
+                "full hex ID",
+            ),
+            ("a", "one-character ID prefix"),
+            (
+                "my-container_1.0",
+                "name with hyphens, underscores, and dots",
+            ),
+            ("9to5", "name starting with a digit"),
+            (longest.as_str(), "name at the length cap"),
+        ];
+        for (id, why) in accepted {
+            assert!(is_safe_container_id(id), "{why} should be accepted: {id:?}");
+        }
 
-    #[test]
-    fn safe_id_accepts_container_name() {
-        assert!(
-            is_safe_container_id("my-container_1.0"),
-            "name with hyphens, underscores, dots should be valid"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_empty() {
-        assert!(!is_safe_container_id(""), "empty ID should be rejected");
-    }
-
-    #[test]
-    fn safe_id_rejects_path_traversal() {
-        assert!(
-            !is_safe_container_id("../../../etc/passwd"),
-            "path traversal should be rejected"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_query_injection() {
-        assert!(
-            !is_safe_container_id("abc?signal=SIGKILL"),
-            "query injection should be rejected"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_crlf_injection() {
-        assert!(
-            !is_safe_container_id("abc\r\nX-Injected: true"),
-            "CRLF injection should be rejected"
-        );
-    }
-
-    #[test]
-    fn safe_id_rejects_every_control_character() {
-        for id in [
-            "abc\tdef",
-            "abc\0",
-            "abc\u{7f}",
-            "abc\u{85}",
-            "abc\u{1b}[0m",
-        ] {
+        let too_long = "a".repeat(MAX_CONTAINER_ID_LEN + 1);
+        let huge = "a".repeat(100 * 1024);
+        let rejected = [
+            ("", "empty ID"),
+            (".", "current directory"),
+            ("..", "parent directory"),
+            ("../../../etc/passwd", "path traversal"),
+            ("-abc", "leading hyphen"),
+            ("_abc", "leading underscore"),
+            (".abc", "leading dot"),
+            ("abc?signal=SIGKILL", "query injection"),
+            ("abc#frag", "fragment"),
+            ("abc%2F..", "percent encoding"),
+            ("abc def", "space"),
+            ("abc\r\nX-Injected: true", "CRLF injection"),
+            ("abc\tdef", "tab"),
+            ("abc\0", "NUL"),
+            ("abc\u{7f}", "DEL"),
+            ("abc\u{85}", "C1 control character"),
+            ("abc\u{1b}[0m", "escape sequence"),
+            ("abc\u{2028}", "line separator"),
+            ("abc\u{200b}def", "zero-width space"),
+            ("\u{feff}abc", "byte order mark"),
+            ("caf\u{e9}-container", "non-ASCII name"),
+            (too_long.as_str(), "one byte past the length cap"),
+            (huge.as_str(), "100 KiB ID"),
+        ];
+        for (id, why) in rejected {
             assert!(
                 !is_safe_container_id(id),
-                "control character in {id:?} should be rejected"
+                "{why} should be rejected: {:?}",
+                id.get(..40).unwrap_or(id)
             );
         }
-    }
-
-    #[test]
-    fn safe_id_accepts_non_ascii_name() {
-        assert!(
-            is_safe_container_id("caf\u{e9}-container"),
-            "non-ASCII printable characters do not corrupt the request line"
-        );
     }
 
     // ── stop_endpoint ────────────────────────────────────────────────
@@ -2033,9 +2031,9 @@ mod tests {
         drop(log::set_logger(&ENABLED_LOGGER));
         log::set_max_level(log::LevelFilter::Debug);
 
-        // Byte 12 falls inside the two-byte 'e9' character.
+        // Byte 12 falls inside the two-byte 'e9' character. Validation
+        // rejects such an id, but logging must not rely on that.
         let id = "aaaaaaaaaaa\u{e9}bc";
-        assert!(is_safe_container_id(id), "non-ASCII ids pass validation");
         assert_eq!(
             stop_endpoint(id, StopKind::Graceful),
             format!("/containers/{id}/stop?t={}", ipc::STOP_GRACE_SECS),

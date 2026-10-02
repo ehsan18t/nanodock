@@ -272,7 +272,11 @@ jobs:
   # same socket directly, so the tests never depend on that detail.
   podman-it:
     name: Rootless Podman Integration (Linux)
-    runs-on: ubuntu-latest
+    # Pinned: Ubuntu 24.04 ships Podman 4.9, whose rootless containers
+    # publish ports through slirp4netns and a rootlessport process, which
+    # the resolver test needs. Podman 5 on newer images defaults to pasta,
+    # which binds the port itself and runs no rootlessport process.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       NANODOCK_IT_PODMAN_NAME: pweb
@@ -303,7 +307,7 @@ jobs:
       - name: Install Podman
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman slirp4netns uidmap
+          sudo apt-get install -y podman slirp4netns uidmap catatonit
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           podman --version
 
@@ -341,6 +345,10 @@ jobs:
 
       # The fully qualified image avoids Podman's short-name prompt, and
       # slirp4netns makes the rootlessport helper hold the published port.
+      # `--init` runs catatonit (installed above, at Podman's default init
+      # path) as PID 1 and forwards SIGTERM to httpd, which ignores SIGTERM
+      # when it is PID 1 itself, so the stop test does not wait out the
+      # 10 second grace period.
       - name: Start the test containers
         run: |
           for attempt in 1 2 3 4 5; do
@@ -349,7 +357,7 @@ jobs:
             echo "pull attempt $attempt failed, retrying"
             sleep $((attempt * 5))
           done
-          podman run -d --network slirp4netns -p "$NANODOCK_IT_PODMAN_PORT:80" \
+          podman run -d --init --network slirp4netns -p "$NANODOCK_IT_PODMAN_PORT:80" \
             --name "$NANODOCK_IT_PODMAN_NAME" docker.io/library/busybox httpd -f -p 80
           docker run -d --init --name "$NANODOCK_IT_DOCKER_NAME" \
             -p "$NANODOCK_IT_DOCKER_PORT:80" busybox httpd -f -p 80

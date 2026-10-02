@@ -48,25 +48,27 @@ The Clippy gate uses `scripts/check-platform-clippy.sh` on shell-based setups an
 
 ## Quality Gates
 
-All of the following must pass before merging:
+This is the one list of the quality gates; the hooks, the CI workflow, and the agent instructions refer to it. All of them must pass before merging. The pre-commit hook runs gates 1 to 3 and the pre-push hook runs all seven. CI runs gates 1 to 6 in the quality gate job on Linux, Windows, and macOS (clippy natively on each, with and without `--all-features`) and gate 7 in the audit job.
 
-| Gate | Command                                                                  | Purpose                                             |
-| ---- | ------------------------------------------------------------------------ | --------------------------------------------------- |
-| 1    | `cargo fmt --check`                                                      | Consistent formatting                               |
-| 2    | `scripts/check-platform-clippy.sh` / `scripts/check-platform-clippy.ps1` | Zero lint warnings across Linux + Windows cfg paths |
-| 3    | `cargo test --lib --tests && cargo test --doc`                           | All tests pass                                      |
-| 4    | `cargo bench --no-run`                                                   | Benchmarks compile                                  |
-| 5    | `cargo build`                                                            | Library compiles                                    |
-| 6    | `cargo doc --no-deps`                                                    | Documentation builds                                |
-| 7    | `cargo deny check`                                                       | No vulnerable/banned deps                           |
+| Gate | Command                                                                                | Purpose                                             |
+| ---- | -------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| 1    | `cargo fmt --all -- --check`                                                           | Consistent formatting                               |
+| 2    | `scripts/check-platform-clippy.sh` / `scripts/check-platform-clippy.ps1`               | Zero lint warnings across Linux + Windows cfg paths |
+| 3    | `cargo test --locked --lib --tests --all-features && cargo test --locked --doc --all-features` | Unit, integration, property, and doc tests pass |
+| 4    | `cargo bench --locked --no-run`                                                        | Benchmarks compile                                  |
+| 5    | `cargo build --locked`                                                                 | Library compiles                                    |
+| 6    | `cargo doc --locked --no-deps --all-features` with the CI `RUSTDOCFLAGS`              | Documentation builds without warnings               |
+| 7    | `cargo deny check`                                                                     | No vulnerable, banned, or unlicensed dependencies   |
 
 CI runs on every push to `main` **and** on every pull request targeting `main`, so cross-platform issues (Linux + Windows + macOS matrix) are caught before a PR is merged.
 
-The crate has one optional feature, `serde`, which derives `Serialize` and `Deserialize` on the public data types. The local hooks check the default features; CI also runs clippy with `--all-features` and runs the tests and docs with `--all-features`. Before pushing a change that touches a `cfg_attr(feature = "serde", ...)` attribute, run `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --lib --tests --all-features` too.
+The crate has one optional feature, `serde`, which derives `Serialize` and `Deserialize` on the public data types. The local hooks run the tests and docs with `--all-features`, as CI does, and every hook cargo command uses `--locked`. The cross-target clippy script checks the default features; CI also runs clippy with `--all-features`, so before pushing a change that touches a `cfg_attr(feature = "serde", ...)` attribute, run `cargo clippy --all-targets --all-features -- -D warnings` too.
 
 A separate MSRV job runs `cargo check --locked --all-targets --all-features` on Rust 1.89, the `rust-version` declared in `Cargo.toml`. Development and the lint gates use the latest stable toolchain, but code must keep compiling on 1.89; raising the MSRV is a deliberate change that updates `rust-version`, this job, and the README together.
 
 A package job runs `cargo package --locked --list` and `cargo publish --locked --dry-run`, which builds the packaged crate from only the files Cargo.toml `include` ships. If you add a file the crate needs at build time, add it to `include` too.
+
+Two Linux jobs run the tests that need a live container runtime. `docker-it` starts containers on the runner's Docker Engine and runs `tests/daemon_it.rs` over the Unix socket and then over a TCP `DOCKER_HOST` (a socat forwarder, with the local socket made root-only so the test can only succeed over TCP). `podman-it` installs Podman, enables the rootless API socket, and runs `tests/podman_it.rs`: one detection merging a Podman and a Docker container, the `rootlessport` resolver, and a stop that falls through Docker's 404 to Podman. Container names and ports come from `NANODOCK_IT_*` variables in each job's `env`, which the tests read with the same defaults.
 
 Workflow dependencies in `.github/workflows/` are pinned to full commit SHAs. When updating an action, keep the trailing version comment (for example `# v6`) so reviewers can see the intended upstream release at a glance.
 
@@ -80,7 +82,7 @@ To run the instruction benchmarks locally on Linux:
 
 ```bash
 sudo apt-get install valgrind
-cargo install --version 0.18.1 gungraun-runner
+cargo install --version 0.18.2 gungraun-runner
 cargo bench --bench benchmarks
 ```
 
@@ -118,12 +120,12 @@ src/
 
 ## Coding Standards
 
-- **Clippy:** `all + pedantic + nursery` at deny level
+- **Clippy:** `all + pedantic + nursery` at deny level, plus `unwrap_used` and `undocumented_unsafe_blocks`
 - **Error handling:** public fallible functions return the crate's own `Error` (or `ParseError`), never a third-party error type; the best-effort detection path returns an empty map instead of an error
-- **No `unwrap()`** outside of tests
+- **No `unwrap()`** outside of tests, and every `unsafe` block has a `// SAFETY:` comment
 - **Doc comments** on every public item
 - **Functions <= 100 lines**, cognitive complexity <= 30
-- **No `dbg!()`, `todo!()`, `unimplemented!()`**
+- **No `dbg!()`, `todo!()`, `unimplemented!()`, or `std::process::abort`**
 
 ---
 
@@ -135,12 +137,13 @@ Follow [Conventional Commits](https://www.conventionalcommits.org):
 <type>(<scope>): <description>
 ```
 
-Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`, `enforce`.
 
 Rules:
 - Description starts lowercase, 5-200 characters
 - No trailing period
 - Scope is optional, lowercase, alphanumeric + hyphens
+- No `!` breaking-change marker; the commit-msg hook rejects it
 
 Good examples:
 ```
@@ -156,12 +159,17 @@ docs: update README with rootless Podman section
 
 - Unit tests live in `#[cfg(test)] mod tests` inside each module
 - Use `assert_eq!` with descriptive messages
-- Tests requiring a running Docker/Podman daemon should be `#[ignore]`-d with a comment explaining the requirement
+- Integration tests in `tests/` use only the public API
+- `tests/proptest_parsers.rs` holds the property tests: the JSON parsers never panic and agree with each other, and the port map, `is_container_proxy_process`, and `short_container_id` keep their documented contracts. Keep case counts moderate so the file runs in seconds.
+- Tests that need a live daemon return early unless their opt-in variable is set, so they pass as no-ops everywhere else. `tests/daemon_it.rs` runs with `NANODOCK_IT=1` (Docker) and its `tcp_` tests with `NANODOCK_IT_TCP_HOST=tcp://host:port`; `tests/podman_it.rs` runs with `NANODOCK_IT_PODMAN=1` (rootless Podman, Linux). Each file's header lists the containers it expects; run them with `--test-threads=1`.
 
 ```bash
 # A plain `cargo test` would also try to run the Gungraun benchmarks.
 cargo test --lib --tests
 cargo test --doc
+
+# Against a local Docker daemon with the CI containers started:
+NANODOCK_IT=1 cargo test --test daemon_it -- --test-threads=1
 ```
 
 ---
@@ -169,6 +177,6 @@ cargo test --doc
 ## Dependency Policy
 
 - Prefer `std` over external crates
-- Only MIT / Apache-2.0 / BSD / MPL-2.0 licensed crates
+- Only licenses on the `deny.toml` allowlist (currently MIT, Apache-2.0, and Unicode-3.0, alone or as one option of an `OR` expression)
 - `cargo deny check` must pass
 - Do not add new dependencies without maintainer approval

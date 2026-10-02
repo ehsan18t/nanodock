@@ -2,15 +2,10 @@
 # nanodock - Pre-commit hook
 # Prevents committing code that doesn't pass quality gates.
 #
-# Install: copy this file to .git/hooks/pre-commit (or run the setup script)
-#          chmod +x .git/hooks/pre-commit  (Linux/macOS)
-#
-# What it checks:
-#   1. cargo fmt --check  - formatting
-#   2. cross-target clippy - lint violations across Linux + Windows targets
-#   3. cargo test          - all tests pass
+# Install: scripts/install-hooks.sh (Linux/macOS) or scripts/install-hooks.ps1
+# (Windows). The gates are listed in docs/CONTRIBUTING.md (Quality Gates).
 
-set -e
+set -eu
 
 ensure_cargo() {
     if command -v cargo >/dev/null 2>&1; then
@@ -70,14 +65,14 @@ echo "  ✓ Cross-target clippy OK"
 
 # Gate 3: Tests
 echo "→ Running tests..."
-if ! cargo test --lib --tests; then
+if ! cargo test --locked --lib --tests --all-features; then
     echo ""
     echo "✗ TESTS FAILED"
     echo "  Fix the failing unit or integration tests, then try committing again."
     exit 1
 fi
 
-if ! cargo test --doc; then
+if ! cargo test --locked --doc --all-features; then
     echo ""
     echo "✗ TESTS FAILED"
     echo "  Fix the failing doctests, then try committing again."

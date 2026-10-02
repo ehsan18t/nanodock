@@ -3,8 +3,8 @@ REM nanodock - Pre-push hook (Windows batch version)
 REM Runs the full quality gate before pushing to remote.
 REM This mirrors the CI checks so issues are caught locally before a PR.
 REM
-REM Install: copy this file to .git\hooks\pre-push
-REM          (remove the .bat extension when copying)
+REM Install: scripts\install-hooks.ps1. The gates are listed in
+REM docs\CONTRIBUTING.md (Quality Gates).
 
 echo ======================================
 echo   nanodock Pre-Push Quality Gate
@@ -44,7 +44,7 @@ echo   OK Cross-target clippy
 
 REM Gate 3: Tests
 echo -^> [3/7] Running tests...
-cargo test --lib --tests
+cargo test --locked --lib --tests --all-features
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X TESTS FAILED
@@ -52,7 +52,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-cargo test --doc
+cargo test --locked --doc --all-features
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X TESTS FAILED
@@ -64,7 +64,7 @@ echo   OK Tests
 REM Gate 4: Benchmarks compile on all platforms. Actual execution requires
 REM valgrind plus gungraun-runner and is enforced in Linux CI.
 echo -^> [4/7] Compiling benchmarks...
-cargo bench --no-run
+cargo bench --locked --no-run
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X BENCHMARK COMPILE FAILED
@@ -75,7 +75,7 @@ echo   OK Benchmarks
 
 REM Gate 5: Library build
 echo -^> [5/7] Building library...
-cargo build
+cargo build --locked
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X BUILD FAILED
@@ -87,7 +87,7 @@ echo   OK Build
 REM Gate 6: Documentation
 echo -^> [6/7] Building docs...
 set "RUSTDOCFLAGS=-D warnings -D rustdoc::bare_urls -D rustdoc::invalid_rust_codeblocks -D rustdoc::private_intra_doc_links -D rustdoc::unescaped_backticks"
-cargo doc --no-deps
+cargo doc --locked --no-deps --all-features
 if %ERRORLEVEL% neq 0 (
     echo.
     echo X DOCUMENTATION BUILD FAILED
@@ -96,29 +96,32 @@ if %ERRORLEVEL% neq 0 (
 )
 echo   OK Docs
 
-REM Gate 7: Dependency audit (optional)
+REM Gate 7: Dependency audit (optional). `if errorlevel` is read when the
+REM line runs; %ERRORLEVEL% inside a parenthesized block is expanded before
+REM the block runs, so a failed audit used to be reported as OK.
 echo -^> [7/7] Auditing dependencies...
 where cargo-deny >nul 2>nul
-if %ERRORLEVEL% equ 0 (
-    cargo deny check 2>nul
-    if %ERRORLEVEL% neq 0 (
-        echo   Warning: First attempt failed, clearing advisory-db cache...
-        if exist "%USERPROFILE%\.cargo\advisory-dbs" rd /s /q "%USERPROFILE%\.cargo\advisory-dbs"
-        if exist "%USERPROFILE%\.cargo\advisory-db" rd /s /q "%USERPROFILE%\.cargo\advisory-db"
-        cargo deny check 2>nul
-        if %ERRORLEVEL% neq 0 (
-            echo.
-            echo   WARNING: DEPENDENCY AUDIT FAILED ^(non-blocking^)
-            echo   CI will enforce this check on the pull request.
-        ) else (
-            echo   OK Dependency audit ^(after cache clear^)
-        )
-    ) else (
-        echo   OK Dependency audit
-    )
-) else (
+if errorlevel 1 (
     echo   SKIP cargo-deny not installed ^(install: cargo install cargo-deny^)
+    goto audit_done
 )
+cargo deny check 2>nul
+if not errorlevel 1 (
+    echo   OK Dependency audit
+    goto audit_done
+)
+echo   Warning: First attempt failed, clearing advisory-db cache...
+if exist "%USERPROFILE%\.cargo\advisory-dbs" rd /s /q "%USERPROFILE%\.cargo\advisory-dbs"
+if exist "%USERPROFILE%\.cargo\advisory-db" rd /s /q "%USERPROFILE%\.cargo\advisory-db"
+cargo deny check 2>nul
+if errorlevel 1 (
+    echo.
+    echo   WARNING: DEPENDENCY AUDIT FAILED ^(non-blocking^)
+    echo   CI will enforce this check on the pull request.
+) else (
+    echo   OK Dependency audit ^(after cache clear^)
+)
+:audit_done
 
 echo.
 echo All quality gates passed. Pushing...

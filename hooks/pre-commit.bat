@@ -11,6 +11,7 @@ echo ======================================
 echo.
 
 call :ensure_cargo
+if %ERRORLEVEL% neq 0 exit /b 1
 
 REM Gate 1: Formatting
 echo -^> Checking formatting...

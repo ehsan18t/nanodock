@@ -1233,16 +1233,24 @@ enum DaemonEndpoint {
 }
 
 impl DaemonEndpoint {
+    /// Connect to this endpoint; every read and write fails once `deadline`
+    /// has passed.
+    fn connect(&self, deadline: Instant) -> std::io::Result<Box<dyn ipc::Stream>> {
+        Ok(match self {
+            Self::Tcp(addr) => Box::new(ipc::connect_tcp(addr, deadline)?),
+            #[cfg(unix)]
+            Self::Unix(path) => Box::new(ipc::connect_unix(path, deadline)?),
+            #[cfg(windows)]
+            Self::Pipe(path) => Box::new(ipc::connect_pipe(path, deadline)?),
+        })
+    }
+
     /// Fetch the container list JSON body before `deadline`.
     fn fetch_json(&self, deadline: Instant) -> Result<String, Error> {
-        let result = match self {
-            Self::Tcp(addr) => ipc::fetch_tcp_json(addr, deadline),
-            #[cfg(unix)]
-            Self::Unix(path) => ipc::fetch_unix_socket_json(path, deadline),
-            #[cfg(windows)]
-            Self::Pipe(path) => ipc::fetch_named_pipe_json(path, deadline),
-        };
-        result.map_err(|error| self.error(error))
+        ipc::fetch_json(|deadline| self.connect(deadline), deadline).map_err(|error| {
+            debug!("container runtime returned no container list: endpoint={self} error={error:?}");
+            self.error(error)
+        })
     }
 
     /// Turn a transport failure at this endpoint into a public [`Error`].
@@ -1268,13 +1276,10 @@ impl DaemonEndpoint {
 
     /// Send a stop or kill request for `endpoint`.
     fn send_stop(&self, endpoint: &str) -> ipc::StopAttempt {
-        match self {
-            Self::Tcp(addr) => ipc::stop_via_tcp(addr, endpoint),
-            #[cfg(unix)]
-            Self::Unix(path) => ipc::stop_via_unix_socket(path, endpoint),
-            #[cfg(windows)]
-            Self::Pipe(path) => ipc::stop_via_named_pipe(path, endpoint),
-        }
+        let deadline = Instant::now() + ipc::STOP_TIMEOUT;
+        let attempt = ipc::stop_via(|deadline| self.connect(deadline), endpoint, deadline);
+        debug!("container runtime stop attempt: endpoint={self} attempt={attempt:?}");
+        attempt
     }
 }
 

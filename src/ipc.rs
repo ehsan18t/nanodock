@@ -84,7 +84,7 @@ fn remaining_until(deadline: Instant) -> Option<Duration> {
 // ---------------------------------------------------------------------------
 
 /// Sockets whose per-call read and write timeouts can be adjusted.
-trait SocketTimeouts {
+pub trait SocketTimeouts {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
@@ -116,7 +116,7 @@ impl SocketTimeouts for std::os::unix::net::UnixStream {
 /// trickles bytes slowly would never trip it. This wrapper sets the socket
 /// timeout to the time remaining before each call and returns
 /// [`io::ErrorKind::TimedOut`] once the deadline has passed.
-struct DeadlineStream<S> {
+pub struct DeadlineStream<S> {
     inner: S,
     deadline: Instant,
 }
@@ -457,23 +457,7 @@ pub fn unix_socket_paths(uid: u32, home: Option<std::path::PathBuf>) -> Vec<std:
 // Unix socket transport
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-pub fn fetch_unix_socket_json(
-    path: &std::path::Path,
-    deadline: Instant,
-) -> Result<String, FetchError> {
-    let stream = connect_unix_stream(path, "").map_err(FetchError::from_connect_error)?;
-    let mut stream = DeadlineStream::new(stream, deadline);
-    http::send_http_request(&mut stream).map_err(|error| {
-        debug!(
-            "container runtime socket returned no usable response: socket={} error={error:?}",
-            path.display()
-        );
-        FetchError::from(error)
-    })
-}
-
-/// Connect to a local Unix stream socket.
+/// Connect to a local Unix stream socket and apply `deadline` to all I/O.
 ///
 /// std offers no connect timeout for `UnixStream`. On a local socket
 /// `connect(2)` completes or fails immediately in practice: the kernel either
@@ -483,16 +467,18 @@ pub fn fetch_unix_socket_json(
 /// workers are detached at the deadline by [`fetch_all`], and all
 /// I/O after the connect runs under [`DeadlineStream`].
 #[cfg(unix)]
-fn connect_unix_stream(
+pub fn connect_unix(
     path: &std::path::Path,
-    operation_suffix: &str,
-) -> io::Result<std::os::unix::net::UnixStream> {
-    std::os::unix::net::UnixStream::connect(path).inspect_err(|error| {
-        debug!(
-            "failed to connect to container runtime socket{operation_suffix}: socket={} error={error}",
-            path.display()
-        );
-    })
+    deadline: Instant,
+) -> io::Result<DeadlineStream<std::os::unix::net::UnixStream>> {
+    std::os::unix::net::UnixStream::connect(path)
+        .map(|stream| DeadlineStream::new(stream, deadline))
+        .inspect_err(|error| {
+            debug!(
+                "failed to connect to container runtime socket: socket={} error={error}",
+                path.display()
+            );
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -537,24 +523,17 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// Open the named pipe at `path` and apply `deadline` to all I/O.
+///
+/// When every instance of the pipe is busy, waits for one with
+/// `WaitNamedPipeW`, but never past `deadline`.
 #[cfg(windows)]
-pub fn fetch_named_pipe_json(path: &str, deadline: Instant) -> Result<String, FetchError> {
-    let file = open_named_pipe(path, deadline, "").map_err(FetchError::from_connect_error)?;
-    let mut stream = PipeStream::new(file, deadline);
-    http::send_http_request(&mut stream).map_err(|error| {
-        debug!(
-            "container runtime named pipe returned no usable response: pipe={path} error={error:?}"
-        );
-        FetchError::from(error)
-    })
+pub fn connect_pipe(path: &str, deadline: Instant) -> io::Result<PipeStream> {
+    open_named_pipe(path, deadline).map(|file| PipeStream::new(file, deadline))
 }
 
 #[cfg(windows)]
-fn open_named_pipe(
-    path: &str,
-    deadline: Instant,
-    operation_suffix: &str,
-) -> io::Result<std::fs::File> {
+fn open_named_pipe(path: &str, deadline: Instant) -> io::Result<std::fs::File> {
     use std::fs::OpenOptions;
 
     loop {
@@ -564,9 +543,7 @@ fn open_named_pipe(
                 wait_named_pipe(path, deadline)?;
             }
             Err(error) => {
-                debug!(
-                    "failed to open container runtime named pipe{operation_suffix}: pipe={path} error={error}"
-                );
+                debug!("failed to open container runtime named pipe: pipe={path} error={error}");
                 return Err(error);
             }
         }
@@ -585,7 +562,7 @@ fn open_named_pipe(
 /// fails with [`io::ErrorKind::TimedOut`]. A pipe the server has closed
 /// reads as EOF.
 #[cfg(windows)]
-struct PipeStream {
+pub struct PipeStream {
     file: std::fs::File,
     deadline: Instant,
 }
@@ -730,21 +707,6 @@ const fn is_pipe_closed_code(code: Option<i32>) -> bool {
 // TCP transport
 // ---------------------------------------------------------------------------
 
-/// Connect to a Docker/Podman daemon over plain TCP and fetch container JSON.
-///
-/// Used when `DOCKER_HOST` is set to `tcp://host:port`. Connecting, writing
-/// and reading all share `deadline`.
-pub fn fetch_tcp_json(addr: &str, deadline: Instant) -> Result<String, FetchError> {
-    let stream = connect_tcp_stream(addr, deadline).map_err(FetchError::from_connect_error)?;
-    let mut stream = DeadlineStream::new(stream, deadline);
-    http::send_http_request(&mut stream).map_err(|error| {
-        debug!(
-            "container runtime TCP endpoint returned no usable response: tcp={addr} error={error:?}"
-        );
-        FetchError::from(error)
-    })
-}
-
 /// Upper bound for one TCP connect attempt.
 ///
 /// A stop request has a long overall deadline ([`STOP_TIMEOUT`]) to cover
@@ -752,6 +714,15 @@ pub fn fetch_tcp_json(addr: &str, deadline: Instant) -> Result<String, FetchErro
 /// keeps one unreachable address from using up the whole deadline before
 /// the other resolved addresses are tried.
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Connect to a Docker/Podman daemon over plain TCP (`DOCKER_HOST` set to
+/// `tcp://host:port`) and apply `deadline` to all I/O.
+pub fn connect_tcp(
+    addr: &str,
+    deadline: Instant,
+) -> io::Result<DeadlineStream<std::net::TcpStream>> {
+    connect_tcp_stream(addr, deadline).map(|stream| DeadlineStream::new(stream, deadline))
+}
 
 /// Connect to the first reachable address that `addr` resolves to.
 ///
@@ -789,6 +760,30 @@ fn connect_tcp_stream(addr: &str, deadline: Instant) -> io::Result<std::net::Tcp
     }
 
     Err(last_error)
+}
+
+// ---------------------------------------------------------------------------
+// Container list
+// ---------------------------------------------------------------------------
+
+/// A connected daemon stream of any transport, with its deadline applied.
+pub trait Stream: Read + Write {}
+
+impl<T: Read + Write> Stream for T {}
+
+/// Connect with `connect` and fetch the container list JSON body, all
+/// before `deadline`.
+///
+/// `connect` opens a socket, pipe, or TCP connection that already enforces
+/// the deadline it is given ([`connect_tcp`], `connect_unix`,
+/// `connect_pipe`).
+pub fn fetch_json<S, C>(connect: C, deadline: Instant) -> Result<String, FetchError>
+where
+    S: Read + Write,
+    C: FnOnce(Instant) -> io::Result<S>,
+{
+    let mut stream = connect(deadline).map_err(FetchError::from_connect_error)?;
+    http::send_http_request(&mut stream).map_err(FetchError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -849,24 +844,17 @@ fn ping_deadline(stop_deadline: Instant) -> Instant {
 /// Every failure, including a reply that is partial or malformed, counts as
 /// "not answered": the stop request has not been sent yet, so skipping this
 /// endpoint can never cause a second daemon to act on the same container.
-fn ping_answered(result: Result<u16, http::StatusFailure>, transport: &str) -> bool {
+fn ping_answered(result: Result<u16, http::StatusFailure>) -> bool {
     match result {
         Ok(status_code) => {
-            debug!("container runtime answered ping: {transport} status={status_code}");
+            debug!("container runtime answered ping: status={status_code}");
             true
         }
         Err(failure) => {
-            debug!(
-                "container runtime did not answer ping, skipping stop: {transport} failure={failure:?}"
-            );
+            debug!("container runtime did not answer ping, skipping stop: failure={failure:?}");
             false
         }
     }
-}
-
-/// Send a POST and classify the reply of an already connected endpoint.
-fn post_status_attempt(stream: &mut (impl Read + Write), endpoint: &str) -> StopAttempt {
-    stop_attempt_from(http::send_http_post_status(stream, endpoint))
 }
 
 /// Map the result of a stop POST to a [`StopAttempt`].
@@ -888,88 +876,31 @@ fn stop_attempt_from(result: Result<u16, http::StatusFailure>) -> StopAttempt {
     }
 }
 
-/// Send a POST request to stop or kill a container via a Unix socket.
+/// Send `POST {endpoint}` to stop or kill a container, connecting with
+/// `connect`, and classify the result.
 ///
-/// The socket must first answer a `GET /_ping` preflight on its own
-/// connection; otherwise the stop is not sent.
-#[cfg(unix)]
-pub fn stop_via_unix_socket(path: &std::path::Path, endpoint: &str) -> StopAttempt {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    if !ping_unix_socket(path, ping_deadline(deadline)) {
+/// The daemon must first answer a `GET /_ping` preflight on its own
+/// connection, within [`PING_TIMEOUT`]; otherwise the stop is not sent.
+/// The ping and the stop request share `deadline`.
+pub fn stop_via<S, C>(connect: C, endpoint: &str, deadline: Instant) -> StopAttempt
+where
+    S: Read + Write,
+    C: Fn(Instant) -> io::Result<S>,
+{
+    let ping_deadline = ping_deadline(deadline);
+    let pinged = connect(ping_deadline).is_ok_and(|mut stream| {
+        ping_answered(http::send_http_status_request(
+            &mut stream,
+            http::PING_HTTP_REQUEST,
+        ))
+    });
+    if !pinged {
         return StopAttempt::Unreachable;
     }
-    let Ok(stream) = connect_unix_stream(path, " for stop") else {
+    let Ok(mut stream) = connect(deadline) else {
         return StopAttempt::Unreachable;
     };
-    let mut stream = DeadlineStream::new(stream, deadline);
-    post_status_attempt(&mut stream, endpoint)
-}
-
-/// Whether the daemon behind a Unix socket answers `GET /_ping`.
-#[cfg(unix)]
-fn ping_unix_socket(path: &std::path::Path, deadline: Instant) -> bool {
-    let Ok(stream) = connect_unix_stream(path, " for ping") else {
-        return false;
-    };
-    let mut stream = DeadlineStream::new(stream, deadline);
-    let result = http::send_http_status_request(&mut stream, http::PING_HTTP_REQUEST);
-    ping_answered(result, &format!("socket={}", path.display()))
-}
-
-/// Send a POST request to stop or kill a container via a Windows named pipe.
-///
-/// The pipe must first answer a `GET /_ping` preflight on its own
-/// connection; otherwise the stop is not sent.
-#[cfg(windows)]
-pub fn stop_via_named_pipe(path: &str, endpoint: &str) -> StopAttempt {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    if !ping_named_pipe(path, ping_deadline(deadline)) {
-        return StopAttempt::Unreachable;
-    }
-    let Ok(file) = open_named_pipe(path, deadline, " for stop") else {
-        return StopAttempt::Unreachable;
-    };
-    post_status_attempt(&mut PipeStream::new(file, deadline), endpoint)
-}
-
-/// Whether the daemon behind a named pipe answers `GET /_ping`.
-#[cfg(windows)]
-fn ping_named_pipe(path: &str, deadline: Instant) -> bool {
-    let Ok(file) = open_named_pipe(path, deadline, " for ping") else {
-        return false;
-    };
-    let mut stream = PipeStream::new(file, deadline);
-    let result = http::send_http_status_request(&mut stream, http::PING_HTTP_REQUEST);
-    ping_answered(result, &format!("pipe={path}"))
-}
-
-/// Send a POST request to stop or kill a container via TCP.
-pub fn stop_via_tcp(addr: &str, endpoint: &str) -> StopAttempt {
-    stop_via_tcp_until(addr, endpoint, Instant::now() + STOP_TIMEOUT)
-}
-
-/// Send a stop request over TCP after a `GET /_ping` preflight on its own
-/// connection. Connecting is capped per attempt by [`connect_tcp_stream`],
-/// while the ping and the stop request share `deadline`.
-fn stop_via_tcp_until(addr: &str, endpoint: &str, deadline: Instant) -> StopAttempt {
-    if !ping_tcp(addr, ping_deadline(deadline)) {
-        return StopAttempt::Unreachable;
-    }
-    let Ok(stream) = connect_tcp_stream(addr, deadline) else {
-        return StopAttempt::Unreachable;
-    };
-    let mut stream = DeadlineStream::new(stream, deadline);
-    post_status_attempt(&mut stream, endpoint)
-}
-
-/// Whether the daemon behind a TCP address answers `GET /_ping`.
-fn ping_tcp(addr: &str, deadline: Instant) -> bool {
-    let Ok(stream) = connect_tcp_stream(addr, deadline) else {
-        return false;
-    };
-    let mut stream = DeadlineStream::new(stream, deadline);
-    let result = http::send_http_status_request(&mut stream, http::PING_HTTP_REQUEST);
-    ping_answered(result, &format!("tcp={addr}"))
+    stop_attempt_from(http::send_http_post_status(&mut stream, endpoint))
 }
 
 #[cfg(test)]
@@ -982,6 +913,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    /// Fetch the container list from the TCP daemon at `addr`.
+    fn fetch_tcp(addr: &str, deadline: Instant) -> Result<String, FetchError> {
+        fetch_json(|deadline| connect_tcp(addr, deadline), deadline)
+    }
+
+    /// Send a stop request to the TCP daemon at `addr`.
+    fn stop_tcp(addr: &str, endpoint: &str, deadline: Instant) -> StopAttempt {
+        stop_via(|deadline| connect_tcp(addr, deadline), endpoint, deadline)
+    }
 
     /// Bind a loopback listener and return it with its `host:port` string.
     fn loopback_listener() -> (TcpListener, String) {
@@ -1385,7 +1326,7 @@ mod tests {
     // ── DeadlineStream / TCP ─────────────────────────────────────────
 
     #[test]
-    fn fetch_tcp_json_reads_complete_response() {
+    fn tcp_fetch_reads_complete_response() {
         let (listener, addr) = loopback_listener();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -1393,14 +1334,14 @@ mod tests {
             drop(stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n[]"));
         });
 
-        let body = fetch_tcp_json(&addr, Instant::now() + Duration::from_secs(5)).ok();
+        let body = fetch_tcp(&addr, Instant::now() + Duration::from_secs(5)).ok();
         drop(server.join());
 
         assert_eq!(body.as_deref(), Some("[]"), "body should pass through");
     }
 
     #[test]
-    fn fetch_tcp_json_reports_http_status() {
+    fn tcp_fetch_reports_http_status() {
         let (listener, addr) = loopback_listener();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -1408,7 +1349,7 @@ mod tests {
             drop(stream.write_all(b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n"));
         });
 
-        let result = fetch_tcp_json(&addr, Instant::now() + Duration::from_secs(5));
+        let result = fetch_tcp(&addr, Instant::now() + Duration::from_secs(5));
         drop(server.join());
 
         assert!(
@@ -1446,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_tcp_json_enforces_overall_deadline_against_trickling_daemon() {
+    fn tcp_fetch_enforces_overall_deadline_against_trickling_daemon() {
         let (listener, addr) = loopback_listener();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -1461,7 +1402,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let body = fetch_tcp_json(&addr, started + Duration::from_millis(200));
+        let body = fetch_tcp(&addr, started + Duration::from_millis(200));
         let elapsed = started.elapsed();
         drop(server.join());
 
@@ -1517,10 +1458,14 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_reports_status_code_after_ping() {
+    fn tcp_stop_reports_status_code_after_ping() {
         let daemon = TestDaemon::start(answer_ping_then_204);
 
-        let attempt = stop_via_tcp(&daemon.addr, "/containers/abc/stop?t=10");
+        let attempt = stop_tcp(
+            &daemon.addr,
+            "/containers/abc/stop?t=10",
+            Instant::now() + STOP_TIMEOUT,
+        );
         let requests = daemon.finish();
 
         assert_eq!(
@@ -1539,12 +1484,12 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_classifies_refused_connection_as_unreachable() {
+    fn tcp_stop_classifies_refused_connection_as_unreachable() {
         let (listener, addr) = loopback_listener();
         drop(listener);
 
         assert_eq!(
-            stop_via_tcp_until(
+            stop_tcp(
                 &addr,
                 "/containers/abc/stop",
                 // Short on purpose: Windows retries refused loopback
@@ -1557,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_classifies_silent_daemon_as_no_response() {
+    fn tcp_stop_classifies_silent_daemon_as_no_response() {
         let daemon = TestDaemon::start(|stream, request| {
             if is_ping(request) {
                 answer_ping_only(stream, request);
@@ -1566,7 +1511,7 @@ mod tests {
             }
         });
 
-        let attempt = stop_via_tcp_until(
+        let attempt = stop_tcp(
             &daemon.addr,
             "/containers/abc/stop",
             Instant::now() + Duration::from_millis(300),
@@ -1582,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_classifies_accept_then_drop_as_unreachable() {
+    fn tcp_stop_classifies_accept_then_drop_as_unreachable() {
         // A forwarder (socat, SSH tunnel) whose backend is down accepts the
         // connection and closes it without sending a byte.
         let (listener, addr) = loopback_listener();
@@ -1591,7 +1536,7 @@ mod tests {
             drop(stream);
         });
 
-        let attempt = stop_via_tcp_until(
+        let attempt = stop_tcp(
             &addr,
             "/containers/abc/stop",
             Instant::now() + Duration::from_secs(5),
@@ -1606,11 +1551,11 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_never_sends_stop_when_ping_is_dropped() {
+    fn tcp_stop_never_sends_stop_when_ping_is_dropped() {
         // Reads every request, then closes the connection without a reply.
         let daemon = TestDaemon::start(|_, _| {});
 
-        let attempt = stop_via_tcp_until(
+        let attempt = stop_tcp(
             &daemon.addr,
             "/containers/abc/stop",
             Instant::now() + Duration::from_secs(5),
@@ -1631,10 +1576,10 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_never_sends_stop_when_ping_times_out() {
+    fn tcp_stop_never_sends_stop_when_ping_times_out() {
         let daemon = TestDaemon::start(|_, _| std::thread::sleep(Duration::from_millis(600)));
 
-        let attempt = stop_via_tcp_until(
+        let attempt = stop_tcp(
             &daemon.addr,
             "/containers/abc/stop",
             Instant::now() + Duration::from_millis(300),
@@ -1650,12 +1595,12 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_classifies_close_after_request_as_no_response() {
+    fn tcp_stop_classifies_close_after_request_as_no_response() {
         // dockerd starts the grace period, then crashes, or Go net/http
         // recovers a handler panic by closing the connection unanswered.
         let daemon = TestDaemon::start(answer_ping_only);
 
-        let attempt = stop_via_tcp_until(
+        let attempt = stop_tcp(
             &daemon.addr,
             "/containers/abc/stop",
             Instant::now() + Duration::from_secs(5),
@@ -1671,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_via_tcp_classifies_partial_reply_as_no_response() {
+    fn tcp_stop_classifies_partial_reply_as_no_response() {
         let daemon = TestDaemon::start(|stream, request| {
             if is_ping(request) {
                 answer_ping_only(stream, request);
@@ -1680,7 +1625,7 @@ mod tests {
             }
         });
 
-        let attempt = stop_via_tcp_until(
+        let attempt = stop_tcp(
             &daemon.addr,
             "/containers/abc/stop",
             Instant::now() + Duration::from_secs(5),
@@ -1702,7 +1647,9 @@ mod tests {
             let endpoint = crate::stop_endpoint("web", kind);
 
             let targets = [(false, first.addr.clone()), (false, second.addr.clone())];
-            let attempt = crate::first_stop_owner(targets, |addr| stop_via_tcp(&addr, &endpoint));
+            let attempt = crate::first_stop_owner(targets, |addr| {
+                stop_tcp(&addr, &endpoint, Instant::now() + STOP_TIMEOUT)
+            });
             let first_requests = first.finish();
             let second_requests = second.finish();
 
@@ -1729,7 +1676,11 @@ mod tests {
 
         let targets = [(true, forwarder.addr.clone()), (false, daemon.addr.clone())];
         let attempt = crate::first_stop_owner(targets, |addr| {
-            stop_via_tcp(&addr, "/containers/web/stop?t=10")
+            stop_tcp(
+                &addr,
+                "/containers/web/stop?t=10",
+                Instant::now() + STOP_TIMEOUT,
+            )
         });
         let forwarder_requests = forwarder.finish();
         drop(daemon.finish());
@@ -1758,7 +1709,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stop_via_unix_socket_classifies_accept_then_drop_as_unreachable() {
+    fn unix_stop_classifies_accept_then_drop_as_unreachable() {
         let path = unix_test_socket_path("stop-drop");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind unix socket");
         let server = std::thread::spawn(move || {
@@ -1766,7 +1717,11 @@ mod tests {
             drop(stream);
         });
 
-        let attempt = stop_via_unix_socket(&path, "/containers/abc/stop");
+        let attempt = stop_via(
+            |deadline| connect_unix(&path, deadline),
+            "/containers/abc/stop",
+            Instant::now() + STOP_TIMEOUT,
+        );
         drop(server.join());
         drop(std::fs::remove_file(&path));
 
@@ -1779,7 +1734,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stop_via_unix_socket_classifies_close_after_request_as_no_response() {
+    fn unix_stop_classifies_close_after_request_as_no_response() {
         let path = unix_test_socket_path("stop-close");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind unix socket");
         let server = std::thread::spawn(move || {
@@ -1796,7 +1751,11 @@ mod tests {
             lines
         });
 
-        let attempt = stop_via_unix_socket(&path, "/containers/abc/stop");
+        let attempt = stop_via(
+            |deadline| connect_unix(&path, deadline),
+            "/containers/abc/stop",
+            Instant::now() + STOP_TIMEOUT,
+        );
         let lines = server.join().expect("server thread");
         drop(std::fs::remove_file(&path));
 
@@ -2003,6 +1962,22 @@ mod tests {
         }
     }
 
+    /// Fetch the container list from the named pipe at `path`.
+    #[cfg(windows)]
+    fn fetch_pipe(path: &str, deadline: Instant) -> Result<String, FetchError> {
+        fetch_json(|deadline| connect_pipe(path, deadline), deadline)
+    }
+
+    /// Send a stop request to the named pipe at `path`.
+    #[cfg(windows)]
+    fn stop_pipe(path: &str, endpoint: &str) -> StopAttempt {
+        stop_via(
+            |deadline| connect_pipe(path, deadline),
+            endpoint,
+            Instant::now() + STOP_TIMEOUT,
+        )
+    }
+
     #[cfg(windows)]
     #[test]
     fn named_pipe_fetch_reads_reply_without_content_length_to_eof() {
@@ -2010,7 +1985,7 @@ mod tests {
             drop(stream.write_all(b"HTTP/1.0 200 OK\r\nServer: test\r\n\r\n[]"));
         });
 
-        let body = fetch_named_pipe_json(&daemon.path, Instant::now() + Duration::from_secs(5));
+        let body = fetch_pipe(&daemon.path, Instant::now() + Duration::from_secs(5));
         let requests = daemon.finish();
 
         assert_eq!(body.ok().as_deref(), Some("[]"), "the body runs to EOF");
@@ -2028,8 +2003,7 @@ mod tests {
             hold_until_client_closes(stream);
         });
 
-        let result =
-            fetch_named_pipe_json(&daemon.path, Instant::now() + Duration::from_millis(300));
+        let result = fetch_pipe(&daemon.path, Instant::now() + Duration::from_millis(300));
         drop(daemon.finish());
 
         assert!(
@@ -2053,7 +2027,7 @@ mod tests {
             hold_until_client_closes(stream);
         });
 
-        let result = fetch_named_pipe_json(&daemon.path, Instant::now() + Duration::from_secs(10));
+        let result = fetch_pipe(&daemon.path, Instant::now() + Duration::from_secs(10));
         drop(daemon.finish());
 
         assert!(
@@ -2065,7 +2039,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn named_pipe_fetch_reports_missing_pipe_as_not_found() {
-        let result = fetch_named_pipe_json(
+        let result = fetch_pipe(
             &test_pipe_path("missing"),
             Instant::now() + Duration::from_secs(2),
         );
@@ -2087,7 +2061,7 @@ mod tests {
             .open(&path)
             .expect("first client");
 
-        let error = open_named_pipe(&path, Instant::now() + Duration::from_millis(200), "")
+        let error = open_named_pipe(&path, Instant::now() + Duration::from_millis(200))
             .expect_err("no instance frees up");
 
         assert!(
@@ -2185,7 +2159,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn stop_via_named_pipe_reports_status_code_after_ping() {
+    fn pipe_stop_reports_status_code_after_ping() {
         let daemon = PipeDaemon::start(2, |stream, request| {
             if is_ping(request) {
                 pipe_answer_ping_only(stream, request);
@@ -2194,7 +2168,7 @@ mod tests {
             }
         });
 
-        let attempt = stop_via_named_pipe(&daemon.path, "/containers/abc/stop?t=10");
+        let attempt = stop_pipe(&daemon.path, "/containers/abc/stop?t=10");
         let requests = daemon.finish();
 
         assert_eq!(attempt, StopAttempt::Status(204));
@@ -2210,10 +2184,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn stop_via_named_pipe_never_sends_stop_when_ping_is_dropped() {
+    fn pipe_stop_never_sends_stop_when_ping_is_dropped() {
         let daemon = PipeDaemon::start(2, |_, _| {});
 
-        let attempt = stop_via_named_pipe(&daemon.path, "/containers/abc/stop");
+        let attempt = stop_pipe(&daemon.path, "/containers/abc/stop");
         let requests = daemon.finish();
 
         assert_eq!(attempt, StopAttempt::Unreachable);
@@ -2226,10 +2200,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn stop_via_named_pipe_classifies_close_after_request_as_no_response() {
+    fn pipe_stop_classifies_close_after_request_as_no_response() {
         let daemon = PipeDaemon::start(2, pipe_answer_ping_only);
 
-        let attempt = stop_via_named_pipe(&daemon.path, "/containers/abc/stop");
+        let attempt = stop_pipe(&daemon.path, "/containers/abc/stop");
         let requests = daemon.finish();
 
         assert_eq!(

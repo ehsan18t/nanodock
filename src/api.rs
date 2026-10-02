@@ -470,7 +470,7 @@ fn container_display_name(container: &DockerContainer<'_>) -> String {
                 .as_deref()
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
-                .map(short_container_id)
+                .map(|id| short_container_id(id).to_owned())
         })
         .unwrap_or_else(|| "container".to_string())
 }
@@ -480,13 +480,22 @@ fn normalize_container_name(name: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
-/// Truncate a full container ID to its 12-character short form.
+/// The 12-character short form of a full container ID, borrowed from `id`.
 ///
-/// Docker/Podman container IDs are hex-encoded (ASCII-only), so byte
-/// length equals character count and a byte slice is safe.
+/// Docker and Podman IDs are hex, so the first 12 bytes are the first 12
+/// characters. An `id` shorter than that, or whose 12th byte falls inside a
+/// multi-byte character, is returned whole.
+///
+/// ```
+/// use nanodock::short_container_id;
+///
+/// let id = "e603f8ebd438b8405b9b835b9d38cb913ea2479f5b29f8e4308b88e9a92e8c4b";
+/// assert_eq!(short_container_id(id), "e603f8ebd438");
+/// assert_eq!(short_container_id("abc"), "abc");
+/// ```
 #[must_use]
-pub fn short_container_id(id: &str) -> String {
-    id.get(..12).unwrap_or(id).to_string()
+pub fn short_container_id(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
 }
 
 #[cfg(test)]

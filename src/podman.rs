@@ -241,7 +241,8 @@ fn podman_storage_container_info(container: &PodmanStorageContainer) -> Containe
         .chain(metadata.as_ref().and_then(|value| value.name.as_deref()))
         .map(str::trim)
         .find(|name| !name.is_empty())
-        .map_or_else(|| short_container_id(&container.id), ToOwned::to_owned);
+        .unwrap_or_else(|| short_container_id(&container.id))
+        .to_owned();
     let image = metadata
         .and_then(|value| value.image_name)
         .unwrap_or_default();

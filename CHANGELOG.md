@@ -41,6 +41,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** `PublishedContainerMatch::Match` holds `&Arc<ContainerInfo>` instead of `&ContainerInfo`. Field access and `Display` work through the `Arc` as before, but code that returns the bound value as `&ContainerInfo` or clones it into a `ContainerInfo` must say so: use `PublishedContainerMatch::container`, or `ContainerInfo::clone(info)` (or `Arc::clone(info)` to share it).
 - **Breaking:** `StopOutcome` no longer implements `Copy`, so a later variant can carry data that is not `Copy`. Clone it where a copy was relied on; `StopOutcome::is_stopped` takes `&self`.
 - **Breaking:** `ContainerInfo` and `PublishedContainerMatch` no longer implement `Hash`, so `ContainerInfo` can gain fields that cannot be hashed (such as a label map) in a minor release. Key a set or map on `info.id` instead of the whole `ContainerInfo`.
+- **Breaking:** `short_container_id` returns `&str`, borrowed from its argument, instead of a new `String`. Call `.to_owned()` on the result where an owned string is needed.
 - **Breaking:** `lookup_rootless_podman_container(pid, name, &mut resolver, home)` is replaced by the method `RootlessPodmanResolver::lookup(pid, name)`. The home directory belongs to the resolver: `RootlessPodmanResolver::new()` reads it from the environment and `.home(home)` replaces it, instead of being passed on every call while only the first call used it.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
 - **Security:** port ranges can no longer make a small reply expand to millions of bindings. One daemon reply expands to at most 131072 bindings (every port of both protocols); past that, the rest of the reply is ignored and the bindings already parsed are kept. A range repeated within one container is expanded once. Before, a reply of a few kilobytes of `"range": 65535` entries took about 0.7 seconds and millions of map inserts to parse.
@@ -179,6 +180,16 @@ let found = resolver.lookup(pid, name);
 let mut resolver = RootlessPodmanResolver::new().home(home);
 // one resolver per scan, or forget the cache between scans
 resolver.clear();
+```
+
+`short_container_id` borrows instead of allocating:
+
+```rust,ignore
+// 0.1
+let short: String = nanodock::short_container_id(&info.id);
+// 0.2
+let short: &str = nanodock::short_container_id(&info.id);
+let owned: String = nanodock::short_container_id(&info.id).to_owned();
 ```
 
 `parse_containers_json_strict` now fails with `nanodock::ParseError`; code that named `serde_json::Error` should name `ParseError` or use `impl std::error::Error`.

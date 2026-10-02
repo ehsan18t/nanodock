@@ -25,14 +25,18 @@ serde = []
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "deny"
 let_underscore_drop = "deny"
 non_ascii_idents = "deny"
+
+[lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

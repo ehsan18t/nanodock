@@ -4,8 +4,15 @@ too-many-lines-threshold = 100
 cognitive-complexity-threshold = 30
 enum-variant-size-threshold = 200
 
+# `unwrap_used` is denied in library code; tests may unwrap.
+allow-unwrap-in-tests = true
+
 disallowed-macros = [
     { path = "std::dbg", reason = "Debug macro left in code - remove before committing" },
     { path = "std::todo", reason = "Unfinished code - implement before committing" },
     { path = "std::unimplemented", reason = "Unfinished code - implement before committing" },
+]
+
+disallowed-methods = [
+    { path = "std::process::abort", reason = "return an error instead of aborting" },
 ]

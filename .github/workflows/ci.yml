@@ -21,6 +21,10 @@
 #   - tests/daemon_it.rs against the runner's Docker Engine, over the unix
 #     socket and over a TCP DOCKER_HOST
 #
+# Rootless Podman integration (Linux):
+#   - tests/podman_it.rs: Docker and Podman merged in one map, stop falling
+#     through Docker's 404 to Podman, and the rootlessport resolver
+#
 # Linux benchmark execution:
 #   - gungraun instruction-count regressions vs PR merge-base
 
@@ -265,6 +269,126 @@ jobs:
           docker compose -p "$NANODOCK_IT_COMPOSE_PROJECT" down -t 0 || true
           docker rm -f "$NANODOCK_IT_WEB_NAME" "$NANODOCK_IT_STOP_NAME" \
             "$NANODOCK_IT_KILL_NAME" "$NANODOCK_IT_TCP_KILL_NAME" || true
+
+  # Integration tests against rootless Podman next to the runner's Docker
+  # Engine (tests/podman_it.rs): the multi-daemon merge, the stop fall-through
+  # from Docker's 404 to Podman, and the rootlessport resolver.
+  #
+  # Rootless Podman needs a user systemd instance for its API socket. Linger
+  # starts one; when it does not come up, `podman system service` serves the
+  # same socket directly, so the tests never depend on that detail.
+  podman-it:
+    name: Rootless Podman Integration (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NANODOCK_IT_PODMAN_NAME: pweb
+      NANODOCK_IT_PODMAN_PORT: "18180"
+      NANODOCK_IT_DOCKER_NAME: nd-web
+      NANODOCK_IT_DOCKER_PORT: "18080"
+      NANODOCK_IT_PODMAN: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # 1.94.1
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          key: podman-it
+
+      - name: Build the integration tests
+        run: cargo test --locked --test podman_it --no-run
+
+      # Ubuntu 24.04 can restrict unprivileged user namespaces through
+      # AppArmor, which rootless Podman needs; the sysctl is absent on older
+      # images, hence the `|| true`.
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman slirp4netns uidmap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          podman --version
+
+      - name: Start the rootless Podman API socket
+        run: |
+          uid="$(id -u)"
+          runtime_dir="/run/user/$uid"
+          sudo loginctl enable-linger "$USER"
+          for attempt in $(seq 1 30); do
+            [ -S "$runtime_dir/bus" ] && break
+            sleep 1
+          done
+          if [ ! -d "$runtime_dir" ]; then
+            sudo mkdir -p "$runtime_dir"
+            sudo chown "$uid:$(id -g)" "$runtime_dir"
+            sudo chmod 700 "$runtime_dir"
+          fi
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          socket="$runtime_dir/podman/podman.sock"
+          if ! systemctl --user enable --now podman.socket; then
+            echo "systemd user socket unavailable, serving the API directly"
+            mkdir -p "$runtime_dir/podman"
+            nohup podman system service --time=0 "unix://$socket" > "$RUNNER_TEMP/podman-service.log" 2>&1 &
+          fi
+          for attempt in $(seq 1 30); do
+            curl -sf --unix-socket "$socket" http://d/_ping && exit 0
+            sleep 1
+          done
+          echo "the Podman API socket never answered"
+          cat "$RUNNER_TEMP/podman-service.log" 2>/dev/null || true
+          exit 1
+
+      # The fully qualified image avoids Podman's short-name prompt, and
+      # slirp4netns makes the rootlessport helper hold the published port.
+      - name: Start the test containers
+        run: |
+          for attempt in 1 2 3 4 5; do
+            podman pull docker.io/library/busybox && docker pull busybox && break
+            if [ "$attempt" -eq 5 ]; then exit 1; fi
+            echo "pull attempt $attempt failed, retrying"
+            sleep $((attempt * 5))
+          done
+          podman run -d --network slirp4netns -p "$NANODOCK_IT_PODMAN_PORT:80" \
+            --name "$NANODOCK_IT_PODMAN_NAME" docker.io/library/busybox httpd -f -p 80
+          docker run -d --init --name "$NANODOCK_IT_DOCKER_NAME" \
+            -p "$NANODOCK_IT_DOCKER_PORT:80" busybox httpd -f -p 80
+          pids=""
+          for attempt in $(seq 1 15); do
+            pids="$(pgrep -x rootlessport | tr '\n' ' ' || true)"
+            [ -n "$pids" ] && break
+            sleep 1
+          done
+          echo "rootlessport pids: ${pids:-none}"
+          echo "NANODOCK_IT_ROOTLESSPORT_PIDS=$pids" >> "$GITHUB_ENV"
+          podman ps
+          docker ps
+
+      - name: "Podman IT: detection merges Podman and Docker"
+        run: cargo test --locked --test podman_it detect_ -- --test-threads=1 --nocapture
+
+      - name: "Podman IT: rootlessport resolver"
+        run: cargo test --locked --test podman_it rootless_resolver -- --test-threads=1 --nocapture
+
+      # Runs last because it stops pweb; `podman start` is a no-op when the
+      # container is already running and recovers it after a retried job.
+      - name: "Podman IT: stop falls through Docker to Podman"
+        run: |
+          podman start "$NANODOCK_IT_PODMAN_NAME"
+          cargo test --locked --test podman_it stop_ -- --test-threads=1 --nocapture
+
+      - name: Clean up containers
+        if: always()
+        run: |
+          podman rm -f -t 0 "$NANODOCK_IT_PODMAN_NAME" || true
+          docker rm -f "$NANODOCK_IT_DOCKER_NAME" || true
 
   # Linux-only instruction-count benchmarks with gungraun.
   #

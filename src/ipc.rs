@@ -2274,7 +2274,7 @@ mod tests {
         let daemon = TestDaemon::start(answer_ping_then_204);
 
         let targets = [(true, tls_port.addr.clone()), (false, daemon.addr.clone())];
-        let attempt = crate::first_stop_owner(targets, |addr| {
+        let attempt = crate::stop::first_stop_owner(targets, |addr| {
             stop_tcp(
                 &addr,
                 "/containers/web/stop?t=10",
@@ -2285,7 +2285,7 @@ mod tests {
         drop(daemon.finish());
 
         assert_eq!(
-            crate::stop_outcome(attempt, crate::StopKind::Graceful),
+            crate::stop::stop_outcome(attempt, crate::stop::StopKind::Graceful),
             crate::StopOutcome::Stopped,
             "the daemon after the endpoint that failed the ping is used"
         );
@@ -2342,20 +2342,20 @@ mod tests {
 
     #[test]
     fn stop_after_close_after_request_never_tries_next_endpoint() {
-        for kind in [crate::StopKind::Graceful, crate::StopKind::Kill] {
+        for kind in [crate::stop::StopKind::Graceful, crate::stop::StopKind::Kill] {
             let first = TestDaemon::start(answer_ping_only);
             let second = TestDaemon::start(answer_ping_then_204);
-            let endpoint = crate::stop_endpoint("web", kind);
+            let endpoint = crate::stop::stop_endpoint("web", kind);
 
             let targets = [(false, first.addr.clone()), (false, second.addr.clone())];
-            let attempt = crate::first_stop_owner(targets, |addr| {
+            let attempt = crate::stop::first_stop_owner(targets, |addr| {
                 stop_tcp(&addr, &endpoint, Instant::now() + STOP_TIMEOUT)
             });
             let first_requests = first.finish();
             let second_requests = second.finish();
 
             assert_eq!(
-                crate::stop_outcome(attempt, kind),
+                crate::stop::stop_outcome(attempt, kind),
                 crate::StopOutcome::NoResponse,
                 "an unanswered {kind:?} request has an unknown result"
             );
@@ -2376,7 +2376,7 @@ mod tests {
         let daemon = TestDaemon::start(answer_ping_then_204);
 
         let targets = [(true, forwarder.addr.clone()), (false, daemon.addr.clone())];
-        let attempt = crate::first_stop_owner(targets, |addr| {
+        let attempt = crate::stop::first_stop_owner(targets, |addr| {
             stop_tcp(
                 &addr,
                 "/containers/web/stop?t=10",
@@ -2387,7 +2387,7 @@ mod tests {
         drop(daemon.finish());
 
         assert_eq!(
-            crate::stop_outcome(attempt, crate::StopKind::Graceful),
+            crate::stop::stop_outcome(attempt, crate::stop::StopKind::Graceful),
             crate::StopOutcome::Stopped,
             "the live daemon behind the dead forwarder is used"
         );

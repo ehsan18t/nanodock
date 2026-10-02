@@ -40,14 +40,18 @@ nanodock is the synchronous, minimal-dependency Docker/Podman client for contain
 
 ## Architecture
 
-| Module      | Owns                                                                    |
-| ----------- | ----------------------------------------------------------------------- |
-| `lib.rs`    | Public API, detection orchestration, port-to-container matching         |
-| `api.rs`    | Daemon JSON parsing and container name resolution                       |
-| `http.rs`   | HTTP/1.0 framing and chunking (via `httparse`), nothing Docker-specific |
-| `ipc.rs`    | OS-specific transport: Unix sockets, named pipes, TCP, `DOCKER_HOST`    |
-| `podman.rs` | Rootless Podman resolution via overlay metadata (lookup runs on Linux) |
-| `proxy.rs`  | Recognition of container runtime port-proxy processes                   |
+| Module        | Owns                                                                        |
+| ------------- | --------------------------------------------------------------------------- |
+| `lib.rs`      | Crate docs, module declarations, public re-exports, the free functions      |
+| `error.rs`    | `Error`, `ParseError`, and ranking endpoint failures                        |
+| `port_map.rs` | `Protocol`, `ContainerInfo`, `PortKey`, `ContainerPortMap`, port matching   |
+| `client.rs`   | `Client`, `DetectionHandle`, endpoint selection, query fan-out, merging     |
+| `stop.rs`     | `StopOutcome`, ID validation, stop endpoints, choosing the owning daemon    |
+| `api.rs`      | Daemon JSON parsing and container name resolution                           |
+| `http.rs`     | HTTP/1.0 framing and chunking (via `httparse`), nothing Docker-specific     |
+| `ipc.rs`      | OS-specific transport: Unix sockets, named pipes, TCP, `DOCKER_HOST`        |
+| `podman.rs`   | Rootless Podman resolution via overlay metadata (lookup runs on Linux)     |
+| `proxy.rs`    | Recognition of container runtime port-proxy processes                       |
 
 Do not create modules or add `[dependencies]` without explicit human approval. The runtime dependencies (`serde`, `serde_json`, `httparse`, `log`, plus `libc` on Unix) are a competitive advantage: anything `std` or an existing dependency can do stays that way. Dev-dependencies are `tempfile`, `gungraun`, and `proptest`.
 

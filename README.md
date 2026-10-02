@@ -299,7 +299,11 @@ The resolver reads the overlay storage on its first lookup and caches every answ
 
 ```text
 src/
-├── lib.rs      - Public API, detection orchestration, port matching
+├── lib.rs      - Crate docs, module declarations, public re-exports, free functions
+├── error.rs    - Error and ParseError
+├── port_map.rs - Protocol, ContainerInfo, ContainerPortMap, port matching
+├── client.rs   - Client, DetectionHandle, endpoint selection, detection queries
+├── stop.rs     - StopOutcome and the stop and kill logic
 ├── api.rs      - JSON response parsing, container name resolution
 ├── http.rs     - Minimal HTTP/1.0 response parser (via httparse)
 ├── ipc.rs      - OS-specific transport (Unix socket, named pipe, TCP)
@@ -309,7 +313,11 @@ src/
 
 ### Module Boundaries
 
-- **`lib.rs`** owns the public API surface, detection orchestration, and port-to-container matching logic. All public types are defined here.
+- **`lib.rs`** holds the crate documentation, the module declarations, the re-exports that make up the public API, and the free functions (`detect_containers`, `start_detection`, `stop_container`, `kill_container`). Public types are defined in their modules and re-exported here, so their paths stay `nanodock::<Type>`.
+- **`error.rs`** owns `Error` and `ParseError`, and picks the most informative failure when every endpoint fails.
+- **`port_map.rs`** owns `Protocol`, `ContainerInfo`, `PortKey`, `ContainerPortMap` and its iterator, `ProxyFallback`, and `PublishedContainerMatch`: the port-to-container matching logic.
+- **`client.rs`** owns `Client` and `DetectionHandle`: endpoint selection, the concurrent detection query, and merging the daemons' replies.
+- **`stop.rs`** owns `StopOutcome` and the stop and kill logic: container ID validation, the request endpoint, and choosing the daemon that owns the container.
 - **`api.rs`** owns JSON response parsing. It converts raw daemon responses into `ContainerPortMap` entries.
 - **`http.rs`** owns HTTP protocol handling. It formats requests and parses responses using `httparse`. No Docker-specific logic lives here.
 - **`ipc.rs`** owns OS-specific transport code. Unix sockets, Windows named pipes, TCP connections, and `DOCKER_HOST` parsing all live here.

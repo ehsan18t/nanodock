@@ -715,6 +715,25 @@ const fn is_pipe_closed_code(code: Option<i32>) -> bool {
 /// the other resolved addresses are tried.
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Upper bound for one connect attempt to a loopback address.
+///
+/// A loopback connect succeeds or is refused at once, except on Windows,
+/// which retries a refused connect for about 2 seconds. Without this cap a
+/// stale `DOCKER_HOST=tcp://127.0.0.1:2375` would spend those seconds on
+/// every detection and stop.
+const LOOPBACK_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Upper bound for one connect attempt to `socket_addr`: short for loopback
+/// addresses (`127.0.0.0/8`, `::1`, and `::ffff:127.0.0.0/104`), longer for
+/// any other address.
+const fn connect_attempt_cap(socket_addr: &std::net::SocketAddr) -> Duration {
+    if socket_addr.ip().to_canonical().is_loopback() {
+        LOOPBACK_CONNECT_ATTEMPT_TIMEOUT
+    } else {
+        CONNECT_ATTEMPT_TIMEOUT
+    }
+}
+
 /// Connect to a Docker/Podman daemon over plain TCP (`DOCKER_HOST` set to
 /// `tcp://host:port`) and apply `deadline` to all I/O.
 pub fn connect_tcp(
@@ -727,7 +746,7 @@ pub fn connect_tcp(
 /// Connect to the first reachable address that `addr` resolves to.
 ///
 /// The connect attempts share `deadline`, and each one is further capped
-/// at [`CONNECT_ATTEMPT_TIMEOUT`]. Name resolution itself has no timeout in
+/// by [`connect_attempt_cap`]. Name resolution itself has no timeout in
 /// std; `DOCKER_HOST` normally names a literal IP or `localhost`, which
 /// resolve locally. Fails with the error of the last attempt, or with
 /// [`io::ErrorKind::TimedOut`] once the deadline has passed.
@@ -747,7 +766,7 @@ fn connect_tcp_stream(addr: &str, deadline: Instant) -> io::Result<std::net::Tcp
             debug!("container runtime TCP connect deadline expired: tcp={addr}");
             return Err(io::ErrorKind::TimedOut.into());
         };
-        let attempt_timeout = remaining.min(CONNECT_ATTEMPT_TIMEOUT);
+        let attempt_timeout = remaining.min(connect_attempt_cap(&socket_addr));
         match std::net::TcpStream::connect_timeout(&socket_addr, attempt_timeout) {
             Ok(stream) => return Ok(stream),
             Err(error) => {
@@ -1500,12 +1519,53 @@ mod tests {
             stop_tcp(
                 &addr,
                 "/containers/abc/stop",
-                // Short on purpose: Windows retries refused loopback
-                // connects, so this may end at the deadline, not a refusal.
-                Instant::now() + Duration::from_millis(300)
+                Instant::now() + Duration::from_secs(5)
             ),
             StopAttempt::Unreachable,
             "a closed port never received the request"
+        );
+    }
+
+    #[test]
+    fn connect_attempts_to_loopback_are_capped_short() {
+        let cap = |addr: &str| connect_attempt_cap(&addr.parse().expect("socket address"));
+        for loopback in [
+            "127.0.0.1:2375",
+            "127.8.9.10:2375",
+            "[::1]:2375",
+            "[::ffff:127.0.0.1]:2375",
+        ] {
+            assert_eq!(
+                cap(loopback),
+                LOOPBACK_CONNECT_ATTEMPT_TIMEOUT,
+                "{loopback}"
+            );
+        }
+        for remote in [
+            "10.0.0.5:2375",
+            "192.168.1.20:2376",
+            "[2001:db8::1]:2375",
+            "[::2]:2375",
+        ] {
+            assert_eq!(cap(remote), CONNECT_ATTEMPT_TIMEOUT, "{remote}");
+        }
+    }
+
+    #[test]
+    fn refused_loopback_connect_fails_within_the_loopback_cap() {
+        // Windows retries a refused connect for about 2 seconds; the cap
+        // must end it long before that, well inside the 5 second deadline.
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let started = Instant::now();
+
+        let result = connect_tcp_stream(&addr, started + Duration::from_secs(5));
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "nothing listens on {addr}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a refused loopback connect must not take {elapsed:?}"
         );
     }
 

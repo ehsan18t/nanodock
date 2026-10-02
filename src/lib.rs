@@ -96,6 +96,7 @@ mod proxy;
 struct ReadmeDoctests;
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -854,12 +855,12 @@ impl Client {
     ///
     /// Fails only when no endpoint produced a container list, with the
     /// most informative endpoint failure (see [`Error`]), or with
-    /// [`Error::InvalidResponse`] when the merged list is not valid JSON.
+    /// [`Error::InvalidResponse`] when a daemon whose answer is used sent
+    /// something other than a JSON array of containers.
     pub fn detect(&self) -> Result<ContainerPortMap, Error> {
         debug!("starting synchronous container runtime detection");
         let bodies = self.query_daemon_bodies(Instant::now())?;
-        let body = merge_prioritized_bodies(&bodies).ok_or(Error::DaemonNotFound)?;
-        let map = api::parse_containers_json_strict(&body)?;
+        let map = merge_bodies(&bodies, api::parse_containers_json_strict)?;
         debug!(
             "finished synchronous container runtime detection: port_mappings={}",
             map.len()
@@ -1388,8 +1389,7 @@ impl Client {
 
     /// One lenient detection pass whose budget runs from `started`.
     fn query_daemon(&self, started: Instant) -> Result<ContainerPortMap, Error> {
-        merge_prioritized_responses(&self.query_daemon_bodies(started)?)
-            .ok_or(Error::DaemonNotFound)
+        Ok(merge_bodies_lenient(&self.query_daemon_bodies(started)?))
     }
 }
 
@@ -1496,100 +1496,40 @@ fn select_daemon_bodies(mut responses: Vec<(usize, bool, String)>) -> Vec<String
     chosen.into_iter().map(|(_, _, body)| body).collect()
 }
 
-/// Merge bodies (highest priority first) into one JSON array for strict
-/// parsing.
+/// Parse every daemon's body with `parse` and merge the port maps.
 ///
-/// The bodies are concatenated lowest priority first: when two daemons
-/// publish the same key, the later entry wins the map insert, so the
-/// higher-priority daemon is kept.
-fn merge_prioritized_bodies(bodies: &[String]) -> Option<String> {
-    merge_daemon_response_bodies(bodies.iter().rev())
-}
-
-/// Merge bodies (highest priority first) into one port map.
-///
-/// Bodies are merged lowest priority first so that, when two daemons
-/// publish the same key, the higher-priority daemon overwrites the other.
-fn merge_prioritized_responses(bodies: &[String]) -> Option<ContainerPortMap> {
-    merge_daemon_responses(bodies.iter().rev())
-}
-
-fn merge_daemon_response_bodies<T, I>(responses: I) -> Option<String>
-where
-    T: AsRef<str>,
-    I: IntoIterator<Item = T>,
-{
-    let mut saw_response = false;
-    let mut has_content = false;
-    let mut combined = String::from("[");
-
-    for response in responses {
-        saw_response = true;
-        let body = response.as_ref().trim();
-        // Each daemon returns a JSON array; unwrap the outer brackets and
-        // concatenate elements so the caller sees a single flat array.
-        let inner = body
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(body)
-            .trim();
-        if inner.is_empty() {
-            continue;
-        }
-        if has_content {
-            combined.push(',');
-        }
-        has_content = true;
-        combined.push_str(inner);
-    }
-
-    if !saw_response {
-        return None;
-    }
-
-    combined.push(']');
-    Some(combined)
-}
-
-fn merge_daemon_responses<T, I>(responses: I) -> Option<ContainerPortMap>
-where
-    T: AsRef<str>,
-    I: IntoIterator<Item = T>,
-{
-    let mut saw_response = false;
+/// `bodies` are highest priority first. They are merged lowest priority
+/// first, so when two daemons publish the same binding the higher-priority
+/// daemon overwrites the other. The first parse error ends the merge.
+fn merge_bodies<E>(
+    bodies: &[String],
+    mut parse: impl FnMut(&str) -> Result<ContainerPortMap, E>,
+) -> Result<ContainerPortMap, E> {
     let mut merged = ContainerPortMap::new();
-
-    for response in responses {
-        saw_response = true;
-        merged.merge(api::parse_containers_json(response.as_ref()));
+    for body in bodies.iter().rev() {
+        let map = parse(body)?;
+        if merged.is_empty() {
+            merged = map;
+        } else {
+            merged.merge(map);
+        }
     }
+    Ok(merged)
+}
 
-    saw_response.then_some(merged)
+/// Merge bodies like [`merge_bodies`], parsing each one leniently: a body
+/// that is not a container list contributes no bindings.
+fn merge_bodies_lenient(bodies: &[String]) -> ContainerPortMap {
+    let Ok(map) = merge_bodies(bodies, |body| {
+        Ok::<_, Infallible>(api::parse_containers_json(body))
+    });
+    map
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-
-    #[test]
-    fn merge_daemon_responses_combines_multiple_runtime_payloads() {
-        let merged = merge_daemon_responses([
-            "[]",
-            r#"[{
-                "Names": ["/backend-postgres-1"],
-                "Image": "postgres:16",
-                "Ports": [{"PublicPort": 5432, "Type": "tcp"}]
-            }]"#,
-        ])
-        .expect("at least one daemon response should produce a map");
-
-        let container = merged
-            .get(None, 5432, Protocol::Tcp)
-            .expect("podman/docker ports should survive multi-daemon merging");
-        assert_eq!(container.name, "backend-postgres-1");
-        assert_eq!(container.image, "postgres:16");
-    }
 
     #[test]
     fn lookup_keeps_protocol_bindings_separate() {
@@ -1933,58 +1873,55 @@ mod tests {
         );
     }
 
-    // ── merge_daemon_response_bodies ─────────────────────────────────
+    // ── merge_bodies ─────────────────────────────────────────────────
 
-    #[test]
-    fn merge_bodies_empty_iterator_returns_none() {
-        let result = merge_daemon_response_bodies::<&str, Vec<&str>>(vec![]);
-        assert!(result.is_none(), "no responses means None");
+    fn bodies(bodies: &[&str]) -> Vec<String> {
+        bodies.iter().map(ToString::to_string).collect()
     }
 
     #[test]
-    fn merge_bodies_single_empty_array() {
-        let result = merge_daemon_response_bodies(["[]"]);
+    fn merge_bodies_combines_every_daemon() {
+        let bodies = bodies(&[
+            "[]",
+            r#"[{"Names": ["/db"], "Image": "postgres:16", "Ports": [{"PublicPort": 5432}]}]"#,
+            r#"[{"Names": ["/web"], "Ports": [{"PublicPort": 80}]}, {"Names": ["/idle"]}]"#,
+        ]);
+        let lenient = merge_bodies_lenient(&bodies);
+        assert_eq!(lenient.len(), 2, "every daemon's bindings are kept");
         assert_eq!(
-            result.as_deref(),
-            Some("[]"),
-            "single empty array should produce []"
+            lenient
+                .get(None, 5432, Protocol::Tcp)
+                .map(|info| info.image.as_str()),
+            Some("postgres:16"),
+            "a lower-priority daemon's containers survive the merge"
+        );
+
+        let strict = merge_bodies(&bodies, api::parse_containers_json_strict).expect("valid lists");
+        assert_eq!(strict, lenient, "both modes merge valid lists the same way");
+        assert!(
+            merge_bodies(&[], api::parse_containers_json_strict)
+                .expect("nothing to parse")
+                .is_empty()
         );
     }
 
     #[test]
-    fn merge_bodies_concatenates_non_empty_arrays() {
-        let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, r#"[{"b":2},{"c":3}]"#]);
-        assert_eq!(
-            result.as_deref(),
-            Some(r#"[{"a":1},{"b":2},{"c":3}]"#),
-            "elements from both arrays should be combined"
+    fn merge_bodies_rejects_a_reply_that_is_not_a_list_only_when_strict() {
+        let bodies = bodies(&[
+            r#"{"message": "page not found"}"#,
+            r#"[{"Names": ["/web"], "Ports": [{"PublicPort": 80}]}]"#,
+        ]);
+        let error = merge_bodies(&bodies, api::parse_containers_json_strict)
+            .map_err(Error::from)
+            .expect_err("an error object is not a container list");
+        assert!(
+            matches!(error, Error::InvalidResponse { .. }),
+            "got {error:?}"
         );
-    }
 
-    #[test]
-    fn merge_bodies_skips_empty_arrays_without_spurious_commas() {
-        let result = merge_daemon_response_bodies(["[]", r#"[{"a":1}]"#]);
-        assert_eq!(
-            result.as_deref(),
-            Some(r#"[{"a":1}]"#),
-            "empty arrays should not introduce leading commas"
-        );
-    }
-
-    #[test]
-    fn merge_bodies_trailing_empty_array_does_not_add_comma() {
-        let result = merge_daemon_response_bodies([r#"[{"a":1}]"#, "[]"]);
-        assert_eq!(
-            result.as_deref(),
-            Some(r#"[{"a":1}]"#),
-            "trailing empty array should not add trailing comma"
-        );
-    }
-
-    #[test]
-    fn merge_bodies_all_empty_arrays_produces_empty_array() {
-        let result = merge_daemon_response_bodies(["[]", "[]"]);
-        assert_eq!(result.as_deref(), Some("[]"), "all-empty should produce []");
+        let lenient = merge_bodies_lenient(&bodies);
+        assert_eq!(lenient.len(), 1, "the error object contributes nothing");
+        assert!(lenient.get(None, 80, Protocol::Tcp).is_some());
     }
 
     // ── is_safe_container_id ─────────────────────────────────────────
@@ -2523,7 +2460,7 @@ mod tests {
         for responses in [vec![first.clone(), second.clone()], vec![second, first]] {
             let bodies = select_daemon_bodies(responses);
 
-            let lenient = merge_prioritized_responses(&bodies).expect("responses were given");
+            let lenient = merge_bodies_lenient(&bodies);
             assert_eq!(
                 lenient
                     .get(None, 8080, Protocol::Tcp)
@@ -2532,8 +2469,8 @@ mod tests {
                 "the earlier default endpoint wins a shared key"
             );
 
-            let merged = merge_prioritized_bodies(&bodies).expect("responses were given");
-            let strict = api::parse_containers_json_strict(&merged).expect("valid JSON");
+            let strict =
+                merge_bodies(&bodies, api::parse_containers_json_strict).expect("valid JSON");
             assert_eq!(
                 strict
                     .get(None, 8080, Protocol::Tcp)

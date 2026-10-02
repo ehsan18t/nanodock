@@ -265,6 +265,13 @@ pub fn docker_host_tcp_addr(docker_host: &str) -> Option<String> {
 /// dropped, an empty host is [`DEFAULT_TCP_HOST`], and a missing port is
 /// [`DEFAULT_TCP_PORT`].
 fn tcp_host_port(address_and_path: &str) -> Option<String> {
+    // A Windows drive path (`C:/x`, `C:\x`) is not a host and port: without
+    // this check it would read as host `C` and trigger a DNS lookup.
+    if let [drive, b':', b'/' | b'\\', ..] = address_and_path.as_bytes()
+        && drive.is_ascii_alphabetic()
+    {
+        return None;
+    }
     let address = address_and_path
         .split_once('/')
         .map_or(address_and_path, |(address, _)| address);
@@ -284,6 +291,11 @@ fn tcp_host_port(address_and_path: &str) -> Option<String> {
             None => (address, None),
         },
     };
+    // Like the Docker CLI, a named host with an explicitly empty port
+    // (`tcp://docker.example:`) is malformed; only an empty host may omit it.
+    if !host.is_empty() && port == Some("") {
+        return None;
+    }
     let host = if host.is_empty() {
         DEFAULT_TCP_HOST
     } else {
@@ -1625,7 +1637,6 @@ mod tests {
             ("tcp://127.0.0.1:2375", "127.0.0.1:2375"),
             ("tcp://localhost", "localhost:2375"),
             ("tcp://10.0.0.5", "10.0.0.5:2375"),
-            ("tcp://docker.example:", "docker.example:2375"),
             ("tcp://127.0.0.1:2375/", "127.0.0.1:2375"),
             ("tcp://127.0.0.1:2375/v1.43/api", "127.0.0.1:2375"),
             ("tcp://host/", "host:2375"),
@@ -1668,7 +1679,12 @@ mod tests {
             "unix:///var/run/docker.sock",
             "npipe:////./pipe/docker_engine",
             "host:port",
+            "tcp://docker.example:",
+            "docker.example:",
             r"C:\docker",
+            "C:/docker",
+            "c:/Users/dev/docker.sock",
+            r"tcp://D:\x",
             "",
             "  ",
         ] {

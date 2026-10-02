@@ -2542,6 +2542,11 @@ mod tests {
     #[cfg(windows)]
     const ERROR_PIPE_CONNECTED: i32 = 535;
 
+    /// `ERROR_NO_DATA`: a client connected and already closed its end before
+    /// `ConnectNamedPipe` ran (the pipe is being closed).
+    #[cfg(windows)]
+    const ERROR_NO_DATA: i32 = 232;
+
     /// A pipe path no other test uses.
     #[cfg(windows)]
     fn test_pipe_path(tag: &str) -> String {
@@ -2606,18 +2611,24 @@ mod tests {
         unsafe { std::fs::File::from_raw_handle(handle) }
     }
 
-    /// Block until a client connects to the server instance.
+    /// Block until a client connects to the server instance. A client that
+    /// connected and already closed (as `PipeDaemon::finish` does to free a
+    /// waiting instance) counts as connected; the following read sees EOF.
     #[cfg(windows)]
     fn accept_pipe_client(instance: &std::fs::File) {
         // SAFETY: `instance` is an open pipe server handle, and a null
         // `overlapped` pointer asks for a blocking call.
         let connected = unsafe { ConnectNamedPipe(instance.as_raw_handle(), std::ptr::null_mut()) };
-        assert!(
-            connected != 0
-                || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED),
-            "ConnectNamedPipe failed: {}",
-            io::Error::last_os_error()
-        );
+        if connected == 0 {
+            let error = io::Error::last_os_error();
+            assert!(
+                matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_PIPE_CONNECTED | ERROR_NO_DATA)
+                ),
+                "ConnectNamedPipe failed: {error}"
+            );
+        }
     }
 
     /// Named pipe stand-in for a daemon, like [`TestDaemon`]: serves up to

@@ -1,0 +1,12 @@
+# Minimal Compose project for tests/daemon_it.rs. The docker-it CI job starts
+# it with `docker compose -p itproj -f tests/fixtures/compose.yaml up -d`, so
+# the container carries the com.docker.compose.project=itproj and
+# com.docker.compose.service=web labels the test checks.
+services:
+  web:
+    image: busybox
+    # tini forwards SIGTERM, so `compose down` does not wait out the grace period.
+    init: true
+    command: ["httpd", "-f", "-p", "80"]
+    ports:
+      - "${NANODOCK_IT_COMPOSE_PORT:-18100}:80"

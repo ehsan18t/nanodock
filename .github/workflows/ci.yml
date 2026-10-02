@@ -17,6 +17,10 @@
 # Package verify (Linux):
 #   - cargo package --list and cargo publish --dry-run
 #
+# Docker integration (Linux):
+#   - tests/daemon_it.rs against the runner's Docker Engine, over the unix
+#     socket and over a TCP DOCKER_HOST
+#
 # Linux benchmark execution:
 #   - gungraun instruction-count regressions vs PR merge-base
 
@@ -154,6 +158,113 @@ jobs:
 
       - name: "Package: cargo publish --dry-run"
         run: cargo publish --locked --dry-run
+
+  # Integration tests against a real Docker daemon (tests/daemon_it.rs).
+  #
+  # The unit tests drive fake daemons; this job proves detection, port
+  # matching, and stop/kill against the Docker Engine preinstalled on the
+  # runner. The job env below is the single source of the container names and
+  # ports: the containers are started from it and the tests read it.
+  docker-it:
+    name: Docker Integration (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NANODOCK_IT_WEB_NAME: nd-web
+      NANODOCK_IT_WILDCARD_PORT: "18080"
+      NANODOCK_IT_LOOPBACK_PORT: "18081"
+      NANODOCK_IT_RANGE: "18090-18092"
+      NANODOCK_IT_UDP_PORT: "18093"
+      NANODOCK_IT_COMPOSE_PROJECT: itproj
+      NANODOCK_IT_COMPOSE_SERVICE: web
+      NANODOCK_IT_COMPOSE_PORT: "18100"
+      NANODOCK_IT_STOP_NAME: nd-stop
+      NANODOCK_IT_STOP_PORT: "18110"
+      NANODOCK_IT_KILL_NAME: nd-kill
+      NANODOCK_IT_KILL_PORT: "18111"
+      NANODOCK_IT_TCP_KILL_NAME: nd-tcp-kill
+      COMPOSE_FILE: tests/fixtures/compose.yaml
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # 1.94.1
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          key: docker-it
+
+      - name: Build the integration tests
+        run: cargo test --locked --test daemon_it --no-run
+
+      - name: Install socat
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y socat
+
+      # Docker Hub pulls occasionally fail on shared runners; retry before
+      # giving up so a registry hiccup is not reported as a nanodock bug.
+      - name: Pull the test image
+        run: |
+          for attempt in 1 2 3 4 5; do
+            docker pull busybox && exit 0
+            echo "pull attempt $attempt failed, retrying"
+            sleep $((attempt * 5))
+          done
+          exit 1
+
+      # --init runs tini as PID 1, which forwards SIGTERM to httpd, so a
+      # graceful stop finishes at once instead of after the 10 second grace.
+      - name: Start the test containers
+        run: |
+          docker run -d --init --name "$NANODOCK_IT_WEB_NAME" \
+            -p "$NANODOCK_IT_WILDCARD_PORT:80" \
+            -p "127.0.0.1:$NANODOCK_IT_LOOPBACK_PORT:80" \
+            -p "$NANODOCK_IT_RANGE:8090-8092" \
+            -p "$NANODOCK_IT_UDP_PORT:5353/udp" \
+            busybox httpd -f -p 80
+          docker run -d --init --name "$NANODOCK_IT_STOP_NAME" \
+            -p "$NANODOCK_IT_STOP_PORT:80" busybox httpd -f -p 80
+          docker run -d --init --name "$NANODOCK_IT_KILL_NAME" \
+            -p "$NANODOCK_IT_KILL_PORT:80" busybox httpd -f -p 80
+          docker run -d --init --name "$NANODOCK_IT_TCP_KILL_NAME" busybox httpd -f -p 80
+          docker compose -p "$NANODOCK_IT_COMPOSE_PROJECT" up -d --wait
+          docker ps
+
+      - name: "Docker IT: unix socket"
+        env:
+          NANODOCK_IT: "1"
+        run: cargo test --locked --test daemon_it -- --test-threads=1 --nocapture
+
+      # socat runs as root and forwards TCP to the daemon socket. The socket is
+      # then made root-only, so the test process can reach the daemon over TCP
+      # alone: a pass proves detection and kill travel the DOCKER_HOST path.
+      - name: "Docker IT: DOCKER_HOST over TCP"
+        env:
+          NANODOCK_IT_TCP_HOST: tcp://127.0.0.1:2375
+        run: |
+          sudo socat TCP-LISTEN:2375,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock &
+          trap 'sudo chmod 660 /var/run/docker.sock; sudo pkill -x socat || true' EXIT
+          for attempt in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2375/_ping && break
+            if [ "$attempt" -eq 30 ]; then echo "socat forwarder never answered"; exit 1; fi
+            sleep 1
+          done
+          sudo chmod 600 /var/run/docker.sock
+          cargo test --locked --test daemon_it tcp_ -- --test-threads=1 --nocapture
+
+      - name: Clean up containers
+        if: always()
+        run: |
+          sudo chmod 660 /var/run/docker.sock || true
+          sudo pkill -x socat || true
+          docker compose -p "$NANODOCK_IT_COMPOSE_PROJECT" down -t 0 || true
+          docker rm -f "$NANODOCK_IT_WEB_NAME" "$NANODOCK_IT_STOP_NAME" \
+            "$NANODOCK_IT_KILL_NAME" "$NANODOCK_IT_TCP_KILL_NAME" || true
 
   # Linux-only instruction-count benchmarks with gungraun.
   #

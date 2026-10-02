@@ -17,14 +17,106 @@ use serde::Deserialize;
 use crate::ContainerInfo;
 use crate::api::short_container_id;
 
-/// Cache for rootless Podman container lookups keyed by process and network namespace.
+/// Resolves rootless Podman `rootlessport` helper processes back to their
+/// containers, caching what it reads.
 ///
-/// Available on every platform. Outside Linux it stays empty, because
-/// [`lookup_rootless_podman_container`] returns `None` there without using it.
-#[derive(Debug, Default)]
+/// When the Podman API socket is unavailable to the current process, the
+/// resolver falls back to local overlay storage metadata and Linux network
+/// namespace paths. It reads the storage once, on the first lookup, and
+/// remembers the result of every process it looks up.
+///
+/// **Use one resolver per scan.** The cache is never refreshed on its own:
+/// containers started after the first lookup are missing from it, and a
+/// process ID reused by a new `rootlessport` keeps the old answer. Create a
+/// new resolver for each scan, or call [`RootlessPodmanResolver::clear`]
+/// between scans.
+///
+/// Available on every platform. Outside Linux [`RootlessPodmanResolver::lookup`]
+/// returns `None` without touching the filesystem, so the resolver stays
+/// empty: rootless Podman's `rootlessport` helper only runs on a Linux host
+/// (a Podman machine on macOS or Windows runs it inside the VM).
+///
+/// ```
+/// use nanodock::RootlessPodmanResolver;
+///
+/// let mut resolver = RootlessPodmanResolver::new();
+/// // Only `rootlessport` processes are resolved.
+/// assert_eq!(resolver.lookup(1, "nginx"), None);
+/// ```
+#[derive(Debug)]
 pub struct RootlessPodmanResolver {
+    home: Option<PathBuf>,
     containers_by_netns: Option<HashMap<PathBuf, ContainerInfo>>,
     containers_by_pid: HashMap<u32, Option<ContainerInfo>>,
+}
+
+impl Default for RootlessPodmanResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RootlessPodmanResolver {
+    /// Create a resolver that searches the user's home directory, from
+    /// [`std::env::home_dir`], for rootless Podman storage.
+    ///
+    /// Storage is looked for below `$XDG_DATA_HOME`, then
+    /// `~/.local/share/containers`, then `/var/lib/containers`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            home: std::env::home_dir(),
+            containers_by_netns: None,
+            containers_by_pid: HashMap::new(),
+        }
+    }
+
+    /// Set the home directory below which rootless Podman storage is
+    /// searched, replacing the one from the environment, and clear the
+    /// cache. With `None`, only `$XDG_DATA_HOME` and `/var/lib/containers`
+    /// are searched.
+    #[must_use]
+    pub fn home(mut self, home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self.clear();
+        self
+    }
+
+    /// Resolve a rootless Podman `rootlessport` helper process back to its
+    /// container.
+    ///
+    /// Returns `None` when `process_name` is not `rootlessport`, when the
+    /// process shares no network namespace with exactly one known
+    /// container, and always outside Linux. The answer for each `pid` is
+    /// cached; see the type documentation for when to start over.
+    pub fn lookup(&mut self, pid: u32, process_name: &str) -> Option<ContainerInfo> {
+        if !cfg!(target_os = "linux") || !is_podman_rootlessport_process(process_name) {
+            return None;
+        }
+
+        if let Some(container) = self.containers_by_pid.get(&pid) {
+            return container.clone();
+        }
+
+        let netns_paths = read_process_netns_paths(pid);
+        let container = match_container_by_netns_paths(&netns_paths, self.containers_by_netns());
+        self.containers_by_pid.insert(pid, container.clone());
+        container
+    }
+
+    /// Forget everything read so far, so the next lookup reads the overlay
+    /// storage and the process again. The home directory is kept.
+    pub fn clear(&mut self) {
+        self.containers_by_netns = None;
+        self.containers_by_pid.clear();
+    }
+
+    /// The containers by network namespace path, read on first use.
+    fn containers_by_netns(&mut self) -> &HashMap<PathBuf, ContainerInfo> {
+        let home = self.home.as_deref();
+        self.containers_by_netns
+            .get_or_insert_with(|| load_rootless_podman_containers_by_netns(home))
+    }
 }
 
 #[derive(Deserialize)]
@@ -60,43 +152,10 @@ struct PodmanNamespace {
     path: Option<PathBuf>,
 }
 
-/// Resolve a rootless Podman `rootlessport` helper process back to its container.
-///
-/// When the Podman API socket is unavailable to the current process, this falls
-/// back to local overlay metadata and Linux network namespace paths.
-///
-/// Available on every platform with the same signature. On platforms other
-/// than Linux it always returns `None` without touching the filesystem or the
-/// resolver: rootless Podman's `rootlessport` helper only runs on a Linux host
-/// (a Podman machine on macOS or Windows runs it inside the VM).
-pub fn lookup_rootless_podman_container(
-    pid: u32,
-    process_name: &str,
-    resolver: &mut RootlessPodmanResolver,
-    home: Option<&Path>,
-) -> Option<ContainerInfo> {
-    if !cfg!(target_os = "linux") || !is_podman_rootlessport_process(process_name) {
-        return None;
-    }
-
-    if let Some(container) = resolver.containers_by_pid.get(&pid) {
-        return container.clone();
-    }
-
-    let containers_by_netns = resolver
-        .containers_by_netns
-        .get_or_insert_with(|| load_rootless_podman_containers_by_netns(home));
-    let container =
-        match_container_by_netns_paths(&read_process_netns_paths(pid), containers_by_netns);
-
-    resolver.containers_by_pid.insert(pid, container.clone());
-    container
-}
-
 /// Check whether a process name matches the Podman rootless port-forwarder.
 ///
 /// Matches `rootlessport` only (ASCII case-insensitive), which is the process
-/// [`lookup_rootless_podman_container`] can resolve. To recognize every
+/// [`RootlessPodmanResolver::lookup`] can resolve. To recognize every
 /// container runtime port proxy, use [`crate::is_container_proxy_process`].
 #[must_use]
 pub const fn is_podman_rootlessport_process(process_name: &str) -> bool {
@@ -173,13 +232,16 @@ fn podman_storage_container_info(container: &PodmanStorageContainer) -> Containe
         .metadata
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok());
+    // An empty name, in `names` or the metadata, falls through to the next
+    // source instead of hiding it.
     let name = container
         .names
-        .first()
-        .cloned()
-        .or_else(|| metadata.as_ref().and_then(|value| value.name.clone()))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| short_container_id(&container.id));
+        .iter()
+        .map(String::as_str)
+        .chain(metadata.as_ref().and_then(|value| value.name.as_deref()))
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .map_or_else(|| short_container_id(&container.id), ToOwned::to_owned);
     let image = metadata
         .and_then(|value| value.image_name)
         .unwrap_or_default();
@@ -301,11 +363,25 @@ mod tests {
         assert_eq!(container.image, "docker.io/library/postgres:14-alpine");
     }
 
+    /// Write a rootless overlay storage catalog with one container to
+    /// `overlay_root`, its network namespace at `netns_path`.
+    fn write_overlay_container(overlay_root: &Path, id: &str, entry: &str, netns_path: &str) {
+        let userdata = overlay_root.join(id).join("userdata");
+        fs::create_dir_all(&userdata).expect("create the container directory");
+        fs::write(overlay_root.join("containers.json"), format!("[{entry}]"))
+            .expect("write the container catalog");
+        fs::write(
+            userdata.join("config.json"),
+            format!(r#"{{"linux":{{"namespaces":[{{"type":"network","path":"{netns_path}"}}]}}}}"#),
+        )
+        .expect("write the runtime config");
+    }
+
     #[test]
     fn lookup_ignores_processes_other_than_rootlessport() {
-        let mut resolver = RootlessPodmanResolver::default();
+        let mut resolver = RootlessPodmanResolver::new().home(None);
 
-        let container = lookup_rootless_podman_container(1, "nginx", &mut resolver, None);
+        let container = resolver.lookup(1, "nginx");
 
         assert_eq!(container, None, "only rootlessport is resolved");
         assert!(
@@ -317,21 +393,87 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn lookup_returns_none_outside_linux() {
-        let home = TempDir::new().unwrap();
-        let mut resolver = RootlessPodmanResolver::default();
+        let home = TempDir::new().expect("create a home directory");
+        let mut resolver = RootlessPodmanResolver::new().home(Some(home.path().to_path_buf()));
 
-        let container = lookup_rootless_podman_container(
-            std::process::id(),
-            "rootlessport",
-            &mut resolver,
-            Some(home.path()),
-        );
+        let container = resolver.lookup(std::process::id(), "rootlessport");
 
         assert_eq!(container, None, "rootlessport only runs on a Linux host");
         assert!(
             resolver.containers_by_netns.is_none() && resolver.containers_by_pid.is_empty(),
             "the resolver stays untouched outside Linux"
         );
+    }
+
+    #[test]
+    fn resolver_reads_storage_below_its_home_and_clear_forgets_it() {
+        let home = TempDir::new().expect("create a home directory");
+        let overlay_root = home
+            .path()
+            .join(".local/share/containers/storage/overlay-containers");
+        let netns_path = "/run/user/1000/netns/netns-home-test";
+        write_overlay_container(
+            &overlay_root,
+            "abc123",
+            r#"{"id": "abc123", "names": ["web"]}"#,
+            netns_path,
+        );
+        let mut resolver = RootlessPodmanResolver::new().home(Some(home.path().to_path_buf()));
+
+        let found = resolver
+            .containers_by_netns()
+            .get(Path::new(netns_path))
+            .map(|info| info.name.clone());
+        assert_eq!(found.as_deref(), Some("web"), "storage below home is read");
+
+        resolver.containers_by_pid.insert(42, None);
+        resolver.clear();
+        assert!(
+            resolver.containers_by_netns.is_none() && resolver.containers_by_pid.is_empty(),
+            "clear forgets the storage and every process"
+        );
+        assert_eq!(
+            resolver.home.as_deref(),
+            Some(home.path()),
+            "clear keeps the home directory"
+        );
+    }
+
+    #[test]
+    fn empty_names_fall_back_to_the_metadata_name_then_the_short_id() {
+        let id = "e603f8ebd438b8405b9b835b9d38cb913ea2479f5b29f8e4308b88e9a92e8c4b";
+        let metadata = r#"{\"name\":\"from-metadata\"}"#;
+        let cases = [
+            (
+                format!(r#"{{"id": "{id}", "names": [""], "metadata": "{metadata}"}}"#),
+                "from-metadata",
+                "an empty name must not hide the metadata name",
+            ),
+            (
+                format!(r#"{{"id": "{id}", "names": ["", "second"]}}"#),
+                "second",
+                "the first non-empty name wins",
+            ),
+            (
+                format!(r#"{{"id": "{id}", "metadata": "{metadata}"}}"#),
+                "from-metadata",
+                "missing names fall back to the metadata name",
+            ),
+            (
+                format!(r#"{{"id": "{id}", "names": [" "], "metadata": "{{\"name\":\"\"}}"}}"#),
+                "e603f8ebd438",
+                "no usable name falls back to the short id",
+            ),
+        ];
+        for (entry, expected, why) in cases {
+            let container: PodmanStorageContainer =
+                serde_json::from_str(&entry).expect("valid catalog entry");
+            assert_eq!(
+                podman_storage_container_info(&container).name,
+                expected,
+                "{why}"
+            );
+        }
     }
 
     #[test]

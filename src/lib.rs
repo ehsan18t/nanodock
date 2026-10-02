@@ -111,8 +111,8 @@ use serde::{Deserialize, Serialize};
 pub use api::parse_containers_json;
 pub use api::parse_containers_json_strict;
 pub use api::short_container_id;
+pub use podman::RootlessPodmanResolver;
 pub use podman::is_podman_rootlessport_process;
-pub use podman::{RootlessPodmanResolver, lookup_rootless_podman_container};
 pub use proxy::is_container_proxy_process;
 
 // ── Error type ───────────────────────────────────────────────────────

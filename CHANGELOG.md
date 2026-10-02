@@ -23,7 +23,9 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - Default Unix socket paths that do not exist are now skipped before any worker thread is spawned, and paths that resolve to the same file (for example `/var/run/docker.sock` symlinked to Docker Desktop's, OrbStack's, or Podman's socket) are queried once, at the first position. `DOCKER_HOST=unix://` still replaces the defaults and is not filtered.
 - **Security:** a default Unix socket whose file is owned by neither the current user nor root is skipped, so a socket another local user planted at a well-known path can neither add containers to detection nor receive a stop request. An explicit `DOCKER_HOST=unix://` path is not checked.
 - `is_container_proxy_process(name)` recognizes container runtime port-proxy processes (`docker-proxy`, `rootlesskit`, `rootlessport`, `rootlessport-child`, `slirp4netns`, `pasta`, `pasta.avx2`, `com.docker.backend`, `com.docker.vpnkit`, `vpnkit`, `wslrelay`, `gvproxy`, `limactl`), ignoring ASCII case and a trailing `.exe` and accepting names truncated to 15 bytes by Linux or to 16 bytes by macOS (such as `com.docker.backe`). A truncated name matches only when it is exactly 15 or 16 bytes long and is the start of a longer known name. Callers no longer need to keep their own list.
-- `RootlessPodmanResolver`, `lookup_rootless_podman_container`, and `is_podman_rootlessport_process` are now available on every platform with the same signatures, so callers no longer need `cfg(target_os = "linux")` gates around them. Outside Linux the lookup always returns `None` without touching the filesystem; Linux behavior is unchanged.
+- `RootlessPodmanResolver` and `is_podman_rootlessport_process` are now available on every platform with the same signatures, so callers no longer need `cfg(target_os = "linux")` gates around them. Outside Linux the lookup always returns `None` without touching the filesystem.
+- `RootlessPodmanResolver::clear` forgets the cached overlay storage and process answers. The resolver never refreshes its cache on its own, so use one resolver per scan or clear it between scans.
+- A rootless Podman container whose first name is empty now takes its next name, or the name in its storage metadata, instead of falling back to its short ID.
 
 ### Changed
 
@@ -39,6 +41,7 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** `PublishedContainerMatch::Match` holds `&Arc<ContainerInfo>` instead of `&ContainerInfo`. Field access and `Display` work through the `Arc` as before, but code that returns the bound value as `&ContainerInfo` or clones it into a `ContainerInfo` must say so: use `PublishedContainerMatch::container`, or `ContainerInfo::clone(info)` (or `Arc::clone(info)` to share it).
 - **Breaking:** `StopOutcome` no longer implements `Copy`, so a later variant can carry data that is not `Copy`. Clone it where a copy was relied on; `StopOutcome::is_stopped` takes `&self`.
 - **Breaking:** `ContainerInfo` and `PublishedContainerMatch` no longer implement `Hash`, so `ContainerInfo` can gain fields that cannot be hashed (such as a label map) in a minor release. Key a set or map on `info.id` instead of the whole `ContainerInfo`.
+- **Breaking:** `lookup_rootless_podman_container(pid, name, &mut resolver, home)` is replaced by the method `RootlessPodmanResolver::lookup(pid, name)`. The home directory belongs to the resolver: `RootlessPodmanResolver::new()` reads it from the environment and `.home(home)` replaces it, instead of being passed on every call while only the first call used it.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
 - **Security:** port ranges can no longer make a small reply expand to millions of bindings. One daemon reply expands to at most 131072 bindings (every port of both protocols); past that, the rest of the reply is ignored and the bindings already parsed are kept. A range repeated within one container is expanded once. Before, a reply of a few kilobytes of `"range": 65535` entries took about 0.7 seconds and millions of map inserts to parse.
 - `Client::detect` and `detect_containers` parse each daemon's reply on its own and merge the results, instead of splicing the replies into one JSON array first. A reply that is not a JSON array, such as `{"message": "page not found"}`, now fails with `Error::InvalidResponse`; before, it was spliced into the array as a container without ports and detection succeeded with nothing found. Background detection still skips such a reply.
@@ -161,6 +164,21 @@ let again = outcome; // StopOutcome was Copy
 // 0.2: key on the container ID, and clone or borrow the outcome
 let seen: HashSet<String> = containers.map(|info| info.id.clone()).collect();
 let again = outcome.clone();
+```
+
+Resolving a rootless Podman `rootlessport` process:
+
+```rust,ignore
+// 0.1
+let mut resolver = RootlessPodmanResolver::default();
+let found = nanodock::lookup_rootless_podman_container(pid, name, &mut resolver, home.as_deref());
+// 0.2, home directory read from the environment
+let mut resolver = RootlessPodmanResolver::new();
+let found = resolver.lookup(pid, name);
+// 0.2, a specific home directory
+let mut resolver = RootlessPodmanResolver::new().home(home);
+// one resolver per scan, or forget the cache between scans
+resolver.clear();
 ```
 
 `parse_containers_json_strict` now fails with `nanodock::ParseError`; code that named `serde_json::Error` should name `ParseError` or use `impl std::error::Error`.

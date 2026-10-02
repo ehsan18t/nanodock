@@ -647,24 +647,6 @@ pub enum ProxyFallback {
     Deny,
 }
 
-#[cfg(test)]
-fn test_container_info(id: &str, name: &str, image: &str) -> ContainerInfo {
-    ContainerInfo::new(id, name, image)
-}
-
-#[cfg(test)]
-fn insert_test_container(
-    map: &mut ContainerPortMap,
-    host_ip: Option<IpAddr>,
-    port: u16,
-    proto: Protocol,
-    id: &str,
-    name: &str,
-    image: &str,
-) {
-    map.insert(host_ip, port, proto, test_container_info(id, name, image));
-}
-
 /// Result of matching a socket against published container port bindings.
 ///
 /// A match borrows the [`Arc`] the [`ContainerPortMap`] stores, so a caller
@@ -1541,6 +1523,18 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn insert_test_container(
+        map: &mut ContainerPortMap,
+        host_ip: Option<IpAddr>,
+        port: u16,
+        proto: Protocol,
+        id: &str,
+        name: &str,
+        image: &str,
+    ) {
+        map.insert(host_ip, port, proto, ContainerInfo::new(id, name, image));
+    }
+
     #[test]
     fn lookup_keeps_protocol_bindings_separate() {
         let mut map = ContainerPortMap::new();
@@ -1666,11 +1660,11 @@ mod tests {
         let map: ContainerPortMap = [
             (
                 (None, 80, Protocol::Tcp),
-                test_container_info("a", "web", "nginx"),
+                ContainerInfo::new("a", "web", "nginx"),
             ),
             (
                 (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 53, Protocol::Udp),
-                test_container_info("b", "dns", "bind9"),
+                ContainerInfo::new("b", "dns", "bind9"),
             ),
         ]
         .into_iter()
@@ -1692,7 +1686,7 @@ mod tests {
     #[test]
     fn lookup_shares_the_stored_arc() {
         let mut map = ContainerPortMap::new();
-        let shared = Arc::new(test_container_info("a", "web", "nginx"));
+        let shared = Arc::new(ContainerInfo::new("a", "web", "nginx"));
         map.insert(None, 80, Protocol::Tcp, Arc::clone(&shared));
         // Bound on another address, so the lookup below needs the fallback.
         map.insert(
@@ -1737,7 +1731,7 @@ mod tests {
                 None,
                 80,
                 Protocol::Tcp,
-                test_container_info("a", "old", "img")
+                ContainerInfo::new("a", "old", "img")
             )
             .is_none()
         );
@@ -1745,7 +1739,7 @@ mod tests {
             None,
             80,
             Protocol::Tcp,
-            test_container_info("b", "new", "img"),
+            ContainerInfo::new("b", "new", "img"),
         );
         assert_eq!(
             previous.map(|info| info.name.clone()).as_deref(),
@@ -1813,62 +1807,45 @@ mod tests {
     // ── interpret_stop_status ────────────────────────────────────────
 
     #[test]
-    fn interpret_stop_status_204_means_stopped() {
-        assert_eq!(
-            interpret_stop_status(204, StopKind::Graceful),
-            StopOutcome::Stopped,
-            "204 should mean stopped for graceful stop"
-        );
-        assert_eq!(
-            interpret_stop_status(204, StopKind::Kill),
-            StopOutcome::Stopped,
-            "204 should mean stopped for kill"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_304_means_already_stopped() {
-        assert_eq!(
-            interpret_stop_status(304, StopKind::Graceful),
-            StopOutcome::AlreadyStopped,
-            "304 from stop endpoint means already stopped"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_409_on_kill_means_already_stopped() {
-        assert_eq!(
-            interpret_stop_status(409, StopKind::Kill),
-            StopOutcome::AlreadyStopped,
-            "409 from kill endpoint means container not running"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_409_on_graceful_is_rejected() {
-        assert_eq!(
-            interpret_stop_status(409, StopKind::Graceful),
-            StopOutcome::Rejected { status: 409 },
-            "409 on a graceful stop is unexpected and should be reported with its status"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_404_means_not_found() {
-        assert_eq!(
-            interpret_stop_status(404, StopKind::Graceful),
-            StopOutcome::NotFound,
-            "404 means container not found"
-        );
-    }
-
-    #[test]
-    fn interpret_stop_status_500_is_rejected() {
-        assert_eq!(
-            interpret_stop_status(500, StopKind::Graceful),
-            StopOutcome::Rejected { status: 500 },
-            "a server error is reported with its status"
-        );
+    fn interpret_stop_status_maps_each_status() {
+        use StopKind::{Graceful, Kill};
+        let cases = [
+            (204, Graceful, StopOutcome::Stopped, "204 means stopped"),
+            (204, Kill, StopOutcome::Stopped, "204 means killed"),
+            (
+                304,
+                Graceful,
+                StopOutcome::AlreadyStopped,
+                "304 from stop means already stopped",
+            ),
+            (
+                409,
+                Kill,
+                StopOutcome::AlreadyStopped,
+                "409 from kill means not running",
+            ),
+            (
+                409,
+                Graceful,
+                StopOutcome::Rejected { status: 409 },
+                "409 on a graceful stop is unexpected",
+            ),
+            (404, Graceful, StopOutcome::NotFound, "404 means not found"),
+            (404, Kill, StopOutcome::NotFound, "404 means not found"),
+            (
+                500,
+                Graceful,
+                StopOutcome::Rejected { status: 500 },
+                "a server error is reported with its status",
+            ),
+        ];
+        for (status, kind, expected, why) in cases {
+            assert_eq!(
+                interpret_stop_status(status, kind),
+                expected,
+                "{status} on {kind:?}: {why}"
+            );
+        }
     }
 
     #[test]
@@ -2331,7 +2308,7 @@ mod tests {
             None,
             80,
             Protocol::Tcp,
-            test_container_info("a", "web", "nginx"),
+            ContainerInfo::new("a", "web", "nginx"),
         );
         tx.send(Ok(map)).expect("receiver alive");
         let handle = DetectionHandle {
@@ -2432,14 +2409,6 @@ mod tests {
             prioritized_targets(None, None, true, defaults),
             vec![(false, "default-a"), (false, "default-b")]
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_local_override_replaces_defaults() {
-        const {
-            assert!(LOCAL_OVERRIDE_REPLACES_DEFAULTS);
-        }
     }
 
     // ── Merge priority ───────────────────────────────────────────────

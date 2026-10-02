@@ -331,33 +331,27 @@ mod tests {
 
     #[test]
     fn load_podman_rootless_containers_from_overlay_root_reads_metadata() {
-        let overlay_root = TempDir::new().unwrap();
+        let overlay_root = TempDir::new().expect("create an overlay root");
         let container_id = "e603f8ebd438b8405b9b835b9d38cb913ea2479f5b29f8e4308b88e9a92e8c4b";
         let netns_path = "/run/user/1000/netns/netns-demo";
 
-        fs::create_dir_all(overlay_root.path().join(container_id).join("userdata")).unwrap();
-        fs::write(
-            overlay_root.path().join("containers.json"),
-            format!(
-                r#"[{{
+        write_overlay_container(
+            overlay_root.path(),
+            container_id,
+            &format!(
+                r#"{{
                     "id": "{container_id}",
                     "names": ["ensurily-postgres-dev"],
                     "metadata": "{{\"image-name\":\"docker.io/library/postgres:14-alpine\",\"name\":\"ensurily-postgres-dev\"}}"
-                }}]"#
+                }}"#
             ),
-        )
-        .unwrap();
-        fs::write(
-            overlay_root
-                .path()
-                .join(container_id)
-                .join("userdata/config.json"),
-            format!(r#"{{"linux":{{"namespaces":[{{"type":"network","path":"{netns_path}"}}]}}}}"#),
-        )
-        .unwrap();
+            netns_path,
+        );
 
         let containers = load_podman_rootless_containers_from_overlay_root(overlay_root.path());
-        let container = containers.get(Path::new(netns_path)).unwrap();
+        let container = containers
+            .get(Path::new(netns_path))
+            .expect("the container is found by its network namespace");
 
         assert_eq!(container.name, "ensurily-postgres-dev");
         assert_eq!(container.image, "docker.io/library/postgres:14-alpine");
@@ -489,7 +483,8 @@ mod tests {
             ),
         );
 
-        let container = match_container_by_netns_paths(&[netns_path], &containers).unwrap();
+        let container = match_container_by_netns_paths(&[netns_path], &containers)
+            .expect("one container owns the namespace");
         assert_eq!(container.name, "ensurily-redis-dev");
     }
 

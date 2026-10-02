@@ -159,6 +159,9 @@ impl<S: SocketTimeouts + Write> Write for DeadlineStream<S> {
 /// Port of a `tcp://` `DOCKER_HOST` that names none, as in the Docker CLI.
 const DEFAULT_TCP_PORT: u16 = 2375;
 
+/// Host of a `tcp://` `DOCKER_HOST` that names none, as in the Docker CLI.
+const DEFAULT_TCP_HOST: &str = "127.0.0.1";
+
 /// The local `DOCKER_HOST` scheme this platform supports.
 const LOCAL_SCHEME: &str = if cfg!(windows) { "npipe" } else { "unix" };
 
@@ -224,25 +227,33 @@ fn is_pipe_path(path: &str) -> bool {
 
 /// Extract a TCP address from a `DOCKER_HOST` value.
 ///
-/// Accepts what the Docker CLI accepts: `tcp://host:port`, `tcp://host`
-/// (port 2375), an IPv6 literal in brackets (`tcp://[::1]:2375` or
-/// `tcp://[::1]`), surrounding whitespace, any letter case in the scheme,
-/// and a trailing slash or path after the address, which is ignored.
-/// Returns `host:port`, or `None` for a malformed address or another
-/// scheme. A scheme nanodock does not support at all (such as `ssh://`,
-/// `fd://`, or `http://`) is logged at debug level and otherwise ignored,
-/// so only the default endpoints are used.
+/// Reads the forms the Docker CLI reads: `tcp://host:port`, `tcp://host`
+/// (port 2375), an empty host (`tcp://` or `tcp://:2376`, meaning
+/// `127.0.0.1`), an IPv6 literal in brackets (`tcp://[::1]:2375` or
+/// `tcp://[::1]`), a value without a scheme (`host:port`, read as
+/// `tcp://`), surrounding whitespace, and a trailing slash or path after
+/// the address, which is ignored. As a leniency of its own, nanodock also
+/// accepts the scheme in any letter case, which the Docker CLI rejects.
+/// Returns `host:port`, or `None` for an empty value, a malformed address,
+/// or another scheme. A scheme nanodock does not support at all (such as
+/// `ssh://`, `fd://`, or `http://`) is logged at debug level and otherwise
+/// ignored, so only the default endpoints are used.
 pub fn docker_host_tcp_addr(docker_host: &str) -> Option<String> {
-    let Some((scheme, rest)) = split_scheme(docker_host) else {
-        debug!("ignoring DOCKER_HOST without a scheme: value={docker_host}");
-        return None;
-    };
-    if !scheme.eq_ignore_ascii_case("tcp") {
-        if !scheme.eq_ignore_ascii_case(LOCAL_SCHEME) {
-            debug!("ignoring DOCKER_HOST with an unsupported scheme: scheme={scheme}");
-        }
+    let trimmed = docker_host.trim();
+    if trimmed.is_empty() {
         return None;
     }
+    let rest = match split_scheme(trimmed) {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("tcp") => rest,
+        Some((scheme, _)) => {
+            if !scheme.eq_ignore_ascii_case(LOCAL_SCHEME) {
+                debug!("ignoring DOCKER_HOST with an unsupported scheme: scheme={scheme}");
+            }
+            return None;
+        }
+        // Like the Docker CLI, a value without a scheme is a TCP address.
+        None => trimmed,
+    };
     let addr = tcp_host_port(rest);
     if addr.is_none() {
         debug!("ignoring malformed DOCKER_HOST tcp:// address: address={rest}");
@@ -251,7 +262,8 @@ pub fn docker_host_tcp_addr(docker_host: &str) -> Option<String> {
 }
 
 /// `host:port` from what follows `tcp://`: any path after the address is
-/// dropped, and a missing port is [`DEFAULT_TCP_PORT`].
+/// dropped, an empty host is [`DEFAULT_TCP_HOST`], and a missing port is
+/// [`DEFAULT_TCP_PORT`].
 fn tcp_host_port(address_and_path: &str) -> Option<String> {
     let address = address_and_path
         .split_once('/')
@@ -272,9 +284,11 @@ fn tcp_host_port(address_and_path: &str) -> Option<String> {
             None => (address, None),
         },
     };
-    if host.is_empty() {
-        return None;
-    }
+    let host = if host.is_empty() {
+        DEFAULT_TCP_HOST
+    } else {
+        host
+    };
     let port = match port {
         None | Some("") => DEFAULT_TCP_PORT,
         Some(port) => port.parse().ok()?,
@@ -1577,7 +1591,7 @@ mod tests {
     // ── DOCKER_HOST parsing ──────────────────────────────────────────
 
     #[test]
-    fn docker_host_tcp_addr_accepts_docker_cli_forms() {
+    fn docker_host_tcp_addr_accepts_docker_cli_forms_and_any_scheme_case() {
         for (value, expected) in [
             ("tcp://127.0.0.1:2375", "127.0.0.1:2375"),
             ("tcp://localhost", "localhost:2375"),
@@ -1592,6 +1606,15 @@ mod tests {
             ("tcp://[::1]:2375", "[::1]:2375"),
             ("tcp://[::1]", "[::1]:2375"),
             ("tcp://[fe80::1]:2376/", "[fe80::1]:2376"),
+            ("tcp://", "127.0.0.1:2375"),
+            ("tcp://:2376", "127.0.0.1:2376"),
+            ("tcp://:2376/", "127.0.0.1:2376"),
+            ("tcp:///path", "127.0.0.1:2375"),
+            ("127.0.0.1:2375", "127.0.0.1:2375"),
+            (" docker.example:2376 ", "docker.example:2376"),
+            ("localhost", "localhost:2375"),
+            (":2376", "127.0.0.1:2376"),
+            ("[::1]:2376", "[::1]:2376"),
         ] {
             assert_eq!(
                 docker_host_tcp_addr(value).as_deref(),
@@ -1604,9 +1627,6 @@ mod tests {
     #[test]
     fn docker_host_tcp_addr_rejects_malformed_addresses_and_other_schemes() {
         for value in [
-            "tcp://",
-            "tcp://:2375",
-            "tcp:///path",
             "tcp://host:port",
             "tcp://host:70000",
             "tcp://::1:2375",
@@ -1618,8 +1638,10 @@ mod tests {
             "http://127.0.0.1:2375",
             "unix:///var/run/docker.sock",
             "npipe:////./pipe/docker_engine",
-            "127.0.0.1:2375",
+            "host:port",
+            r"C:\docker",
             "",
+            "  ",
         ] {
             assert_eq!(
                 docker_host_tcp_addr(value),

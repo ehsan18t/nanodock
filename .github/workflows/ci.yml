@@ -1,15 +1,8 @@
 # nanodock - CI Pipeline
 # Enforces code quality on pull requests. All checks must pass before merging.
 #
-# Gates (ALL must pass):
-#   1. cargo fmt --check            -> consistent formatting
-#   2. cargo clippy (deny)          -> zero lint warnings (all+pedantic+nursery),
-#                                      default and all features
-#   3. cargo test --locked          -> all tests pass, Cargo.lock respected
-#   4. cargo bench --no-run         -> benchmarks compile without errors
-#   5. cargo build                  -> library compiles
-#   6. cargo doc                    -> documentation + doc-comment format valid
-#   7. cargo deny check             -> no vulnerable/banned dependencies
+# Quality gates 1 to 7: the list lives in docs/CONTRIBUTING.md (Quality Gates);
+# each step below is named after the gate it runs.
 #
 # MSRV (Linux):
 #   - cargo check on Rust 1.89, the rust-version declared in Cargo.toml

@@ -1356,7 +1356,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("docker.sock");
         std::fs::write(&socket, b"").expect("create socket file");
-        // Safety: getuid() is a simple syscall with no preconditions.
+        // SAFETY: getuid() is a simple syscall with no preconditions.
         let uid = unsafe { libc::getuid() };
 
         assert!(

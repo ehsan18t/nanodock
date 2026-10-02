@@ -1343,7 +1343,7 @@ fn docker_host_tcp_endpoint(docker_host: Option<&str>) -> Option<DaemonEndpoint>
 /// The well-known local daemon sockets for the current user.
 #[cfg(unix)]
 fn default_local_endpoints(home: Option<PathBuf>) -> impl Iterator<Item = DaemonEndpoint> {
-    // Safety: getuid() is a simple syscall with no preconditions.
+    // SAFETY: getuid() is a simple syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
     ipc::unix_socket_paths(uid, home)
         .into_iter()

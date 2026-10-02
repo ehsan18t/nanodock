@@ -2625,7 +2625,8 @@ mod tests {
             FakeTarget::Local(body) => Ok((*body).to_string()),
             FakeTarget::Fail(error) => Err(error()),
             FakeTarget::Hung => {
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                // Far past every test deadline; the worker is detached.
+                std::thread::sleep(std::time::Duration::from_secs(10));
                 Err(Error::Timeout { endpoint: None })
             }
         }
@@ -2686,7 +2687,8 @@ mod tests {
                 (false, FakeTarget::Hung),
             ],
             fetch_fake,
-            Instant::now() + std::time::Duration::from_millis(200),
+            // Long enough that the failing target always reports in time.
+            Instant::now() + std::time::Duration::from_secs(2),
         )
         .expect_err("no endpoint answered in time");
         assert!(
@@ -2817,7 +2819,7 @@ mod tests {
                 (false, FakeTarget::Local("[2]")),
             ],
             fetch_fake,
-            started + std::time::Duration::from_millis(300),
+            started + std::time::Duration::from_secs(2),
         )
         .expect("the local daemons answered");
         let elapsed = started.elapsed();
@@ -2829,7 +2831,7 @@ mod tests {
             "a refused DOCKER_HOST must not hide the local daemons"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < std::time::Duration::from_secs(4),
             "the shared budget bounds the pass, took {elapsed:?}"
         );
     }
@@ -2840,7 +2842,7 @@ mod tests {
         let bodies = collect_daemon_bodies(
             vec![(true, FakeTarget::Hung), (false, FakeTarget::Local("[1]"))],
             fetch_fake,
-            started + std::time::Duration::from_millis(200),
+            started + std::time::Duration::from_secs(2),
         )
         .expect("the local daemon answered");
         let elapsed = started.elapsed();
@@ -2851,7 +2853,7 @@ mod tests {
             "a blackholed DOCKER_HOST must not starve the local endpoints"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < std::time::Duration::from_secs(5),
             "a hung endpoint must not outlive the budget, took {elapsed:?}"
         );
     }

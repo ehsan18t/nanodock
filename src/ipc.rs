@@ -1190,6 +1190,13 @@ mod tests {
         }
     }
 
+    /// Keep the connection open, without answering, until the client closes
+    /// it: a daemon that went silent, with no sleep the test must outlast.
+    fn hold_until_client_closes(stream: &mut impl Read) {
+        let mut byte = [0_u8; 1];
+        while matches!(stream.read(&mut byte), Ok(read) if read > 0) {}
+    }
+
     /// Whether any recorded request line is a POST (a stop or kill).
     fn any_post(requests: &[String]) -> bool {
         requests.iter().any(|line| line.starts_with("POST "))
@@ -1602,25 +1609,34 @@ mod tests {
 
     #[test]
     fn fetch_all_does_not_wait_for_stuck_workers() {
+        // The stuck worker blocks until released below (or for 10 seconds),
+        // far past the 2 second deadline the fast worker easily meets.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
         let started = Instant::now();
         let fan_out = fetch_all(
-            [0_u64, 3000],
-            |delay_ms| {
-                std::thread::sleep(Duration::from_millis(delay_ms));
-                delay_ms
+            [false, true],
+            move |stuck| {
+                if stuck {
+                    let released = released.lock().expect("release lock");
+                    let _woken = released.recv_timeout(Duration::from_secs(10));
+                }
+                stuck
             },
-            started + Duration::from_millis(300),
+            started + Duration::from_secs(2),
         );
+        let elapsed = started.elapsed();
+        drop(release);
 
         assert_eq!(
             fan_out.results,
-            vec![0],
+            vec![false],
             "the fast answer must survive a stuck sibling"
         );
         assert_eq!(fan_out.unfinished, 1, "the stuck worker is counted");
         assert!(
-            started.elapsed() < Duration::from_millis(2000),
-            "a stuck worker must be detached, not joined"
+            elapsed < Duration::from_secs(5),
+            "a stuck worker must be detached, not joined, took {elapsed:?}"
         );
     }
 
@@ -1849,14 +1865,16 @@ mod tests {
             if is_ping(request) {
                 answer_ping_only(stream, request);
             } else {
-                std::thread::sleep(Duration::from_millis(500));
+                hold_until_client_closes(stream);
             }
         });
 
+        // Long enough that the ping is always answered in time; the stop
+        // then runs into the deadline.
         let attempt = stop_tcp(
             &daemon.addr,
             "/containers/abc/stop",
-            Instant::now() + Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
         );
         let requests = daemon.finish();
 
@@ -1919,7 +1937,7 @@ mod tests {
 
     #[test]
     fn tcp_stop_never_sends_stop_when_ping_times_out() {
-        let daemon = TestDaemon::start(|_, _| std::thread::sleep(Duration::from_millis(600)));
+        let daemon = TestDaemon::start(|stream, _| hold_until_client_closes(stream));
 
         let attempt = stop_tcp(
             &daemon.addr,
@@ -2372,13 +2390,6 @@ mod tests {
             lines.retain(|line| !line.is_empty());
             lines
         }
-    }
-
-    /// Keep the connection open until the client closes it.
-    #[cfg(windows)]
-    fn hold_until_client_closes(stream: &mut std::fs::File) {
-        let mut byte = [0_u8; 1];
-        while matches!(stream.read(&mut byte), Ok(read) if read > 0) {}
     }
 
     #[cfg(windows)]

@@ -4,11 +4,13 @@
 //! ports to [`ContainerInfo`] records.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 use std::sync::Arc;
 
+use log::debug;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
@@ -77,6 +79,8 @@ enum HostIp {
     Unparseable,
 }
 
+/// One published port, in Docker's format (`IP`, `PublicPort`, `Type`) or
+/// Podman's libpod format (`host_ip`, `host_port`, `range`, `protocol`).
 #[derive(Deserialize)]
 struct DockerPort<'a> {
     #[serde(
@@ -86,13 +90,40 @@ struct DockerPort<'a> {
         deserialize_with = "deserialize_host_ip"
     )]
     host_ip: HostIp,
-    #[serde(rename = "PublicPort", alias = "host_port")]
+    /// Docker format: the one host port of this entry. Docker lists every
+    /// port of a published range as its own entry.
+    #[serde(rename = "PublicPort")]
     public_port: Option<u16>,
+    /// Podman libpod format: the first host port of `range` ports.
+    host_port: Option<u16>,
     #[serde(rename = "Type", alias = "protocol", borrow)]
     proto: Option<JsonStr<'a>>,
-    #[serde(alias = "range")]
-    port_range: Option<u16>,
+    /// Podman libpod format: how many consecutive ports, from `host_port`,
+    /// the entry publishes. Ignored on a Docker-format entry, which never
+    /// carries it.
+    range: Option<u16>,
 }
+
+impl DockerPort<'_> {
+    /// The first and last host port this entry publishes.
+    fn host_ports(&self) -> Option<(u16, u16)> {
+        if let Some(port) = self.public_port {
+            return Some((port, port));
+        }
+        let first = self.host_port?;
+        // Podman may report `range: 0` for a single-port binding; treat it
+        // like 1 so the binding is not silently dropped. A range that runs
+        // past port 65535 ends there.
+        let count = self.range.unwrap_or(1).max(1);
+        Some((first, first.saturating_add(count - 1)))
+    }
+}
+
+/// Most bindings one daemon response may expand to: every port of both
+/// protocols. Port ranges make the number of bindings independent of the
+/// body size (a few kilobytes of `"range": 65535` entries would otherwise
+/// expand to millions of map inserts), so expansion stops at this cap.
+const MAX_PORT_BINDINGS: usize = 2 * 65_536;
 
 #[derive(Deserialize)]
 struct DockerContainer<'a> {
@@ -308,45 +339,63 @@ pub fn parse_containers_json_strict(json_body: &str) -> Result<ContainerPortMap,
     Ok(map)
 }
 
-fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'_>]) {
-    for container in containers {
-        let id = container.id.as_deref().unwrap_or("").to_string();
-        let name = container_display_name(container);
-        let image = container.image.as_deref().unwrap_or("").to_string();
-        let mut info = ContainerInfo::new(id, name, image);
-        if let Some(labels) = &container.labels {
-            info.compose_project = labels.project();
-            info.compose_service = labels.service();
-        }
-        // Shared by every binding of this container.
-        let info = Arc::new(info);
+/// One published port entry reduced to what the map stores: host IP, first
+/// and last host port, and protocol.
+type PortSpan = (Option<IpAddr>, u16, u16, Protocol);
 
+fn port_span(port: &DockerPort<'_>) -> Option<PortSpan> {
+    let (first, last) = port.host_ports()?;
+    let proto = parse_port_protocol(port.proto.as_deref())?;
+    let host_ip = match port.host_ip {
+        HostIp::Any => None,
+        HostIp::Addr(ip) => Some(ip),
+        HostIp::Unparseable => return None,
+    };
+    Some((host_ip, first, last, proto))
+}
+
+fn container_info(container: &DockerContainer<'_>) -> ContainerInfo {
+    let id = container.id.as_deref().unwrap_or("");
+    let image = container.image.as_deref().unwrap_or("");
+    let mut info = ContainerInfo::new(id, container_display_name(container), image);
+    if let Some(labels) = &container.labels {
+        info.compose_project = labels.project();
+        info.compose_service = labels.service();
+    }
+    info
+}
+
+/// Insert the bindings of every container, at most [`MAX_PORT_BINDINGS`]
+/// in total. Past the cap the rest of the response is ignored; the bindings
+/// already inserted are kept.
+fn populate_port_map(map: &mut ContainerPortMap, containers: &[DockerContainer<'_>]) {
+    let mut remaining = MAX_PORT_BINDINGS;
+    for container in containers {
         let Some(ports) = &container.ports else {
             continue;
         };
+        // Shared by every binding of this container.
+        let info = Arc::new(container_info(container));
+        // Port ranges already expanded for this container. Only ranges are
+        // tracked: a repeated single port (Docker lists a port once for
+        // IPv4 and once for IPv6) costs one insert either way.
+        let mut expanded_ranges = HashSet::new();
 
-        for port in ports {
-            let Some(public_port) = port.public_port else {
+        for (host_ip, first, last, proto) in ports.iter().filter_map(port_span) {
+            if first != last && !expanded_ranges.insert((host_ip, first, last, proto)) {
                 continue;
+            }
+            let count = usize::from(last - first) + 1;
+            let Some(left) = remaining.checked_sub(count) else {
+                debug!(
+                    "stopped expanding published ports at {MAX_PORT_BINDINGS} bindings; \
+                     the rest of the container list is ignored"
+                );
+                return;
             };
-            let Some(proto) = parse_port_protocol(port.proto.as_deref()) else {
-                continue;
-            };
-            let host_ip = match port.host_ip {
-                HostIp::Any => None,
-                HostIp::Addr(ip) => Some(ip),
-                HostIp::Unparseable => continue,
-            };
-
-            // Podman may report `range: 0` for a single-port binding; treat
-            // it like 1 so the binding is not silently dropped.
-            let port_count = port.port_range.unwrap_or(1).max(1);
-            for offset in 0..port_count {
-                let Some(mapped_port) = public_port.checked_add(offset) else {
-                    break;
-                };
-
-                map.insert(host_ip, mapped_port, proto, Arc::clone(&info));
+            remaining = left;
+            for port in first..=last {
+                map.insert(host_ip, port, proto, Arc::clone(&info));
             }
         }
     }
@@ -1024,5 +1073,90 @@ mod tests {
             map.is_empty(),
             "empty JSON array should produce an empty map, not an error"
         );
+    }
+
+    /// A container list with one container per entry of `ports`, named
+    /// `c0`, `c1`, and so on.
+    fn containers_with_ports(ports: &[&str]) -> String {
+        let containers: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(index, ports)| format!(r#"{{"Names": ["/c{index}"], "Ports": [{ports}]}}"#))
+            .collect();
+        format!("[{}]", containers.join(","))
+    }
+
+    #[test]
+    fn port_ranges_expand_to_at_most_the_binding_cap() {
+        let range = r#"{"host_port": 1, "range": 65535, "protocol": "tcp"}"#;
+        let shifted: Vec<String> = (2..200)
+            .map(|first| format!(r#"{{"host_port": {first}, "range": 65535, "protocol": "udp"}}"#))
+            .collect();
+        let mut entries = vec![
+            r#"{"IP": "127.0.0.1", "PublicPort": 80, "Type": "tcp"}"#,
+            range,
+        ];
+        entries.extend(shifted.iter().map(String::as_str));
+        let json = containers_with_ports(&entries);
+
+        let started = std::time::Instant::now();
+        let map = parse_containers_json(&json);
+        let elapsed = started.elapsed();
+
+        assert!(map.len() <= MAX_PORT_BINDINGS, "got {} bindings", map.len());
+        assert_eq!(
+            mapped_container(
+                &map,
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                80,
+                Protocol::Tcp
+            )
+            .name,
+            "c0",
+            "containers parsed before the cap are kept"
+        );
+        assert!(
+            map.get(None, 65535, Protocol::Tcp).is_some(),
+            "a range that fits under the cap is expanded in full"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "expansion is bounded, took {elapsed:?}"
+        );
+        let strict = parse_containers_json_strict(&json).expect("valid JSON");
+        assert_eq!(strict, map, "strict and lenient parsing apply the same cap");
+    }
+
+    #[test]
+    fn repeated_port_ranges_are_expanded_once() {
+        let range = r#"{"host_port": 1, "range": 65535, "protocol": "tcp"}"#;
+        let repeated = [range; 8].join(",");
+        let json = containers_with_ports(&[&repeated, r#"{"PublicPort": 80, "Type": "udp"}"#]);
+        let map = parse_containers_json(&json);
+
+        assert_eq!(map.len(), 65_535 + 1);
+        assert_eq!(
+            mapped_container(&map, None, 80, Protocol::Udp).name,
+            "c1",
+            "a repeated range does not use up the binding cap"
+        );
+    }
+
+    #[test]
+    fn range_applies_only_to_the_podman_format() {
+        let json = r#"[{
+            "Names": ["/docker"],
+            "Ports": [{"PublicPort": 8000, "Type": "tcp", "range": 100}]
+        }]"#;
+        let map = parse_containers_json(json);
+        assert_eq!(map.len(), 1, "a Docker-format entry publishes one port");
+
+        let json = r#"[{
+            "Names": ["podman"],
+            "Ports": [{"host_port": 65530, "range": 100, "protocol": "tcp"}]
+        }]"#;
+        let map = parse_containers_json(json);
+        assert_eq!(map.len(), 6, "a range ends at port 65535");
+        assert!(map.get(None, 65535, Protocol::Tcp).is_some());
     }
 }

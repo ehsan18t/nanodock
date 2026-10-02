@@ -40,6 +40,8 @@ This release redesigns the public API ahead of 1.0. Every breaking change is mar
 - **Breaking:** `StopOutcome` no longer implements `Copy`, so a later variant can carry data that is not `Copy`. Clone it where a copy was relied on; `StopOutcome::is_stopped` takes `&self`.
 - **Breaking:** `ContainerInfo` and `PublishedContainerMatch` no longer implement `Hash`, so `ContainerInfo` can gain fields that cannot be hashed (such as a label map) in a minor release. Key a set or map on `info.id` instead of the whole `ContainerInfo`.
 - `Error`'s `Display` output no longer repeats the message of the underlying error; it is available through `std::error::Error::source`.
+- **Security:** port ranges can no longer make a small reply expand to millions of bindings. One daemon reply expands to at most 131072 bindings (every port of both protocols); past that, the rest of the reply is ignored and the bindings already parsed are kept. A range repeated within one container is expanded once. Before, a reply of a few kilobytes of `"range": 65535` entries took about 0.7 seconds and millions of map inserts to parse.
+- The `range` field is read only from Podman's libpod port format (`host_port`). A Docker-format entry (`PublicPort`) always publishes one port, because Docker lists every port of a range as its own entry.
 - The background detection wait window is measured from the moment detection started rather than from the call that waits, so it never ends later than the detection timeout after `start_detection`.
 
 ### Removed
